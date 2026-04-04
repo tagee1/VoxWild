@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/c/tts-app/chatterbox_env/Scripts/python.exe --version)",
+      "Bash(/c/tts-app/chatterbox_env/Scripts/pip.exe list:*)",
+      "Bash(/c/tts-app/chatterbox_env/Scripts/pip.exe install:*)",
+      "Bash(/c/tts-app/chatterbox_env/Scripts/pip.exe show:*)",
+      "Bash(/c/tts-app/chatterbox_env/Scripts/python.exe:*)",
+      "Bash(python -c \"import kokoro_onnx; print\\('kokoro ok'\\)\")",
+      "Bash(python -c \"import customtkinter; print\\('ctk ok'\\)\")",
+      "Bash(/c/Users/tcsco/AppData/Local/Programs/Python/Python311/python.exe:*)",
+      "Bash(/c/Users/tcsco/AppData/Local/Python/pythoncore-3.14-64/python.exe:*)",
+      "Bash(python:*)",
+      "Bash(echo \"PID: $!\")",
+      "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
+      "Bash(tasklist)",
+      "Bash(C:/Users/tcsco/AppData/Local/Python/pythoncore-3.14-64/python.exe -c ':*)",
+      "Bash(C:/Users/tcsco/AppData/Local/Python/pythoncore-3.14-64/python.exe -c \"import pydub; print\\('pydub ok'\\)\")",
+      "Bash(C:/Users/tcsco/AppData/Local/Python/pythoncore-3.14-64/python.exe -c \"import mutagen; print\\('mutagen ok'\\)\")",
+      "Bash(C:/Users/tcsco/AppData/Local/Python/pythoncore-3.14-64/python.exe -m pip install lameenc mutagen --quiet)",
+      "Bash(C:/Users/tcsco/AppData/Local/Python/pythoncore-3.14-64/python.exe -c \"import lameenc; import mutagen; print\\('both ok'\\)\")",
+      "Bash(ls:*)",
+      "Bash(powershell:*)",
+      "Bash(\"chatterbox_env/Scripts/python.exe\" app.py)",
+      "Bash(where python:*)",
+      "Bash(C:/Users/tcsco/AppData/Local/Python/bin/python.exe:*)",
+      "Bash(C:/tts-app/chatterbox_env/Scripts/python.exe:*)",
+      "Read(//c/Users/tcsco/.cache/huggingface/hub/**)",
+      "Bash(\"C:/tts-app/chatterbox_env/Scripts/python.exe\" -c \"import inspect; from chatterbox.tts import ChatterboxTTS; print\\(inspect.getfile\\(ChatterboxTTS\\)\\)\")",
+      "Skill(update-config)",
+      "Bash(\"C:/Users/tcsco/AppData/Local/Python/bin/python.exe\" \"C:/tts-app/app.py\")"
+    ]
+  }
+}

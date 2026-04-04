@@ -1,0 +1,20 @@
+# Python environments — recreate with requirements files
+chatterbox_env/
+
+# Large model files — transfer via OneDrive (too big for GitHub)
+*.onnx
+*.bin
+
+# Runtime / temp files
+worker_stderr.txt
+worker_stdout.txt
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp audio files created during generation
+*.tmp
+
+# User-specific data (optional — remove lines below to include in repo)
+# calibration.json
+# tts_profiles.json

@@ -1,0 +1,11 @@
+{
+  "default_output_folder": "C:/Users/tcsco/Downloads",
+  "theme": "dark",
+  "default_voice": "\ud83c\uddec\ud83c\udde7 Male - George (Best)",
+  "default_speed": 0.85,
+  "default_profile": "\ud83c\udf19 Calm Narrator",
+  "auto_clean_text": false,
+  "notify_on_completion": true,
+  "notify_threshold_seconds": 10,
+  "selected_clone": "Cookies Voice"
+}
