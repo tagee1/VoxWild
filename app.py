@@ -2444,7 +2444,12 @@ def _on_engine_change(*_):
         kokoro_frame.pack_forget()
         cb_frame.pack(fill="x")
         if not chatterbox_engine.is_ready:
-            threading.Thread(target=_load_chatterbox_bg, daemon=True).start()
+            update_modal, close_modal = _make_chatterbox_loading_modal()
+            threading.Thread(
+                target=_load_chatterbox_bg,
+                args=(update_modal, close_modal),
+                daemon=True,
+            ).start()
     else:
         cb_frame.pack_forget()
         kokoro_frame.pack(fill="x")
@@ -2876,25 +2881,91 @@ if _saved_clone and _saved_clone != _CLONE_DEFAULT:
         status_label.configure(text="Ready  ·  Ctrl+Enter to generate  ·  Ctrl+P to play  ·  Esc to stop")
     # if not found (deleted), dropdown stays at Default
 
-def _load_chatterbox_bg():
+def _make_chatterbox_loading_modal():
+    """Create and return the Natural mode loading modal. Non-dismissible while loading."""
+    win = ctk.CTkToplevel(app)
+    win.title("Loading Natural Mode")
+    win.geometry("500x260")
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+    win.protocol("WM_DELETE_WINDOW", lambda: None)  # block close button
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
+    hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    hdr_inner = ctk.CTkFrame(hdr, fg_color="transparent")
+    hdr_inner.pack(side="left", padx=16, pady=10)
+    ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=4, height=20,
+                 corner_radius=2).pack(side="left", padx=(0, 10))
+    ctk.CTkLabel(hdr_inner, text="Loading Natural Mode",
+                 font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                 text_color=C_TXT).pack(side="left")
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+
+    # ── Download warning callout ───────────────────────────────────────────────
+    callout = ctk.CTkFrame(win, fg_color=C_ACCENT_D, corner_radius=8)
+    callout.pack(fill="x", padx=20, pady=(16, 0))
+    ctk.CTkLabel(
+        callout,
+        text="First launch downloads ~3 GB of model files (5–15 min).\n"
+             "Subsequent loads take ~30 seconds. Do not close the app.",
+        font=ctk.CTkFont(family="Segoe UI", size=11),
+        text_color=C_WARN,
+        justify="left",
+    ).pack(anchor="w", padx=12, pady=8)
+
+    # ── Progress bar (indeterminate) ───────────────────────────────────────────
+    bar = ctk.CTkProgressBar(win, mode="indeterminate",
+                             progress_color=C_ACCENT, fg_color=C_ACCENT_D)
+    bar.pack(fill="x", padx=20, pady=(14, 6))
+    bar.start()
+
+    # ── Status text ────────────────────────────────────────────────────────────
+    status_var = ctk.StringVar(value="Starting…")
+    ctk.CTkLabel(win, textvariable=status_var,
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT2).pack(padx=20, anchor="w")
+
+    def update_status(msg):
+        app.after(0, lambda m=msg: status_var.set(m))
+
+    def close_modal():
+        def _do():
+            bar.stop()
+            win.grab_release()
+            win.destroy()
+        app.after(0, _do)
+
+    return update_status, close_modal
+
+
+def _load_chatterbox_bg(update_modal, close_modal):
     """Load Chatterbox in a background thread; called when user switches to Natural mode."""
     def _st(msg):
+        update_modal(msg)
         app.after(0, lambda m=msg: status_label.configure(text=m))
+
     app.after(0, lambda: play_button.configure(state="disabled"))
+    app.after(0, lambda: engine_toggle.configure(state="disabled"))
     try:
-        _st("🎙️ Loading Natural mode — this may take a few minutes...")
-        app.after(0, lambda: engine_toggle.configure(state="disabled"))
         chatterbox_engine.start(status_cb=_st)
+        close_modal()
         app.after(0, lambda: engine_toggle.configure(state="normal"))
         app.after(0, lambda: play_button.configure(state="normal"))
-        _st("✅ Natural mode ready  ·  Ctrl+Enter to generate")
+        app.after(0, lambda: status_label.configure(
+            text="✅ Natural mode ready  ·  Ctrl+Enter to generate"))
     except Exception as e:
         _log_crash(e)
         err = _fmt_err(e)
+        close_modal()
         app.after(0, lambda: engine_var.set("⚡ Fast"))   # revert the toggle
         app.after(0, lambda: engine_toggle.configure(state="normal"))
         app.after(0, lambda: play_button.configure(state="normal"))
-        _st(f"❌ Natural mode failed: {err}")
+        app.after(0, lambda m=err: status_label.configure(
+            text=f"❌ Natural mode failed: {m}"))
 
 # ── License activation modal ──────────────────────────────────────────────────
 def _show_activation_modal(can_skip=True, remaining=0):
