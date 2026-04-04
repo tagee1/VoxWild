@@ -27,22 +27,28 @@ def cleanup_audio(samples, sample_rate, mode="pedalboard"):
 
 
 def _cleanup_pedalboard(samples, sample_rate):
-    from pedalboard import Pedalboard, HighpassFilter, NoiseGate, Compressor
-    board = Pedalboard([
-        HighpassFilter(cutoff_frequency_hz=80.0),
-        NoiseGate(threshold_db=-40.0, ratio=4.0, attack_ms=5.0, release_ms=100.0),
-        Compressor(threshold_db=-18.0, ratio=3.0, attack_ms=5.0, release_ms=100.0),
-    ])
-    # pedalboard expects shape (channels, samples); our arrays are 1-D (mono)
-    out = board(samples.reshape(1, -1).astype(np.float32), sample_rate)
-    return out.squeeze().astype(np.float32)
+    try:
+        from pedalboard import Pedalboard, HighpassFilter, NoiseGate, Compressor
+        board = Pedalboard([
+            HighpassFilter(cutoff_frequency_hz=80.0),
+            NoiseGate(threshold_db=-40.0, ratio=4.0, attack_ms=5.0, release_ms=100.0),
+            Compressor(threshold_db=-18.0, ratio=3.0, attack_ms=5.0, release_ms=100.0),
+        ])
+        # pedalboard expects shape (channels, samples); our arrays are 1-D (mono)
+        out = board(samples.reshape(1, -1).astype(np.float32), sample_rate)
+        return out.squeeze().astype(np.float32)
+    except Exception as e:
+        raise RuntimeError(f"Audio cleanup (pedalboard) failed: {e}  [E013]") from e
 
 
 def _cleanup_noisereduce(samples, sample_rate):
-    import noisereduce as nr
-    reduced = nr.reduce_noise(y=samples.astype(np.float32), sr=sample_rate,
-                              stationary=True)
-    return reduced.astype(np.float32)
+    try:
+        import noisereduce as nr
+        reduced = nr.reduce_noise(y=samples.astype(np.float32), sr=sample_rate,
+                                  stationary=True)
+        return reduced.astype(np.float32)
+    except Exception as e:
+        raise RuntimeError(f"Audio cleanup (noisereduce) failed: {e}  [E013]") from e
 
 
 def trim_silence(samples, sample_rate, threshold_db=-50):
