@@ -29,7 +29,7 @@ from clone_library import (
     add_clone_to_library as _lib_add,
     rename_clone_in_library as _lib_rename,
 )
-from audio_utils import trim_silence
+from audio_utils import trim_silence, cleanup_audio
 import license as _lic
 
 # ── Resource path helper (PyInstaller one-dir compatible) ─────────────────────
@@ -552,6 +552,15 @@ _pause_pos        = [None]   # sample index to resume from (None = not paused)
 _play_start_time  = [None]   # time.time() when sd.play() was last called
 
 def add_to_history(samples, sample_rate, text, voice_name, segments=None):
+    # Apply audio cleanup if enabled (before storing — affects playback and export)
+    if cleanup_var.get():
+        try:
+            mode = "noisereduce" if cleanup_mode.get().startswith("AI") else "pedalboard"
+            samples = cleanup_audio(samples, sample_rate, mode=mode)
+            samples = np.clip(samples, -1.0, 1.0)
+        except Exception as e:
+            _log_crash(e)  # don't block history — just skip cleanup on error
+
     duration = len(samples) / sample_rate
     entry = {
         "samples":     samples,
@@ -2712,6 +2721,44 @@ ctk.CTkButton(enh_panel, text="Reset to defaults", command=reset_enhancements,
               width=214, height=28,
               font=ctk.CTkFont(family="Segoe UI", size=11),
               **BTN_GHOST).pack(padx=14, pady=(0, 6))
+
+# ── Audio Cleanup ─────────────────────────────────────────────────────────────
+_sep(enh_panel)
+_section_label(enh_panel, "AUDIO CLEANUP", pady=(8, 4))
+
+cleanup_var  = ctk.BooleanVar(value=False)
+cleanup_mode = ctk.StringVar(value="Pedalboard")
+
+_cleanup_row = ctk.CTkFrame(enh_panel, fg_color="transparent")
+_cleanup_row.pack(fill="x", padx=14, pady=(0, 4))
+ctk.CTkCheckBox(_cleanup_row, text="Enable cleanup", variable=cleanup_var,
+                font=ctk.CTkFont(family="Segoe UI", size=11),
+                text_color=C_TXT2, checkmark_color=C_ACCENT,
+                fg_color=C_ACCENT_D, hover_color=C_ACCENT_D,
+                border_color=C_BORDER).pack(side="left")
+
+# Check if noisereduce is available
+try:
+    import noisereduce as _nr_check; del _nr_check
+    _nr_available = True
+except ImportError:
+    _nr_available = False
+
+_cleanup_mode_btn = ctk.CTkSegmentedButton(
+    enh_panel,
+    values=["Pedalboard", "AI (noisereduce)"],
+    variable=cleanup_mode,
+    font=ctk.CTkFont(family="Segoe UI", size=11),
+    width=214,
+)
+_cleanup_mode_btn.pack(padx=14, pady=(0, 6))
+if not _nr_available:
+    _cleanup_mode_btn.set("Pedalboard")
+    _cleanup_mode_btn.configure(state="disabled")
+    ctk.CTkLabel(enh_panel,
+                 text="pip install noisereduce to enable AI mode",
+                 font=ctk.CTkFont(family="Segoe UI", size=9),
+                 text_color=C_TXT3).pack(padx=14, anchor="w")
 
 
 # ── Audio History panel ───────────────────────────────────────────────────────
