@@ -28,6 +28,17 @@ def save_clone_library(entries, clone_dir, index_path):
         json.dump(entries, f, indent=2, ensure_ascii=False)
 
 
+def rename_clone_in_library(old_name, new_name, clone_dir, index_path):
+    """Rename a clone entry in the library. Returns True on success, False if old_name not found."""
+    entries = load_clone_library(clone_dir, index_path)
+    for entry in entries:
+        if entry["name"] == old_name:
+            entry["name"] = new_name
+            save_clone_library(entries, clone_dir, index_path)
+            return True
+    return False
+
+
 def add_clone_to_library(name, src_wav_path, clone_dir, index_path):
     """Copy src_wav_path into clone_dir, register in library, return new entry dict."""
     os.makedirs(clone_dir, exist_ok=True)
