@@ -2444,7 +2444,12 @@ def _on_engine_change(*_):
         kokoro_frame.pack_forget()
         cb_frame.pack(fill="x")
         if not chatterbox_engine.is_ready:
-            update_modal, close_modal = _make_chatterbox_loading_modal()
+            try:
+                update_modal, close_modal = _make_chatterbox_loading_modal()
+            except Exception:
+                # Modal failed to create — fall back to silent load with status bar only
+                def update_modal(msg): pass
+                def close_modal(): pass
             threading.Thread(
                 target=_load_chatterbox_bg,
                 args=(update_modal, close_modal),
@@ -2888,9 +2893,10 @@ def _make_chatterbox_loading_modal():
     win.geometry("500x260")
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
-    win.grab_set()
     win.transient(app)
     win.protocol("WM_DELETE_WINDOW", lambda: None)  # block close button
+    win.attributes("-topmost", True)               # stay above main window
+    win.lift()                                      # bring to front
 
     # ── Header ────────────────────────────────────────────────────────────────
     hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
@@ -2929,13 +2935,15 @@ def _make_chatterbox_loading_modal():
                  font=ctk.CTkFont(family="Segoe UI", size=11),
                  text_color=C_TXT2).pack(padx=20, anchor="w")
 
+    # Force the window to render before the background thread starts
+    win.update()
+
     def update_status(msg):
         app.after(0, lambda m=msg: status_var.set(m))
 
     def close_modal():
         def _do():
             bar.stop()
-            win.grab_release()
             win.destroy()
         app.after(0, _do)
 
