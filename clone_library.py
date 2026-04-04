@@ -15,9 +15,10 @@ def load_clone_library(clone_dir, index_path):
         try:
             with open(index_path, encoding="utf-8") as f:
                 entries = json.load(f)
-            return [e for e in entries if os.path.exists(e["file"])]
-        except Exception:
-            pass
+            return [e for e in entries
+                    if isinstance(e, dict) and "file" in e and os.path.exists(e["file"])]
+        except Exception as e:
+            print(f"[clone_library] Failed to load {index_path}: {e}", flush=True)
     return []
 
 
@@ -32,7 +33,7 @@ def rename_clone_in_library(old_name, new_name, clone_dir, index_path):
     """Rename a clone entry in the library. Returns True on success, False if old_name not found."""
     entries = load_clone_library(clone_dir, index_path)
     for entry in entries:
-        if entry["name"] == old_name:
+        if entry.get("name") == old_name:
             entry["name"] = new_name
             save_clone_library(entries, clone_dir, index_path)
             return True
