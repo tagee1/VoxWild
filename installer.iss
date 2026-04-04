@@ -1,0 +1,128 @@
+; installer.iss — Inno Setup script for TTS Studio
+;
+; Prerequisites:
+;   1. Run PyInstaller:  pyinstaller app.spec
+;      Output must be in:  dist\TTS Studio\
+;   2. Install Inno Setup 6:  https://jrsoftware.org/isinfo.php
+;   3. Compile:  iscc installer.iss
+;      Output: installer_output\TTS-Studio-Setup.exe
+;
+; Signing (after you have a code signing cert):
+;   signtool sign /tr http://timestamp.sectigo.com /td sha256 /fd sha256 ^
+;     /a installer_output\TTS-Studio-Setup.exe
+
+#define MyAppName      "TTS Studio"
+#define MyAppVersion   "1.0.0"
+#define MyAppPublisher "tagee1"
+#define MyAppURL       "https://yourstore.lemonsqueezy.com"
+#define MyAppExeName   "TTS Studio.exe"
+#define MyBuildDir     "dist\TTS Studio"
+
+[Setup]
+AppId={{B3F2A1C4-7D8E-4F0A-9B2C-5E6D3A1F8C90}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppURL}
+AppSupportURL={#MyAppURL}
+AppUpdatesURL={#MyAppURL}
+
+; Install to Program Files by default (requires UAC elevation)
+DefaultDirName={autopf}\{#MyAppName}
+DefaultGroupName={#MyAppName}
+AllowNoIcons=yes
+
+; Output
+OutputDir=installer_output
+OutputBaseFilename=TTS-Studio-Setup
+SetupIconFile=icon.ico
+
+; Compression (LZMA2 is best ratio for large binaries)
+Compression=lzma2/ultra64
+SolidCompression=yes
+LZMAUseSeparateProcess=yes
+
+; Minimum Windows 10
+MinVersion=10.0
+
+; Require 64-bit Windows
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+
+; Show a license page (create EULA.rtf or change to .txt)
+; LicenseFile=EULA.rtf
+
+; Require admin for install (so it goes into Program Files)
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=dialog
+
+; Uninstall
+Uninstallable=yes
+UninstallDisplayName={#MyAppName}
+UninstallDisplayIcon={app}\{#MyAppExeName}
+CreateUninstallRegKey=yes
+
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+
+[Tasks]
+Name: "desktopicon";   Description: "{cm:CreateDesktopIcon}";   GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "startmenuicon"; Description: "Create a Start Menu shortcut"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
+
+
+[Files]
+; ── Main application (PyInstaller one-dir build) ────────────────────────────
+Source: "{#MyBuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; ── chatterbox_worker.py (alongside the exe, found via _res()) ───────────────
+; Already included above via recursesubdirs since it's in the PyInstaller output.
+; If you keep chatterbox_worker.py only in the source tree (not copied by PyInstaller),
+; uncomment the line below:
+; Source: "chatterbox_worker.py"; DestDir: "{app}"; Flags: ignoreversion
+
+
+[Icons]
+Name: "{group}\{#MyAppName}";          Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"
+Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
+Name: "{commondesktop}\{#MyAppName}";   Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
+
+
+[Run]
+; Launch app after install (optional — user can uncheck)
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
+
+[UninstallRun]
+; Nothing special needed — user data lives in %APPDATA%\TTS Studio, not here
+
+
+[Registry]
+; File association, version info, etc. — add here if needed
+
+
+[Code]
+// Warn if existing install found (offer to uninstall first)
+function InitializeSetup(): Boolean;
+var
+  UninstPath: String;
+  UninstExe:  String;
+  MsgResult:  Integer;
+begin
+  Result := True;
+  if RegQueryStringValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B3F2A1C4-7D8E-4F0A-9B2C-5E6D3A1F8C90}_is1',
+                         'UninstallString', UninstExe) then
+  begin
+    MsgResult := MsgBox(
+      'A previous version of TTS Studio is already installed.'#13#10 +
+      'It is recommended to uninstall it first.'#13#10#13#10 +
+      'Uninstall the previous version now?',
+      mbConfirmation, MB_YESNO);
+    if MsgResult = IDYES then
+    begin
+      Exec(RemoveQuotes(UninstExe), '/SILENT /NORESTART', '', SW_SHOW, ewWaitUntilTerminated, MsgResult);
+    end;
+  end;
+end;
