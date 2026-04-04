@@ -3376,10 +3376,115 @@ def _run_kokoro_benchmark():
     except Exception:
         pass  # non-critical; never block startup
 
+def _show_onboarding():
+    """Welcome card shown once on first launch. Saved to settings so it never repeats."""
+    if _get_settings().get("seen_onboarding", False):
+        return
+
+    win = ctk.CTkToplevel(app)
+    win.title("Welcome to TTS Studio")
+    win.geometry("500x430")
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+    win.protocol("WM_DELETE_WINDOW", lambda: None)  # must use the button to dismiss
+    win.attributes("-topmost", True)
+    win.lift()
+    _fade_in(win)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=64)
+    hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    hdr_inner = ctk.CTkFrame(hdr, fg_color="transparent")
+    hdr_inner.pack(side="left", padx=20, pady=12)
+    ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=4, height=28,
+                 corner_radius=2).pack(side="left", padx=(0, 12))
+    title_col = ctk.CTkFrame(hdr_inner, fg_color="transparent")
+    title_col.pack(side="left")
+    ctk.CTkLabel(title_col, text="Welcome to TTS Studio",
+                 font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+                 text_color=C_TXT).pack(anchor="w")
+    ctk.CTkLabel(title_col, text="Here's what you need to know to get started",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT3).pack(anchor="w")
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=24, pady=(18, 0))
+
+    # ── Fast mode card ────────────────────────────────────────────────────────
+    fast_card = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=8,
+                             border_width=1, border_color=C_BORDER)
+    fast_card.pack(fill="x", pady=(0, 10))
+    fast_inner = ctk.CTkFrame(fast_card, fg_color="transparent")
+    fast_inner.pack(fill="x", padx=14, pady=12)
+    ctk.CTkLabel(fast_inner, text="⚡  Fast Mode",
+                 font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                 text_color=C_ACCENT).pack(anchor="w")
+    ctk.CTkLabel(fast_inner,
+                 text="Uses the Kokoro ONNX engine — generates in seconds with no\n"
+                      "internet required. Great for scripts, bulk work, and previews.\n"
+                      "Choose from 20+ voices in the Voice dropdown.",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT2, justify="left", wraplength=430).pack(anchor="w", pady=(4, 0))
+
+    # ── Natural mode card ─────────────────────────────────────────────────────
+    nat_card = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=8,
+                            border_width=1, border_color=C_BORDER)
+    nat_card.pack(fill="x", pady=(0, 10))
+    nat_inner = ctk.CTkFrame(nat_card, fg_color="transparent")
+    nat_inner.pack(fill="x", padx=14, pady=12)
+    ctk.CTkLabel(nat_inner, text="🎙️  Natural Mode",
+                 font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                 text_color=C_TXT).pack(anchor="w")
+    ctk.CTkLabel(nat_inner,
+                 text="Uses the Chatterbox neural TTS engine — more expressive and\n"
+                      "human-sounding. Downloads ~3 GB on first use (5–15 min).\n"
+                      "Supports voice cloning from a short audio recording.",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT2, justify="left", wraplength=430).pack(anchor="w", pady=(4, 0))
+
+    # ── Tip ───────────────────────────────────────────────────────────────────
+    ctk.CTkLabel(body, text="Tip: press Ctrl+/ at any time to open Help & keyboard shortcuts.",
+                 font=ctk.CTkFont(family="Segoe UI", size=10),
+                 text_color=C_TXT3).pack(anchor="w", pady=(0, 14))
+
+    # ── Footer: checkbox + button ─────────────────────────────────────────────
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+    footer = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
+    footer.pack(fill="x", side="bottom")
+    footer.pack_propagate(False)
+
+    dont_show_var = ctk.BooleanVar(value=True)
+    ctk.CTkCheckBox(footer, text="Don't show again", variable=dont_show_var,
+                    font=ctk.CTkFont(family="Segoe UI", size=11),
+                    text_color=C_TXT2, checkmark_color=C_ACCENT,
+                    fg_color=C_ACCENT_D, hover_color=C_ACCENT_D,
+                    border_color=C_BORDER).pack(side="left", padx=20)
+
+    def _dismiss():
+        if dont_show_var.get():
+            s = _get_settings()
+            s["seen_onboarding"] = True
+            _save_settings(s)
+        _fade_out(win, win.destroy)
+
+    ctk.CTkButton(footer, text="Get Started  →", command=_dismiss,
+                  width=130, height=34,
+                  font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                  fg_color=C_ACCENT, hover_color=C_ACCENT_H,
+                  text_color="#000000", corner_radius=8).pack(side="right", padx=20)
+    win.bind("<Return>", lambda _: _dismiss())
+
+
 _run_kokoro_benchmark()
 
 _splash = _run_splash(_on_splash_done)
 # Kokoro is already loaded at this point — complete the splash bar
 app.after(100, _splash._finish)
+# Show onboarding after splash finishes (800 ms gives splash time to complete)
+app.after(800, _show_onboarding)
 
 app.mainloop()
