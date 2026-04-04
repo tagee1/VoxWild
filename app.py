@@ -559,7 +559,9 @@ def add_to_history(samples, sample_rate, text, voice_name, segments=None):
             samples = cleanup_audio(samples, sample_rate, mode=mode)
             samples = np.clip(samples, -1.0, 1.0)
         except Exception as e:
-            _log_crash(e)  # don't block history — just skip cleanup on error
+            _log_crash(e)
+            app.after(0, lambda m=_fmt_err(e): status_label.configure(
+                text=f"⚠️ Audio cleanup skipped: {m}"))
 
     duration = len(samples) / sample_rate
     entry = {
@@ -2326,26 +2328,31 @@ def _rename_clone():
     entry.pack(padx=20)
 
     def _confirm():
-        new_name = entry.get().strip()
-        if not new_name:
-            return
-        if new_name == old_name:
+        try:
+            new_name = entry.get().strip()
+            if not new_name:
+                return
+            if new_name == old_name:
+                win.destroy()
+                return
+            # Deduplicate against existing names
+            lib = load_clone_library()
+            existing = {e["name"] for e in lib if e["name"] != old_name}
+            base, n = new_name, 2
+            while new_name in existing:
+                new_name = f"{base} ({n})"; n += 1
+            if not rename_clone_in_library(old_name, new_name):
+                status_label.configure(text=f"⚠️ Could not rename '{old_name}' — entry not found.")
+                win.destroy()
+                return
+            _refresh_clone_menu()
+            cb_clone_var.set(new_name)  # set AFTER refresh so menu knows the name
+            status_label.configure(text=f"Renamed to: {new_name}")
             win.destroy()
-            return
-        # Deduplicate against existing names
-        lib = load_clone_library()
-        existing = {e["name"] for e in lib if e["name"] != old_name}
-        base, n = new_name, 2
-        while new_name in existing:
-            new_name = f"{base} ({n})"; n += 1
-        if not rename_clone_in_library(old_name, new_name):
-            status_label.configure(text=f"⚠️ Could not rename '{old_name}' — entry not found.")
+        except Exception as e:
+            _log_crash(e)
+            status_label.configure(text=f"❌ Rename failed: {_fmt_err(e)}")
             win.destroy()
-            return
-        _refresh_clone_menu()
-        cb_clone_var.set(new_name)  # set AFTER refresh so menu knows the name
-        status_label.configure(text=f"Renamed to: {new_name}")
-        win.destroy()
 
     ctk.CTkButton(win, text="Rename", command=_confirm,
                   height=30, font=ctk.CTkFont(family="Segoe UI", size=12),

@@ -114,6 +114,7 @@ def fmt_err(e):
       E010 — Voice clone recording too quiet
       E011 — Voice clone recording too short
       E012 — Failed to reset voice conditioning (default voice switch)
+      E013 — Audio cleanup failed (pedalboard or noisereduce error)
       E099 — Unknown / unrecognised error
     """
     raw  = str(e).lower()
@@ -160,6 +161,8 @@ def fmt_err(e):
         return _r("Voice clone recording is too short — use at least 6 seconds of clear speech", "E011")
     if "failed to reset voice conditioning" in raw or "e012" in raw:
         return _r("Failed to reset to default voice — restart Natural mode to recover", "E012")
+    if "audio cleanup" in raw or "e013" in raw:
+        return _r("Audio cleanup failed — generation saved without cleanup", "E013")
 
     # ── Audio file format ─────────────────────────────────────────────────────
     if any(k in raw for k in ("sndfile", "unknown format", "could not read",
