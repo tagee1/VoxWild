@@ -11,6 +11,7 @@ import re
 import time
 import subprocess
 import tempfile
+import webbrowser
 from tkinter import filedialog, messagebox
 from scipy.signal import butter, sosfilt
 import tkinter as tk
@@ -82,6 +83,7 @@ def _invalidate_clone_cache():
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 VERSION          = "1.0.0"
+GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
 # ── User data directory (%APPDATA%\TTS Studio) ────────────────────────────────
@@ -576,7 +578,7 @@ def add_to_history(samples, sample_rate, text, voice_name, segments=None):
     audio_history.insert(0, entry)
     if len(audio_history) > MAX_HISTORY:
         audio_history.pop()
-    _prepend_history_card(entry)
+    app.after(0, lambda e=entry: _prepend_history_card(e))
 
 def _prepend_history_card(entry):
     """Add one card at the top of the history panel — O(1) widget work."""
@@ -1570,11 +1572,12 @@ def queue_generate_all():
         is_generating = True
         words_done    = 0
         cancelled     = False
+        i = -1
         for i, item in enumerate(queue_items):
             if _cancel_event.is_set():
                 cancelled = True
                 break
-            def scb(msg): status_label.configure(text=f"[{i+1}/{total_items}] {msg}")
+            def scb(msg, _i=i): app.after(0, lambda m=f"[{_i+1}/{total_items}] {msg}": status_label.configure(text=m))
             scb("Starting...")
             t0 = time.time()
             try:
@@ -1595,11 +1598,14 @@ def queue_generate_all():
             time.sleep(0.05)
         smooth.finish()
         is_generating = False
+        completed = i + 1
         if cancelled:
-            status_label.configure(text=f"⏹ Queue cancelled. {words_done and i or 0} of {total_items} items completed.")
+            app.after(0, lambda c=completed, t=total_items: status_label.configure(
+                text=f"⏹ Queue cancelled. {c} of {t} items completed."))
         else:
-            status_label.configure(text=f"✅ Queue complete! {total_items} files saved to {out_dir}")
-        queue_gen_btn.configure(state="normal")
+            app.after(0, lambda t=total_items, d=out_dir: status_label.configure(
+                text=f"✅ Queue complete! {t} files saved to {d}"))
+        app.after(0, lambda: queue_gen_btn.configure(state="normal"))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -1668,26 +1674,29 @@ def generate_and_store():
         try:
             samples, sr, segments = generate_audio(
                 text, voice, speed,
-                status_cb=lambda m: status_label.configure(text=m)
+                status_cb=lambda m: app.after(0, lambda m=m: status_label.configure(text=m))
             )
             elapsed = time.time() - t0
             record_calibration(words, elapsed)
             smooth.finish()
             add_to_history(samples, sr, text, voice_name, segments=segments)
-            status_label.configure(text="✅ Audio ready! Click ▶ Play in the history panel.")
+            app.after(0, lambda: status_label.configure(
+                text="✅ Audio ready! Click ▶ Play in the history panel."))
         except GenerationCancelled:
             smooth.finish()
-            status_label.configure(text="⏹ Generation cancelled.")
+            app.after(0, lambda: status_label.configure(text="⏹ Generation cancelled."))
         except Exception as e:
             _log_crash(e)
             smooth.finish()
-            status_label.configure(text=f"❌ {_fmt_err(e)}")
+            _msg = _fmt_err(e)
+            app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
         finally:
             is_generating = False
-            play_button.configure(state="normal", text="▶  Generate")
-            stop_button.configure(state="disabled", text="Stop",
-                                  fg_color="transparent", hover_color=C_ELEVATED,
-                                  text_color=C_TXT2, border_width=1, border_color=C_BORDER)
+            app.after(0, lambda: play_button.configure(state="normal", text="▶  Generate"))
+            app.after(0, lambda: stop_button.configure(
+                state="disabled", text="Stop",
+                fg_color="transparent", hover_color=C_ELEVATED,
+                text_color=C_TXT2, border_width=1, border_color=C_BORDER))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -1715,12 +1724,13 @@ def preview_voice():
             enhanced = apply_enhancements(samples, sr)
             sd.play(enhanced, sr)
             sd.wait()
-            status_label.configure(text="✅ Preview done!")
+            app.after(0, lambda: status_label.configure(text="✅ Preview done!"))
         except Exception as e:
             _log_crash(e)
-            status_label.configure(text=f"❌ {_fmt_err(e)}")
+            _msg = _fmt_err(e)
+            app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
         finally:
-            preview_button.configure(state="normal")
+            app.after(0, lambda: preview_button.configure(state="normal"))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -1873,7 +1883,7 @@ def show_settings():
 def show_about():
     win = ctk.CTkToplevel(app)
     win.title("About TTS Studio")
-    win.geometry("460x620")
+    win.geometry("460x660")
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
@@ -1911,14 +1921,19 @@ def show_about():
     notice = ctk.CTkFrame(scroll, fg_color=C_ACCENT_D, corner_radius=8)
     notice.pack(fill="x", pady=(0, 10))
     ctk.CTkLabel(notice,
-                 text="Audio Watermarking Notice",
+                 text="⚠  AI Watermark Disclosure — Natural Mode",
                  font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-                 text_color=C_ACCENT, anchor="w").pack(anchor="w", padx=12, pady=(10, 2))
+                 text_color=C_ACCENT, anchor="w").pack(anchor="w", padx=12, pady=(10, 4))
     ctk.CTkLabel(notice,
-                 text="Audio generated in Natural mode contains an imperceptible\n"
-                      "neural watermark applied by Resemble AI's Perth library.\n"
-                      "This watermark is inaudible and does not affect quality.",
+                 text="Audio generated in Natural (Chatterbox) mode contains an\n"
+                      "inaudible AI watermark embedded by Resemble AI's Perth\n"
+                      "library. This watermark is present in all Natural mode output\n"
+                      "regardless of settings, and does not affect audio quality.",
                  font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT2, anchor="w", justify="left").pack(anchor="w", padx=12, pady=(0, 4))
+    ctk.CTkLabel(notice,
+                 text="Fast (Kokoro) mode output does not contain a watermark.",
+                 font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
                  text_color=C_TXT2, anchor="w", justify="left").pack(anchor="w", padx=12, pady=(0, 10))
 
     # ── Keyboard shortcuts ────────────────────────────────────────────────────
@@ -2099,6 +2114,28 @@ if not _lic.load_license().get("activated"):
     _activate_btn.pack(side="right", padx=(0, 6), pady=14)
 
 _sep(app)
+
+# ── Update banner (hidden until _show_update_banner is called) ─────────────────
+_update_banner = ctk.CTkFrame(app, fg_color=C_ACCENT_D, corner_radius=0, height=34)
+_update_banner.pack_propagate(False)
+# Not packed here — _show_update_banner inserts it before prog_row when needed
+_update_banner_label = ctk.CTkLabel(
+    _update_banner, text="", anchor="w",
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    text_color=C_TXT)
+_update_banner_label.pack(side="left", padx=14)
+_update_banner_link = ctk.CTkButton(
+    _update_banner, text="Download ↗", width=94, height=22,
+    font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+    fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
+    corner_radius=4, command=lambda: None)
+_update_banner_link.pack(side="left", padx=(6, 0))
+ctk.CTkButton(
+    _update_banner, text="✕", width=28, height=22,
+    font=ctk.CTkFont(family="Segoe UI", size=11),
+    fg_color="transparent", hover_color=C_BORDER,
+    text_color=C_TXT3, corner_radius=4,
+    command=lambda: _update_banner.pack_forget()).pack(side="right", padx=(0, 8))
 
 # ── Progress row ──────────────────────────────────────────────────────────────
 prog_row = ctk.CTkFrame(app, fg_color=C_SURFACE, corner_radius=0, height=34)
@@ -2444,12 +2481,13 @@ def show_voice_recorder():
                                text_color=C_TXT3)
     rec_status.pack(pady=(4, 0))
 
-    _recording = threading.Event()
-    _chunks    = []
-    _samples   = [None]
-    _stream    = [None]
-    _start     = [0.0]
-    _tmp_path  = [None]
+    _recording   = threading.Event()
+    _chunks      = []
+    _chunks_lock = threading.Lock()
+    _samples     = [None]
+    _stream      = [None]
+    _start       = [0.0]
+    _tmp_path    = [None]
 
     def _tick():
         if _recording.is_set():
@@ -2459,7 +2497,8 @@ def show_voice_recorder():
             win.after(100, _tick)
 
     def _start_rec():
-        _chunks.clear()
+        with _chunks_lock:
+            _chunks.clear()
         _recording.set()
         _start[0] = time.time()
         record_btn.configure(text="⏹  Stop")
@@ -2469,7 +2508,8 @@ def show_voice_recorder():
         _tick()
         def _cb(indata, frames, time_info, st):
             if _recording.is_set():
-                _chunks.append(indata.copy())
+                with _chunks_lock:
+                    _chunks.append(indata.copy())
         s = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                            dtype="float32", callback=_cb)
         s.start()
@@ -2481,10 +2521,12 @@ def show_voice_recorder():
             _stream[0].stop(); _stream[0].close(); _stream[0] = None
         timer_lbl.configure(text_color=C_TXT3)
         record_btn.configure(text="⏺  Record Again")
-        if not _chunks:
+        with _chunks_lock:
+            chunks_snap = list(_chunks)
+        if not chunks_snap:
             rec_status.configure(text="Nothing recorded.", text_color=C_WARN)
             return
-        _samples[0] = np.concatenate(_chunks).flatten()
+        _samples[0] = np.concatenate(chunks_snap).flatten()
         dur = len(_samples[0]) / SAMPLE_RATE
         peak = float(np.abs(_samples[0]).max()) if len(_samples[0]) else 0.0
         if dur < 3:
@@ -2500,7 +2542,14 @@ def show_voice_recorder():
             import tempfile
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
-            sf.write(tmp.name, _samples[0], SAMPLE_RATE)
+            try:
+                sf.write(tmp.name, _samples[0], SAMPLE_RATE)
+            except Exception as e:
+                _log_crash(e)
+                rec_status.configure(text=f"❌ Could not save recording: {_fmt_err(e)}",
+                                     text_color=C_WARN)
+                play_btn.configure(state="normal")
+                return
             _tmp_path[0] = tmp.name
             rec_status.configure(text=f"{dur:.1f}s recorded — name it and save to library.",
                                   text_color=C_SUCCESS)
@@ -2513,9 +2562,15 @@ def show_voice_recorder():
 
     def _preview():
         if _samples[0] is not None:
-            threading.Thread(
-                target=lambda: (sd.stop(), sd.play(_samples[0], SAMPLE_RATE), sd.wait()),
-                daemon=True).start()
+            def _do():
+                try:
+                    sd.stop()
+                    sd.play(_samples[0], SAMPLE_RATE)
+                    sd.wait()
+                except Exception as e:
+                    app.after(0, lambda m=_fmt_err(e): rec_status.configure(
+                        text=f"❌ Playback failed: {m}", text_color=C_WARN))
+            threading.Thread(target=_do, daemon=True).start()
 
     def _save_to_library():
         if _tmp_path[0] is None or not os.path.exists(_tmp_path[0]):
@@ -3075,20 +3130,22 @@ def dlg_generate():
         try:
             samples, sr, segments = generate_dialogue_audio(
                 d_lines, speaker_voices, speed,
-                status_cb=lambda m: status_label.configure(text=m)
+                status_cb=lambda m: app.after(0, lambda m=m: status_label.configure(text=m))
             )
             smooth.finish()
             label = "Dialogue: " + " · ".join(dlg_speaker_vars.keys())
             add_to_history(samples, sr, text, label, segments=segments)
-            status_label.configure(text="✅ Dialogue ready! View in Studio → History panel.")
+            app.after(0, lambda: status_label.configure(
+                text="✅ Dialogue ready! View in Studio → History panel."))
         except Exception as e:
             _log_crash(e)
-            status_label.configure(text=f"❌ {_fmt_err(e)}")
+            _msg = _fmt_err(e)
+            app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
             smooth.finish()
         finally:
             is_generating = False
-            dlg_gen_btn.configure(state="normal", text="Generate Dialogue")
-            dlg_detect_btn.configure(state="normal")
+            app.after(0, lambda: dlg_gen_btn.configure(state="normal", text="Generate Dialogue"))
+            app.after(0, lambda: dlg_detect_btn.configure(state="normal"))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -3182,6 +3239,58 @@ def _make_chatterbox_loading_modal():
     return update_status, close_modal
 
 
+def _show_oom_modal():
+    """Plain-English dialog shown when Natural mode fails to load due to low RAM."""
+    win = ctk.CTkToplevel(app)
+    win.title("Not Enough Memory")
+    win.geometry("420x300")
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+    win.attributes("-topmost", True)
+    win.lift()
+    _fade_in(win)
+
+    # Icon + title
+    top = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=72)
+    top.pack(fill="x")
+    top.pack_propagate(False)
+    ctk.CTkLabel(top, text="⚠", font=ctk.CTkFont(family="Segoe UI", size=28),
+                 text_color=C_ACCENT).pack(side="left", padx=(20, 10), pady=16)
+    ctk.CTkLabel(top, text="Natural mode requires more RAM",
+                 font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                 text_color=C_TXT, anchor="w").pack(side="left", pady=16)
+
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=24, pady=18)
+
+    ctk.CTkLabel(body,
+                 text="The Chatterbox model needs at least 6 GB of free RAM to load.\n"
+                      "Your system didn't have enough available memory.",
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT2, wraplength=368, justify="left", anchor="w"
+                 ).pack(anchor="w", pady=(0, 12))
+
+    ctk.CTkLabel(body, text="To free up memory:",
+                 font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                 text_color=C_TXT, anchor="w").pack(anchor="w")
+    for tip in ("• Close browser tabs and other open applications",
+                "• Restart your PC to clear background processes",
+                "• Use Fast mode — it runs with under 1 GB of RAM"):
+        ctk.CTkLabel(body, text=tip,
+                     font=ctk.CTkFont(family="Segoe UI", size=12),
+                     text_color=C_TXT2, anchor="w").pack(anchor="w")
+
+    ctk.CTkButton(win, text="OK — Use Fast Mode", width=160, height=34,
+                  font=ctk.CTkFont(family="Segoe UI", size=12),
+                  fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
+                  corner_radius=6,
+                  command=lambda: _fade_out(win, win.destroy)).pack(pady=(0, 20))
+
+
 def _load_chatterbox_bg(update_modal, close_modal):
     """Load Chatterbox in a background thread; called when user switches to Natural mode."""
     def _st(msg):
@@ -3204,8 +3313,15 @@ def _load_chatterbox_bg(update_modal, close_modal):
         app.after(0, lambda: engine_var.set("⚡ Fast"))   # revert the toggle
         app.after(0, lambda: engine_toggle.configure(state="normal"))
         app.after(0, lambda: play_button.configure(state="normal"))
-        app.after(0, lambda m=err: status_label.configure(
-            text=f"❌ Natural mode failed: {m}"))
+        _raw = str(e).lower()
+        _is_oom = isinstance(e, MemoryError) or any(
+            k in _raw for k in ("not enough ram", "not enough memory",
+                                "out of memory", "paging file", "winerror 1455"))
+        if _is_oom:
+            app.after(0, _show_oom_modal)
+        else:
+            app.after(0, lambda m=err: status_label.configure(
+                text=f"❌ Natural mode failed: {m}"))
 
 # ── License activation modal ──────────────────────────────────────────────────
 def _show_activation_modal(can_skip=True, remaining=0):
@@ -3376,6 +3492,43 @@ def _run_kokoro_benchmark():
     except Exception:
         pass  # non-critical; never block startup
 
+def _show_update_banner(latest_tag: str):
+    """Show the amber update banner below the header. Called from main thread only."""
+    _update_banner_label.configure(text=f"🔔 Update available: {latest_tag}")
+    url = f"https://github.com/{GITHUB_REPO}/releases/latest"
+    _update_banner_link.configure(command=lambda: webbrowser.open(url))
+    _update_banner.pack(fill="x", before=prog_row)
+
+
+def _check_for_update():
+    """Background thread: check GitHub releases API once per day.
+    Never raises — update check is best-effort and must not affect startup."""
+    try:
+        import urllib.request
+        import json as _json
+        s = _get_settings()
+        today = datetime.now().strftime("%Y-%m-%d")
+        if s.get("last_update_check") == today:
+            return
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(
+            api_url, headers={"User-Agent": f"TTS-Studio/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read())
+        tag = data.get("tag_name", "").lstrip("v")
+        if not tag:
+            return
+        current = tuple(int(x) for x in VERSION.split(".") if x.isdigit())
+        latest  = tuple(int(x) for x in tag.split(".")  if x.isdigit())
+        s["last_update_check"] = today
+        _save_settings(s)
+        if latest > current:
+            v = data["tag_name"]
+            app.after(0, lambda: _show_update_banner(v))
+    except Exception:
+        pass  # non-critical; never block or crash on failure
+
+
 def _show_onboarding():
     """Welcome card shown once on first launch. Saved to settings so it never repeats."""
     if _get_settings().get("seen_onboarding", False):
@@ -3486,5 +3639,7 @@ _splash = _run_splash(_on_splash_done)
 app.after(100, _splash._finish)
 # Show onboarding after splash finishes (800 ms gives splash time to complete)
 app.after(800, _show_onboarding)
+# Check for updates in the background — 2 s delay so the UI is fully settled first
+app.after(2000, lambda: threading.Thread(target=_check_for_update, daemon=True).start())
 
 app.mainloop()

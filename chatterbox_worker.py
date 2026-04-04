@@ -146,12 +146,15 @@ def main():
         if cmd == "generate":
             try:
                 import traceback as _tb
-                text         = req["text"]
+                text         = req.get("text", "")
+                out_path     = req.get("output_path", "")
+                if not text or not out_path:
+                    emit({"type": "error", "msg": "Malformed generate request (missing text or output_path)."})
+                    continue
                 audio_prompt = req.get("audio_prompt_path") or None
                 exaggeration = float(req.get("exaggeration", 0.5))
                 cfg_weight   = float(req.get("cfg_weight", 0.5))
                 temperature  = float(req.get("temperature", 0.8))
-                out_path     = req["output_path"]
 
                 # Preprocess voice clone audio:
                 #   1. Convert stereo → mono (model requires 1 channel)
