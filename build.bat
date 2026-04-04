@@ -3,13 +3,12 @@ REM build.bat — Build TTS Studio installer in one step
 REM
 REM Requirements:
 REM   - PyInstaller installed in the active Python env (pip install pyinstaller)
-REM   - Inno Setup 6 installed at default path (or update ISCC_PATH below)
+REM   - Inno Setup 6 installed (adds iscc to PATH automatically)
 REM   - Run from C:\tts-app
 
 setlocal enabledelayedexpansion
 
 set "APP_DIR=%~dp0"
-set "ISCC_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 
 echo.
 echo ============================================================
@@ -46,16 +45,23 @@ if not exist "%APP_DIR%dist\TTS Studio\TTS Studio.exe" (
 REM ── Step 3: Inno Setup ────────────────────────────────────────────────────────
 echo.
 echo [3/3] Running Inno Setup...
-if not exist "%ISCC_PATH%" (
+
+REM Diagnostics — show where iscc is (or isn't)
+echo   Searching for iscc in PATH...
+where iscc 2>&1
+echo   ERRORLEVEL after where: %ERRORLEVEL%
+echo.
+
+where iscc >nul 2>&1
+if errorlevel 1 (
     echo.
-    echo WARNING: Inno Setup not found at:
-    echo   %ISCC_PATH%
+    echo WARNING: iscc not found in PATH. Is Inno Setup 6 installed?
     echo   Download from: https://jrsoftware.org/isinfo.php
     echo   Then re-run this script.
     exit /b 1
 )
 
-"%ISCC_PATH%" "%APP_DIR%installer.iss"
+iscc "%APP_DIR%installer.iss"
 if errorlevel 1 (
     echo.
     echo ERROR: Inno Setup compilation failed. Check output above.

@@ -15,7 +15,8 @@ import site
 import glob as _glob
 
 # Site-packages directory for the current Python interpreter
-SP = site.getsitepackages()[0]
+# getsitepackages() returns [python_root, Lib\site-packages] on Windows — pick the one ending in site-packages
+SP = next(p for p in site.getsitepackages() if p.endswith("site-packages"))
 
 # ── Helper: expand glob patterns in datas entries ─────────────────────────────
 def _glob_datas(pattern, dest):

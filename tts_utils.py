@@ -113,6 +113,7 @@ def fmt_err(e):
       E009 — Unsupported audio file format
       E010 — Voice clone recording too quiet
       E011 — Voice clone recording too short
+      E012 — Failed to reset voice conditioning (default voice switch)
       E099 — Unknown / unrecognised error
     """
     raw  = str(e).lower()
@@ -152,11 +153,13 @@ def fmt_err(e):
     if "expected all tensors to be on the same device" in raw:
         return _r("Model error — device mismatch. Restart the app and try again", "E008")
 
-    # ── Voice clone quality ───────────────────────────────────────────────────
+    # ── Voice clone quality / state ───────────────────────────────────────────
     if "too quiet" in raw or "e010" in raw:
         return _r("Voice clone recording is too quiet — re-record in a louder environment", "E010")
     if "too short" in raw or "voice clone" in raw and "short" in raw:
         return _r("Voice clone recording is too short — use at least 6 seconds of clear speech", "E011")
+    if "failed to reset voice conditioning" in raw or "e012" in raw:
+        return _r("Failed to reset to default voice — restart Natural mode to recover", "E012")
 
     # ── Audio file format ─────────────────────────────────────────────────────
     if any(k in raw for k in ("sndfile", "unknown format", "could not read",

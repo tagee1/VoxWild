@@ -15,6 +15,7 @@ import sys
 import os
 import json
 import logging
+import copy
 
 # Save the real stdout for our JSON protocol BEFORE anything else touches it
 _proto = sys.stdout
@@ -119,6 +120,16 @@ def main():
 
     emit({"type": "ready", "sr": model.sr})
 
+    # Save default voice conditioning so we can restore it when the user
+    # switches back to Default voice. model.generate() mutates model.conds
+    # in-place when given an audio prompt, so without this reset, subsequent
+    # calls with audio_prompt_path=None would silently keep using the last
+    # clone's voice.
+    try:
+        _default_conds = copy.deepcopy(model.conds)
+    except Exception:
+        _default_conds = None
+
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:
@@ -190,6 +201,17 @@ def main():
                             audio_prompt = _tmp_prompt
                     except Exception:
                         pass  # if preprocessing fails, pass original and let model error naturally
+
+                # Restore default voice conditioning when no clone is selected.
+                # model.generate() mutates model.conds in-place when given a
+                # voice prompt, so we must reset it to prevent bleed-through.
+                if audio_prompt is None and _default_conds is not None:
+                    try:
+                        model.conds = copy.deepcopy(_default_conds)
+                    except Exception as _ce:
+                        emit({"type": "error",
+                              "msg": f"Failed to reset voice conditioning: {_ce}  [E012]"})
+                        continue
 
                 emit({"type": "status", "msg": "Generating audio..."})
                 wav = model.generate(
