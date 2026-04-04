@@ -546,7 +546,10 @@ def get_words_per_second():
 
 # ── Audio History ─────────────────────────────────────────────────────────────
 audio_history = []   # list of dicts: {samples, sample_rate, text, duration, timestamp, voice}
-_active_play_btn = [None]   # currently playing card's Play button, or None
+_active_play_btn  = [None]   # currently playing card's Play button, or None
+_active_pause_btn = [None]   # pause button paired with the active play button
+_pause_pos        = [None]   # sample index to resume from (None = not paused)
+_play_start_time  = [None]   # time.time() when sd.play() was last called
 
 def add_to_history(samples, sample_rate, text, voice_name, segments=None):
     duration = len(samples) / sample_rate
@@ -638,8 +641,18 @@ def _make_history_card(parent, idx, entry):
         font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
         fg_color=C_ACCENT_D, hover_color=C_ACCENT, text_color=C_TXT, corner_radius=5,
     )
-    play_btn.configure(command=lambda e=entry, b=play_btn: _toggle_history_playback(e, b))
+    # pause_btn created but not packed — shown only during playback
+    pause_btn = ctk.CTkButton(
+        row2, text="⏸ Pause", width=80, height=24,
+        font=ctk.CTkFont(family="Segoe UI", size=11),
+        **BTN_GHOST, corner_radius=5,
+    )
+    play_btn.configure(command=lambda e=entry, b=play_btn, p=pause_btn:
+                       _toggle_history_playback(e, b, p))
+    pause_btn.configure(command=lambda e=entry, b=play_btn, p=pause_btn:
+                        _toggle_history_pause(e, b, p))
     play_btn.pack(side="left", padx=(0, 4))
+    # pause_btn is intentionally not packed here; _toggle_history_playback shows it
 
     ctk.CTkButton(
         row2, text="Save", width=46, height=24,
@@ -675,46 +688,112 @@ def _make_history_card(parent, idx, entry):
     return outer
 
 def _reset_play_btn():
-    """Reset the active play button back to ▶ Play (call from any thread)."""
+    """Reset the active play/pause buttons back to idle state (call from any thread)."""
     btn = _active_play_btn[0]
     if btn:
         try:
             btn.configure(text="▶  Play", fg_color=C_ACCENT_D, hover_color=C_ACCENT)
         except Exception:
             pass
-        _active_play_btn[0] = None
+    pause_btn = _active_pause_btn[0]
+    if pause_btn:
+        try:
+            pause_btn.pack_forget()
+        except Exception:
+            pass
+    _active_play_btn[0]  = None
+    _active_pause_btn[0] = None
+    _pause_pos[0]        = None
+    _play_start_time[0]  = None
 
-def _toggle_history_playback(entry, btn):
+def _toggle_history_playback(entry, btn, pause_btn=None):
+    """Play or stop a history entry. pause_btn is the paired pause widget."""
     # If this button is already the active one, treat as Stop
     if _active_play_btn[0] is btn:
         sd.stop()
-        _reset_play_btn()
-        status_label.configure(text="⏹ Stopped.")
+        app.after(0, _reset_play_btn)
+        app.after(0, lambda: status_label.configure(text="⏹ Stopped."))
         return
 
-    # Stop whatever is playing and reset its button
+    # Stop whatever is currently playing and reset its controls
     sd.stop()
-    _reset_play_btn()
+    app.after(0, _reset_play_btn)
 
-    # Mark this button as active and switch it to Stop
-    _active_play_btn[0] = btn
-    btn.configure(text="■  Stop", fg_color="#3d1515", hover_color="#5a1f1f")
+    samples = np.clip(np.nan_to_num(entry["samples"], nan=0.0), -1.0, 1.0)
+    sr      = entry["sample_rate"]
+
+    # Mark this button as active, show Stop style + pause button
+    _active_play_btn[0]  = btn
+    _active_pause_btn[0] = pause_btn
+    _pause_pos[0]        = None
+    if btn:
+        btn.configure(text="■  Stop", fg_color="#3d1515", hover_color="#5a1f1f")
+    if pause_btn:
+        pause_btn.pack(side="left", padx=(0, 4))
+
+    def _start_playback(start_pos=0):
+        _play_start_time[0] = time.time()
+        sd.play(samples[start_pos:], sr)
 
     def run():
         try:
-            status_label.configure(text=f"🔊 Playing: {entry['text'][:40]}...")
-            samples = np.clip(np.nan_to_num(entry["samples"], nan=0.0), -1.0, 1.0)
-            sd.play(samples, entry["sample_rate"])
+            app.after(0, lambda: status_label.configure(
+                text=f"🔊 Playing: {entry['text'][:40]}..."))
+            _start_playback(0)
             sd.wait()
-            # Only update status if we weren't stopped early
             if _active_play_btn[0] is btn:
-                status_label.configure(text="✅ Playback done.")
-                _reset_play_btn()
+                app.after(0, lambda: status_label.configure(text="✅ Playback done."))
+                app.after(0, _reset_play_btn)
         except Exception as e:
             _log_crash(e)
-            status_label.configure(text=f"❌ {_fmt_err(e)}")
-            _reset_play_btn()
+            app.after(0, lambda: status_label.configure(text=f"❌ {_fmt_err(e)}"))
+            app.after(0, _reset_play_btn)
+
     threading.Thread(target=run, daemon=True).start()
+
+def _toggle_history_pause(entry, play_btn, pause_btn):
+    """Pause or resume the currently playing history entry."""
+    sr = entry["sample_rate"]
+    samples = np.clip(np.nan_to_num(entry["samples"], nan=0.0), -1.0, 1.0)
+
+    if _pause_pos[0] is None:
+        # ── Pause ────────────────────────────────────────────────────────────
+        elapsed = time.time() - (_play_start_time[0] or time.time())
+        pos = int(elapsed * sr)
+        _pause_pos[0] = min(pos, len(samples) - 1)
+        sd.stop()
+        if pause_btn:
+            try:
+                pause_btn.configure(text="▶  Resume")
+            except Exception:
+                pass
+        status_label.configure(text="⏸ Paused.")
+    else:
+        # ── Resume ───────────────────────────────────────────────────────────
+        resume_pos = _pause_pos[0]
+        _pause_pos[0] = None
+        if pause_btn:
+            try:
+                pause_btn.configure(text="⏸ Pause")
+            except Exception:
+                pass
+
+        def run():
+            try:
+                app.after(0, lambda: status_label.configure(
+                    text=f"🔊 Playing: {entry['text'][:40]}..."))
+                _play_start_time[0] = time.time() - (resume_pos / sr)
+                sd.play(samples[resume_pos:], sr)
+                sd.wait()
+                if _active_play_btn[0] is play_btn:
+                    app.after(0, lambda: status_label.configure(text="✅ Playback done."))
+                    app.after(0, _reset_play_btn)
+            except Exception as e:
+                _log_crash(e)
+                app.after(0, lambda: status_label.configure(text=f"❌ {_fmt_err(e)}"))
+                app.after(0, _reset_play_btn)
+
+        threading.Thread(target=run, daemon=True).start()
 
 def play_history_entry(entry):
     """Legacy wrapper — kept for any external callers."""
