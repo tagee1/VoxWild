@@ -24,9 +24,10 @@ from tts_utils import (
     fmt_err, estimate_audio_duration, GenerationCancelled,
 )
 from clone_library import (
-    load_clone_library  as _lib_load,
-    save_clone_library  as _lib_save,
+    load_clone_library   as _lib_load,
+    save_clone_library   as _lib_save,
     add_clone_to_library as _lib_add,
+    rename_clone_in_library as _lib_rename,
 )
 from audio_utils import trim_silence
 import license as _lic
@@ -182,6 +183,33 @@ C_REC       = "#dc3030"   # record button red
 # Button presets
 BTN_GHOST   = dict(fg_color="transparent", hover_color=C_ELEVATED,
                    border_width=1, border_color=C_BORDER, text_color=C_TXT2)
+
+# ── Window animation helpers ──────────────────────────────────────────────────
+def _fade_in(win, steps=10, delay=18):
+    """Fade a CTkToplevel in from transparent to opaque."""
+    win.attributes("-alpha", 0.0)
+    def _step(i):
+        if not win.winfo_exists():
+            return
+        if i > steps:
+            win.attributes("-alpha", 1.0)
+            return
+        win.attributes("-alpha", i / steps)
+        win.after(delay, lambda: _step(i + 1))
+    win.after(delay, lambda: _step(1))
+
+def _fade_out(win, on_done, steps=8, delay=15):
+    """Fade a CTkToplevel out then call on_done (e.g. win.destroy)."""
+    def _step(i):
+        if not win.winfo_exists():
+            on_done()
+            return
+        if i < 0:
+            on_done()
+            return
+        win.attributes("-alpha", i / steps)
+        win.after(delay, lambda: _step(i - 1))
+    _step(steps - 1)
 BTN_DARK    = dict(fg_color=C_CARD, hover_color=C_ELEVATED, text_color=C_TXT2)
 BTN_DANGER  = dict(fg_color="#2a0f0f", hover_color="#3d1515", text_color=C_DANGER,
                    border_width=1, border_color="#3d1515")
@@ -568,8 +596,9 @@ def _make_history_card(parent, idx, entry):
             audio_history.remove(e)
         refresh_history_panel()
 
-    outer = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=6)
-    outer.pack(fill="x", padx=6, pady=(0, 3))
+    outer = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=6,
+                         border_width=1, border_color=C_BORDER)
+    outer.pack(fill="x", padx=6, pady=(0, 6))
     # NOTE: caller (_prepend_history_card) may call outer.lift() after this returns.
 
     # place() ties relheight to outer's actual rendered size, not the pack allocation
@@ -578,9 +607,9 @@ def _make_history_card(parent, idx, entry):
         x=0, y=0, relheight=1)
 
     content = ctk.CTkFrame(outer, fg_color="transparent")
-    content.pack(fill="both", expand=True, padx=(11, 8), pady=6)
+    content.pack(fill="both", expand=True, padx=(11, 8), pady=(8, 8))
 
-    # ── Row 1: timestamp · voice  |  text preview ────────────────────────────
+    # ── Row 1: timestamp · voice ──────────────────────────────────────────────
     row1 = ctk.CTkFrame(content, fg_color="transparent")
     row1.pack(fill="x")
 
@@ -593,14 +622,16 @@ def _make_history_card(parent, idx, entry):
                  font=ctk.CTkFont(family="Segoe UI", size=10),
                  text_color=C_ACCENT).pack(side="left")
 
-    preview = entry["text"][:48].replace("\n", " ") + ("…" if len(entry["text"]) > 48 else "")
-    ctk.CTkLabel(row1, text=preview,
-                 font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT, anchor="w").pack(side="right", fill="x", expand=True)
+    # ── Row 1b: text preview (own line, wraps up to 2 lines) ─────────────────
+    preview = entry["text"].replace("\n", " ")
+    ctk.CTkLabel(content, text=preview,
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT, anchor="w", justify="left",
+                 wraplength=220).pack(fill="x", pady=(3, 0))
 
     # ── Row 2: Play · Save · SRT ─────────────────────────────────────────────
     row2 = ctk.CTkFrame(content, fg_color="transparent")
-    row2.pack(fill="x", pady=(4, 0))
+    row2.pack(fill="x", pady=(6, 0))
 
     play_btn = ctk.CTkButton(
         row2, text="▶  Play", width=70, height=24,
@@ -627,7 +658,7 @@ def _make_history_card(parent, idx, entry):
 
     # ── Row 3: Delete · duration ──────────────────────────────────────────────
     row3 = ctk.CTkFrame(content, fg_color="transparent")
-    row3.pack(fill="x", pady=(2, 0))
+    row3.pack(fill="x", pady=(3, 0))
 
     ctk.CTkButton(
         row3, text="Delete", width=52, height=22,
@@ -722,6 +753,7 @@ def _save_as_mp3(entry, filepath):
     win.resizable(False, False)
     win.grab_set()
     win.configure(fg_color=C_BG)
+    _fade_in(win)
 
     # Header
     hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
@@ -956,6 +988,10 @@ def save_clone_library(entries):
 def add_clone_to_library(name, src_wav_path):
     _invalidate_clone_cache()
     return _lib_add(name, src_wav_path, CLONE_DIR, CLONE_INDEX)
+
+def rename_clone_in_library(old_name, new_name):
+    _invalidate_clone_cache()
+    return _lib_rename(old_name, new_name, CLONE_DIR, CLONE_INDEX)
 
 def apply_enhancements(samples, sample_rate):
     out = samples.astype(np.float32).copy()
@@ -1667,6 +1703,7 @@ def show_text_cleaner():
     win.resizable(True, True)
     win.configure(fg_color=C_BG)
     win.grab_set()
+    _fade_in(win)
 
     header = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=56)
     header.pack(fill="x")
@@ -1750,6 +1787,7 @@ def show_about():
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
+    _fade_in(win)
 
     # ── Header ────────────────────────────────────────────────────────────────
     hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=150)
@@ -2172,6 +2210,61 @@ def _delete_clone():
     _refresh_clone_menu()
     status_label.configure(text=f"Deleted clone: {name}")
 
+def _rename_clone():
+    old_name = cb_clone_var.get()
+    if old_name == _CLONE_DEFAULT:
+        status_label.configure(text="⚠️ Default voice cannot be renamed.")
+        return
+
+    win = ctk.CTkToplevel(app)
+    win.title("Rename Voice Clone")
+    win.geometry("340x130")
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+    _fade_in(win)
+
+    ctk.CTkLabel(win, text="New name for this voice clone:",
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT).pack(padx=20, pady=(18, 6), anchor="w")
+
+    entry = ctk.CTkEntry(win, font=ctk.CTkFont(family="Segoe UI", size=12),
+                         fg_color=C_ELEVATED, border_color=C_BORDER,
+                         text_color=C_TXT, height=32, width=300)
+    entry.insert(0, old_name)
+    entry.select_range(0, "end")
+    entry.focus()
+    entry.pack(padx=20)
+
+    def _confirm():
+        new_name = entry.get().strip()
+        if not new_name:
+            return
+        if new_name == old_name:
+            win.destroy()
+            return
+        # Deduplicate against existing names
+        lib = load_clone_library()
+        existing = {e["name"] for e in lib if e["name"] != old_name}
+        base, n = new_name, 2
+        while new_name in existing:
+            new_name = f"{base} ({n})"; n += 1
+        if not rename_clone_in_library(old_name, new_name):
+            status_label.configure(text=f"⚠️ Could not rename '{old_name}' — entry not found.")
+            win.destroy()
+            return
+        _refresh_clone_menu()
+        cb_clone_var.set(new_name)  # set AFTER refresh so menu knows the name
+        status_label.configure(text=f"Renamed to: {new_name}")
+        win.destroy()
+
+    ctk.CTkButton(win, text="Rename", command=_confirm,
+                  height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
+                  fg_color=C_ACCENT_D, hover_color=C_ACCENT,
+                  text_color=C_TXT).pack(pady=10)
+    win.bind("<Return>", lambda _: _confirm())
+
 def show_voice_recorder():
     SAMPLE_RATE = 44100
     CLONE_SCRIPT = (
@@ -2186,6 +2279,7 @@ def show_voice_recorder():
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
+    _fade_in(win)
 
     hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=56)
     hdr.pack(fill="x")
@@ -2377,6 +2471,7 @@ def _browse_and_add_clone():
     name_win.resizable(False, False)
     name_win.configure(fg_color=C_BG)
     name_win.grab_set()
+    _fade_in(name_win)
     ctk.CTkLabel(name_win, text="Name for this voice clone:",
                  font=ctk.CTkFont(family="Segoe UI", size=12),
                  text_color=C_TXT).pack(padx=20, pady=(18, 6), anchor="w")
@@ -2406,6 +2501,9 @@ ctk.CTkButton(cb_clone_btns, text="Record New", command=show_voice_recorder,
               fg_color=C_ACCENT_D, hover_color=C_ACCENT, text_color=C_TXT).pack(side="left", padx=(0, 5))
 ctk.CTkButton(cb_clone_btns, text="Browse", command=_browse_and_add_clone,
               width=76, height=28, font=ctk.CTkFont(family="Segoe UI", size=11),
+              **BTN_GHOST).pack(side="left", padx=(0, 5))
+ctk.CTkButton(cb_clone_btns, text="Rename", command=_rename_clone,
+              width=70, height=28, font=ctk.CTkFont(family="Segoe UI", size=11),
               **BTN_GHOST).pack(side="left", padx=(0, 5))
 ctk.CTkButton(cb_clone_btns, text="Delete", command=_delete_clone,
               width=62, height=28, font=ctk.CTkFont(family="Segoe UI", size=11),
@@ -2935,8 +3033,9 @@ def _make_chatterbox_loading_modal():
                  font=ctk.CTkFont(family="Segoe UI", size=11),
                  text_color=C_TXT2).pack(padx=20, anchor="w")
 
-    # Force the window to render before the background thread starts
+    # Force a render pass then fade in before the background thread starts
     win.update()
+    _fade_in(win)
 
     def update_status(msg):
         app.after(0, lambda m=msg: status_var.set(m))
@@ -2944,7 +3043,7 @@ def _make_chatterbox_loading_modal():
     def close_modal():
         def _do():
             bar.stop()
-            win.destroy()
+            _fade_out(win, win.destroy)
         app.after(0, _do)
 
     return update_status, close_modal
@@ -2990,6 +3089,7 @@ def _show_activation_modal(can_skip=True, remaining=0):
     win.configure(fg_color=C_BG)
     win.grab_set()
     win.transient(app)
+    _fade_in(win)
 
     # ── Header ────────────────────────────────────────────────────────────────
     hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
