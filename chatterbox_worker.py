@@ -72,10 +72,14 @@ def load_model_from_local(local_dir):
         try:
             conds = Conditionals.load(ckpt_dir / "conds.pt", map_location="cpu").to("cpu")
             # conds.pt is sometimes saved with batch_size=2 (CFG pair: [uncond, cond]).
-            # Normalize any batch-2 tensor to batch-1 so CPU generation doesn't mismatch.
-            for key, val in list(conds.__dict__.items()):
+            # Normalize to batch-1. Tensors live inside conds.t3 (T3Cond dataclass)
+            # and conds.gen (dict) — NOT at the top-level conds.__dict__.
+            for key, val in list(conds.t3.__dict__.items()):
                 if isinstance(val, torch.Tensor) and val.ndim >= 1 and val.shape[0] == 2:
-                    conds.__dict__[key] = val[:1]
+                    setattr(conds.t3, key, val[:1])
+            for key, val in list(conds.gen.items()):
+                if isinstance(val, torch.Tensor) and val.ndim >= 1 and val.shape[0] == 2:
+                    conds.gen[key] = val[:1]
         except Exception:
             conds = None
 
@@ -138,6 +142,55 @@ def main():
                 temperature  = float(req.get("temperature", 0.8))
                 out_path     = req["output_path"]
 
+                # Preprocess voice clone audio:
+                #   1. Convert stereo → mono (model requires 1 channel)
+                #   2. Normalize amplitude — quiet recordings (e.g. phone mics, whispers)
+                #      produce near-zero embeddings that cause the model to output
+                #      garbage or NaN audio, which crashes PortAudio on playback.
+                _tmp_prompt = None
+                if audio_prompt:
+                    try:
+                        import tempfile
+                        import torch as _torch
+                        waveform, sr = torchaudio.load(audio_prompt)
+                        changed = False
+
+                        # Stereo → mono
+                        if waveform.shape[0] > 1:
+                            waveform = waveform.mean(dim=0, keepdim=True)
+                            changed = True
+
+                        # Minimum duration: VoiceEncoder needs at least 1.6s of speech
+                        # (processed in 160ms windows). Reject anything under 2s to be safe.
+                        duration_sec = waveform.shape[-1] / sr
+                        if duration_sec < 2.0:
+                            emit({"type": "error",
+                                  "msg": f"Voice clone recording is too short ({duration_sec:.1f}s). "
+                                         "Please record at least 6 seconds of clear speech.  [E011]"})
+                            audio_prompt = None
+
+                        # Amplitude normalization — target peak of 0.95
+                        if audio_prompt is not None:
+                            peak = waveform.abs().max().item()
+                            if peak < 0.001:
+                                emit({"type": "error",
+                                      "msg": "Voice clone recording is too quiet to use "
+                                             f"(peak level: {peak:.5f}). "
+                                             "Please re-record in a louder environment.  [E010]"})
+                                audio_prompt = None
+                            elif peak < 0.5:
+                                waveform = waveform * (0.95 / peak)
+                                changed = True
+
+                        if audio_prompt and changed:
+                            _tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                            torchaudio.save(_tmp.name, waveform, sr)
+                            _tmp.close()
+                            _tmp_prompt = _tmp.name
+                            audio_prompt = _tmp_prompt
+                    except Exception:
+                        pass  # if preprocessing fails, pass original and let model error naturally
+
                 emit({"type": "status", "msg": "Generating audio..."})
                 wav = model.generate(
                     text,
@@ -154,5 +207,11 @@ def main():
                 import traceback as _tb
                 print(_tb.format_exc(), file=sys.stderr, flush=True)
                 emit({"type": "error", "msg": str(e)})
+            finally:
+                if _tmp_prompt:
+                    try:
+                        os.unlink(_tmp_prompt)
+                    except OSError:
+                        pass
 
 main()

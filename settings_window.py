@@ -3,7 +3,9 @@ import json
 import os
 from tkinter import filedialog
 
-SETTINGS_FILE = "settings.json"
+SETTINGS_FILE = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio", "settings.json"
+)
 
 # ── Studio Gold palette (must match app.py) ───────────────────────────────────
 C_BG        = "#0d0d0d"

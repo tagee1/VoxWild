@@ -12,19 +12,38 @@ def format_time(seconds):
     return f"{seconds // 60}m {seconds % 60}s"
 
 
-def chunk_text(text, max_chars=800):
+def chunk_text(text, max_chars=800, min_chars=80):
     sentences = []
-    for s in text.replace("!\n", "! ").replace("?\n", "? ").replace(".\n", ". ").split(". "):
-        s = s.strip()
+    # Protect ellipses ("..." and "..") before splitting on ". " so that
+    # "Just listen... and rest" is not torn into "Just listen.." + "and rest".
+    _normalized = (text
+        .replace("...", "\x00ELLIPSIS3\x00")
+        .replace("..", "\x00ELLIPSIS2\x00")
+        .replace("!\n", "! ")
+        .replace("?\n", "? ")
+        .replace(".\n", ". "))
+    for s in _normalized.split(". "):
+        s = (s.strip()
+               .replace("\x00ELLIPSIS3\x00", "...")
+               .replace("\x00ELLIPSIS2\x00", ".."))
         if s: sentences.append(s)
     chunks, current = [], ""
     for s in sentences:
+        # If the sentence already ends with punctuation (e.g. "Let's begin.")
+        # don't append another period — that produces "Let's begin.." which
+        # confuses neural TTS models and causes them to drop the last line.
+        suffix = " " if s and s[-1] in ".!?" else ". "
         if len(current) + len(s) < max_chars:
-            current += s + ". "
+            current += s + suffix
         else:
             if current: chunks.append(current.strip())
-            current = s + ". "
+            current = s + suffix
     if current: chunks.append(current.strip())
+    # Merge a short final chunk into the previous one to avoid Chatterbox producing
+    # distorted audio on tiny inputs (e.g. "Let's begin." as an orphan chunk).
+    if len(chunks) > 1 and len(chunks[-1]) < min_chars:
+        chunks[-2] = chunks[-2] + " " + chunks[-1]
+        chunks.pop()
     return chunks or [text]
 
 
@@ -79,10 +98,77 @@ class GenerationCancelled(Exception):
 
 
 def fmt_err(e):
-    """Return a single-line, printable error string suitable for a status label."""
-    msg = str(e)
-    first_line = next((l.strip() for l in msg.splitlines() if l.strip()), msg)
-    return "".join(ch if ch.isprintable() or ch == " " else "?" for ch in first_line)
+    """Return a plain-English error string with a crash code for the status label.
+
+    Format: "Human readable message  [E###]"
+    Codes:
+      E001 — Out of memory / RAM
+      E002 — Audio device not found
+      E003 — File permission denied
+      E004 — Disk full
+      E005 — File not found
+      E006 — Network / connection error
+      E007 — Model tensor mismatch (bad audio prompt)
+      E008 — Model device mismatch
+      E009 — Unsupported audio file format
+      E010 — Voice clone recording too quiet
+      E011 — Voice clone recording too short
+      E099 — Unknown / unrecognised error
+    """
+    raw  = str(e).lower()
+    full = str(e)
+
+    def _r(msg, code):
+        return f"{msg}  [{code}]"
+
+    # ── Memory / RAM ──────────────────────────────────────────────────────────
+    if any(k in raw for k in ("out of memory", "not enough memory", "memoryerror",
+                               "paging file", "winerror 1455", "cannot allocate")):
+        return _r("Not enough RAM — close other apps and try again", "E001")
+
+    # ── Audio device ──────────────────────────────────────────────────────────
+    if any(k in raw for k in ("no default output", "invalid device", "portaudio",
+                               "device unavailable", "hostapierror")):
+        return _r("Audio device not found — check your speakers/headphones in Windows Sound settings", "E002")
+
+    # ── File permission / disk ────────────────────────────────────────────────
+    if "permissionerror" in raw or "access is denied" in raw:
+        return _r("Permission denied — the file may be open in another app, or the folder is read-only", "E003")
+    if any(k in raw for k in ("disk full", "no space left", "there is not enough space")):
+        return _r("Disk full — free up space and try again", "E004")
+
+    # ── File not found ────────────────────────────────────────────────────────
+    if "filenotfounderror" in raw or "no such file" in raw:
+        return _r("File not found — it may have been moved or deleted", "E005")
+
+    # ── Network / download ────────────────────────────────────────────────────
+    if any(k in raw for k in ("connectionerror", "connection refused", "timed out",
+                               "network", "ssl", "certificate")):
+        return _r("Network error — check your internet connection and try again", "E006")
+
+    # ── Model / tensor errors (Chatterbox) ───────────────────────────────────
+    if "sizes of tensors must match" in raw or "size does not match" in raw:
+        return _r("Model error — audio prompt may be incompatible. Try a different voice sample", "E007")
+    if "expected all tensors to be on the same device" in raw:
+        return _r("Model error — device mismatch. Restart the app and try again", "E008")
+
+    # ── Voice clone quality ───────────────────────────────────────────────────
+    if "too quiet" in raw or "e010" in raw:
+        return _r("Voice clone recording is too quiet — re-record in a louder environment", "E010")
+    if "too short" in raw or "voice clone" in raw and "short" in raw:
+        return _r("Voice clone recording is too short — use at least 6 seconds of clear speech", "E011")
+
+    # ── Audio file format ─────────────────────────────────────────────────────
+    if any(k in raw for k in ("sndfile", "unknown format", "could not read",
+                               "unrecognized audio", "unsupported format")):
+        return _r("Unsupported audio format — use a WAV or MP3 file", "E009")
+
+    # ── Fallback: trim to first meaningful line, strip stack trace noise ──────
+    first_line = next((l.strip() for l in full.splitlines() if l.strip()), full)
+    clean = "".join(ch if ch.isprintable() or ch == " " else "?" for ch in first_line)
+    if clean.startswith(("RuntimeError:", "ValueError:", "OSError:", "TypeError:")):
+        clean = clean.split(":", 1)[-1].strip()
+    return _r(clean[:100], "E099")
 
 
 def estimate_audio_duration(text, speed):

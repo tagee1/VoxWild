@@ -28,6 +28,7 @@ from clone_library import (
     add_clone_to_library as _lib_add,
 )
 from audio_utils import trim_silence
+import license as _lic
 
 # ── In-memory caches (eliminates repeated disk reads in hot paths) ────────────
 _settings_cache     = None
@@ -67,10 +68,84 @@ def _invalidate_clone_cache():
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 VERSION          = "1.0.0"
-PROFILES_FILE    = "tts_profiles.json"
-CALIBRATION_FILE = "calibration.json"
-SETTINGS_FILE    = "settings.json"
 MAX_HISTORY      = 10
+
+# ── User data directory (%APPDATA%\TTS Studio) ────────────────────────────────
+_USER_DIR        = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio")
+os.makedirs(_USER_DIR, exist_ok=True)
+
+PROFILES_FILE    = os.path.join(_USER_DIR, "tts_profiles.json")
+CALIBRATION_FILE = os.path.join(_USER_DIR, "calibration.json")
+SETTINGS_FILE    = os.path.join(_USER_DIR, "settings.json")
+CLONE_DIR        = os.path.join(_USER_DIR, "voice_clones")
+CLONE_INDEX      = os.path.join(CLONE_DIR, "library.json")
+
+# ── One-time migration: copy existing user files from app dir to %APPDATA% ────
+def _migrate_user_data():
+    """Copy legacy files from the app directory to %APPDATA% on first launch."""
+    _app_dir = os.path.dirname(os.path.abspath(__file__))
+    _migrations = [
+        ("tts_profiles.json",       PROFILES_FILE),
+        ("calibration.json",        CALIBRATION_FILE),
+        ("settings.json",           SETTINGS_FILE),
+    ]
+    import shutil as _shutil
+    for _src_name, _dst in _migrations:
+        _src = os.path.join(_app_dir, _src_name)
+        if os.path.exists(_src) and not os.path.exists(_dst):
+            try:
+                _shutil.copy2(_src, _dst)
+            except OSError:
+                pass
+    # Migrate voice_clones directory
+    _src_clones = os.path.join(_app_dir, "voice_clones")
+    if os.path.isdir(_src_clones) and not os.path.exists(CLONE_INDEX):
+        try:
+            _shutil.copytree(_src_clones, CLONE_DIR, dirs_exist_ok=True)
+        except OSError:
+            pass
+
+_migrate_user_data()
+
+# ── Crash logger ──────────────────────────────────────────────────────────────
+import traceback as _traceback
+from datetime import datetime as _dt
+
+_CRASH_LOG = os.path.join(_USER_DIR, "crashes.log")
+_MAX_CRASH_LOG_BYTES = 512 * 1024  # 512 KB — rotate when exceeded
+
+def _log_crash(e, tb_str=None):
+    """Append a crash entry to crashes.log. Never raises."""
+    try:
+        # Rotate log if it's grown too large
+        if os.path.exists(_CRASH_LOG) and os.path.getsize(_CRASH_LOG) > _MAX_CRASH_LOG_BYTES:
+            _rotated = _CRASH_LOG + ".old"
+            try:
+                os.replace(_CRASH_LOG, _rotated)
+            except OSError:
+                pass
+
+        if tb_str is None:
+            tb_str = _traceback.format_exc()
+
+        code = "E099"
+        from tts_utils import fmt_err as _fe
+        msg = _fe(e)
+        import re as _re
+        m = _re.search(r'\[(E\d{3})\]', msg)
+        if m:
+            code = m.group(1)
+
+        timestamp = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = (
+            f"[{timestamp}] {code} — {type(e).__name__}: {str(e)[:200]}\n"
+            f"{tb_str.strip()}\n"
+            f"{'-' * 60}\n"
+        )
+        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception:
+        pass  # logging must never crash the app
 
 # ── Theme palette (Studio Gold) ───────────────────────────────────────────────
 C_BG        = "#0d0d0d"   # carbon black
@@ -131,18 +206,30 @@ def _run_splash(on_done):
     import tkinter as _tk
 
     SW, SH = 520, 360
-    splash = ctk.CTkToplevel()
+
+    # Use plain tk.Toplevel — ctk.CTkToplevel has deferred-init callbacks that
+    # keep resetting geometry, making centering unreliable on Windows.
+    splash = _tk.Toplevel(app)
     splash.overrideredirect(True)
-    splash.configure(fg_color=C_BG)
+    splash.configure(bg=C_BG)
     splash.attributes("-topmost", True)
 
-    # Center on screen
-    splash.update_idletasks()
-    sw_screen = splash.winfo_screenwidth()
-    sh_screen = splash.winfo_screenheight()
+    # Center on screen using logical-pixel screen dimensions.
+    # winfo_screenwidth/height can return physical pixels on HiDPI Windows,
+    # but window coordinates are always in logical pixels.  ctypes
+    # GetSystemMetrics returns logical-pixel values that match window coords.
+    try:
+        import ctypes as _ctypes
+        _u32 = _ctypes.windll.user32
+        sw_screen = _u32.GetSystemMetrics(0)   # SM_CXSCREEN (logical px)
+        sh_screen = _u32.GetSystemMetrics(1)   # SM_CYSCREEN (logical px)
+    except Exception:
+        sw_screen = app.winfo_screenwidth()
+        sh_screen = app.winfo_screenheight()
     x = (sw_screen - SW) // 2
     y = (sh_screen - SH) // 2
     splash.geometry(f"{SW}x{SH}+{x}+{y}")
+    splash.update_idletasks()
 
     # Amber border frame
     border = ctk.CTkFrame(splash, fg_color=C_ACCENT, corner_radius=16)
@@ -357,14 +444,29 @@ def set_default_folder(path):
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 def load_calibration():
+    data = {"words_per_second": None, "samples": [],
+            "cb_words_per_second": None, "cb_samples": []}
     if os.path.exists(CALIBRATION_FILE):
         try:
             with open(CALIBRATION_FILE, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (OSError, json.JSONDecodeError):
             pass
-    return {"words_per_second": None, "samples": [],
-            "cb_words_per_second": None, "cb_samples": []}
+
+    # One-time migration: remove outlier samples captured during model-load.
+    # Values < 0.1 wps are physically impossible during normal generation.
+    _changed = False
+    for s_key, w_key in [("samples", "words_per_second"),
+                          ("cb_samples", "cb_words_per_second")]:
+        clean = [s for s in data.get(s_key, []) if s >= 0.1]
+        if len(clean) != len(data.get(s_key, [])):
+            data[s_key] = clean
+            data[w_key] = round(sum(clean) / len(clean), 3) if clean else None
+            _changed = True
+    if _changed:
+        save_calibration(data)
+
+    return data
 
 def save_calibration(data):
     _invalidate_calibration()
@@ -374,29 +476,34 @@ def save_calibration(data):
     except OSError:
         pass  # calibration is non-critical; silently skip if disk write fails
 
-def record_calibration(word_count, elapsed_seconds):
+def record_calibration(word_count, elapsed_seconds, use_cb=None):
     data = _get_calibration()
-    use_cb = engine_var.get() == "🎙️ Natural"
-    wps = word_count / elapsed_seconds if elapsed_seconds > 0 else (3 if use_cb else 55)
+    if use_cb is None:
+        use_cb = engine_var.get() == "🎙️ Natural"
+    wps = word_count / elapsed_seconds if elapsed_seconds > 0 else (0.5 if use_cb else 55)
+    _EMA_ALPHA = 0.4
     if use_cb:
         data.setdefault("cb_samples", [])
-        data["cb_samples"].append(round(wps, 2))
-        data["cb_samples"] = data["cb_samples"][-10:]
-        data["cb_words_per_second"] = round(sum(data["cb_samples"]) / len(data["cb_samples"]), 2)
+        data["cb_samples"].append(round(wps, 3))
+        data["cb_samples"] = data["cb_samples"][-5:]
+        prior = data.get("cb_words_per_second") or 0.5
+        data["cb_words_per_second"] = round(_EMA_ALPHA * wps + (1 - _EMA_ALPHA) * prior, 3)
     else:
-        data["samples"].append(round(wps, 2))
-        data["samples"] = data["samples"][-10:]
-        data["words_per_second"] = round(sum(data["samples"]) / len(data["samples"]), 2)
+        data["samples"].append(round(wps, 3))
+        data["samples"] = data["samples"][-5:]
+        prior = data.get("words_per_second") or 55
+        data["words_per_second"] = round(_EMA_ALPHA * wps + (1 - _EMA_ALPHA) * prior, 3)
     save_calibration(data)
 
 def get_words_per_second():
     data = _get_calibration()
     if engine_var.get() == "🎙️ Natural":
-        return data.get("cb_words_per_second") or 3
+        return data.get("cb_words_per_second") or 0.5
     return data.get("words_per_second") or 55
 
 # ── Audio History ─────────────────────────────────────────────────────────────
 audio_history = []   # list of dicts: {samples, sample_rate, text, duration, timestamp, voice}
+_active_play_btn = [None]   # currently playing card's Play button, or None
 
 def add_to_history(samples, sample_rate, text, voice_name, segments=None):
     duration = len(samples) / sample_rate
@@ -450,11 +557,13 @@ def _make_history_card(parent, idx, entry):
     outer.pack(fill="x", padx=6, pady=(0, 3))
     # NOTE: caller (_prepend_history_card) may call outer.lift() after this returns.
 
-    ctk.CTkFrame(outer, fg_color=C_ACCENT, width=3, corner_radius=0).pack(
-        side="left", fill="y")
+    # place() ties relheight to outer's actual rendered size, not the pack allocation
+    # (fill="y" inside a CTkScrollableFrame expands to the full viewport height)
+    ctk.CTkFrame(outer, fg_color=C_ACCENT, width=3, corner_radius=0).place(
+        x=0, y=0, relheight=1)
 
     content = ctk.CTkFrame(outer, fg_color="transparent")
-    content.pack(side="left", fill="both", expand=True, padx=8, pady=6)
+    content.pack(fill="both", expand=True, padx=(11, 8), pady=6)
 
     # ── Row 1: timestamp · voice  |  text preview ────────────────────────────
     row1 = ctk.CTkFrame(content, fg_color="transparent")
@@ -464,7 +573,7 @@ def _make_history_card(parent, idx, entry):
                  font=ctk.CTkFont(family="Segoe UI", size=10),
                  text_color=C_TXT3).pack(side="left")
 
-    voice_short = entry["voice"].split(" - ")[-1].replace(" (Best)", "")
+    voice_short = entry["voice"].split(" - ")[-1].replace(" (Best)", "") if " - " in entry["voice"] else entry["voice"]
     ctk.CTkLabel(row1, text=f"  {voice_short}",
                  font=ctk.CTkFont(family="Segoe UI", size=10),
                  text_color=C_ACCENT).pack(side="left")
@@ -472,18 +581,19 @@ def _make_history_card(parent, idx, entry):
     preview = entry["text"][:48].replace("\n", " ") + ("…" if len(entry["text"]) > 48 else "")
     ctk.CTkLabel(row1, text=preview,
                  font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT, anchor="e").pack(side="right", fill="x", expand=True)
+                 text_color=C_TXT, anchor="w").pack(side="right", fill="x", expand=True)
 
-    # ── Row 2: Play · Save · SRT?  |  duration · Delete ─────────────────────
+    # ── Row 2: Play · Save · SRT ─────────────────────────────────────────────
     row2 = ctk.CTkFrame(content, fg_color="transparent")
     row2.pack(fill="x", pady=(4, 0))
 
-    ctk.CTkButton(
+    play_btn = ctk.CTkButton(
         row2, text="▶  Play", width=70, height=24,
         font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
         fg_color=C_ACCENT_D, hover_color=C_ACCENT, text_color=C_TXT, corner_radius=5,
-        command=lambda e=entry: play_history_entry(e)
-    ).pack(side="left", padx=(0, 4))
+    )
+    play_btn.configure(command=lambda e=entry, b=play_btn: _toggle_history_playback(e, b))
+    play_btn.pack(side="left", padx=(0, 4))
 
     ctk.CTkButton(
         row2, text="Save", width=46, height=24,
@@ -500,31 +610,69 @@ def _make_history_card(parent, idx, entry):
             command=lambda e=entry: export_srt_from_entry(e)
         ).pack(side="left", padx=(0, 4))
 
+    # ── Row 3: Delete · duration ──────────────────────────────────────────────
+    row3 = ctk.CTkFrame(content, fg_color="transparent")
+    row3.pack(fill="x", pady=(2, 0))
+
     ctk.CTkButton(
-        row2, text="Delete", width=52, height=24,
+        row3, text="Delete", width=52, height=22,
         font=ctk.CTkFont(family="Segoe UI", size=10),
         fg_color="transparent", hover_color="#3d1515",
         text_color=C_DANGER, border_width=1, border_color="#3d1515", corner_radius=5,
         command=_delete
-    ).pack(side="right")
+    ).pack(side="left")
 
-    ctk.CTkLabel(row2, text=format_time(int(entry["duration"])),
+    ctk.CTkLabel(row3, text=format_time(int(entry["duration"])),
                  font=ctk.CTkFont(family="Segoe UI", size=10),
-                 text_color=C_TXT3).pack(side="right", padx=(0, 6))
+                 text_color=C_TXT3).pack(side="right", padx=(0, 2))
 
     return outer
 
-def play_history_entry(entry):
+def _reset_play_btn():
+    """Reset the active play button back to ▶ Play (call from any thread)."""
+    btn = _active_play_btn[0]
+    if btn:
+        try:
+            btn.configure(text="▶  Play", fg_color=C_ACCENT_D, hover_color=C_ACCENT)
+        except Exception:
+            pass
+        _active_play_btn[0] = None
+
+def _toggle_history_playback(entry, btn):
+    # If this button is already the active one, treat as Stop
+    if _active_play_btn[0] is btn:
+        sd.stop()
+        _reset_play_btn()
+        status_label.configure(text="⏹ Stopped.")
+        return
+
+    # Stop whatever is playing and reset its button
+    sd.stop()
+    _reset_play_btn()
+
+    # Mark this button as active and switch it to Stop
+    _active_play_btn[0] = btn
+    btn.configure(text="■  Stop", fg_color="#3d1515", hover_color="#5a1f1f")
+
     def run():
         try:
-            sd.stop()
             status_label.configure(text=f"🔊 Playing: {entry['text'][:40]}...")
-            sd.play(entry["samples"], entry["sample_rate"])
+            samples = np.clip(np.nan_to_num(entry["samples"], nan=0.0), -1.0, 1.0)
+            sd.play(samples, entry["sample_rate"])
             sd.wait()
-            status_label.configure(text="✅ Playback done.")
+            # Only update status if we weren't stopped early
+            if _active_play_btn[0] is btn:
+                status_label.configure(text="✅ Playback done.")
+                _reset_play_btn()
         except Exception as e:
+            _log_crash(e)
             status_label.configure(text=f"❌ {_fmt_err(e)}")
+            _reset_play_btn()
     threading.Thread(target=run, daemon=True).start()
+
+def play_history_entry(entry):
+    """Legacy wrapper — kept for any external callers."""
+    _toggle_history_playback(entry, None)
 
 def download_history_entry(entry):
     folder = get_default_folder()
@@ -544,7 +692,8 @@ def download_history_entry(entry):
             sf.write(filepath, entry["samples"], entry["sample_rate"])
             status_label.configure(text=f"✅ Saved: {os.path.basename(filepath)}")
         except Exception as e:
-            status_label.configure(text=f"❌ Save failed: {e}")
+            _log_crash(e)
+            status_label.configure(text=f"❌ Save failed: {_fmt_err(e)}")
 
 def _save_as_mp3(entry, filepath):
     """Show MP3 metadata dialog then encode and save."""
@@ -663,7 +812,8 @@ def _save_as_mp3(entry, filepath):
             status_label.configure(
                 text=f"✅ Saved MP3: {os.path.basename(filepath)}  ({bitrate} kbps)")
         except Exception as e:
-            status_label.configure(text=f"❌ MP3 encode failed: {e}")
+            _log_crash(e)
+            status_label.configure(text=f"❌ MP3 encode failed: {_fmt_err(e)}")
 
     ctk.CTkButton(foot_inner, text="Save MP3", command=_do_save,
                   width=120, height=34,
@@ -695,7 +845,8 @@ def export_srt_from_entry(entry):
             f.write(srt_content)
         status_label.configure(text=f"✅ SRT saved: {os.path.basename(filepath)}")
     except Exception as e:
-        status_label.configure(text=f"❌ SRT export failed: {e}")
+        _log_crash(e)
+        status_label.configure(text=f"❌ SRT export failed: {_fmt_err(e)}")
 
 # ── Smooth Progress ───────────────────────────────────────────────────────────
 class SmoothProgress:
@@ -776,8 +927,7 @@ def estimate_processing_time(text):
 # chunk_text imported from tts_utils
 
 # ── Voice Clone Library ────────────────────────────────────────────────────────
-CLONE_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_clones")
-CLONE_INDEX = os.path.join(CLONE_DIR, "library.json")
+# CLONE_DIR / CLONE_INDEX defined near the top with other user-data paths.
 
 # Thin wrappers bind the module-level paths so all existing call sites are unchanged.
 # The in-memory _clone_cache is used for reads; writes invalidate it.
@@ -952,11 +1102,21 @@ def generate_audio(text, voice, speed, status_cb=None):
     pre_total_dur = offset
 
     combined = np.concatenate(all_samples)
+
+    # Sanitize — NaN/Inf in audio (from a bad voice clone prompt) will crash
+    # PortAudio at the C level with no Python exception and no error message.
+    if not np.isfinite(combined).all():
+        combined = np.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
+    combined = np.clip(combined, -1.0, 1.0)
+
     if trim_var.get():
         if status_cb: status_cb("✂️ Trimming silence...")
         combined = trim_silence(combined, sample_rate)
     if status_cb: status_cb("🎛️ Applying enhancements...")
     enhanced = apply_enhancements(combined, sample_rate)
+
+    # Final clip after enhancements (compressor/gain can push above 1.0)
+    enhanced = np.clip(enhanced, -1.0, 1.0)
 
     # Scale timings to match final (post-trim/enhance) audio length
     post_total_dur = len(enhanced) / sample_rate
@@ -1049,6 +1209,17 @@ def apply_settings(s):
     trim_var.set(s.get("trim", True))
     update_all_labels()
     update_word_count()
+    eq_preset_var.set("Custom")
+
+EQ_PRESETS = {
+    "Custom":             None,
+    "🎚️ Flat":            {"highpass": 20,  "lowpass": 18000, "compressor": False, "compressor_ratio": 1.0, "reverb": 0.0,  "gain": 0, "noise_gate": False, "trim": False},
+    "🎙️ Podcast":         {"highpass": 100, "lowpass": 14000, "compressor": True,  "compressor_ratio": 4.0, "reverb": 0.05, "gain": 3, "noise_gate": True,  "trim": True},
+    "📖 Audiobook":       {"highpass": 60,  "lowpass": 16000, "compressor": True,  "compressor_ratio": 2.5, "reverb": 0.08, "gain": 1, "noise_gate": False, "trim": True},
+    "📻 Broadcast":       {"highpass": 120, "lowpass": 12000, "compressor": True,  "compressor_ratio": 6.0, "reverb": 0.03, "gain": 4, "noise_gate": True,  "trim": True},
+    "🎬 Cinematic":       {"highpass": 40,  "lowpass": 15000, "compressor": True,  "compressor_ratio": 2.0, "reverb": 0.30, "gain": 0, "noise_gate": False, "trim": True},
+    "🌙 Warm & Intimate": {"highpass": 80,  "lowpass": 10000, "compressor": True,  "compressor_ratio": 3.0, "reverb": 0.15, "gain": 2, "noise_gate": True,  "trim": True},
+}
 
 def load_profiles():
     if os.path.exists(PROFILES_FILE):
@@ -1105,6 +1276,26 @@ def delete_profile():
         if remaining: profile_var.set(remaining[0])
         status_label.configure(text=f"🗑 Profile '{name}' deleted.")
 
+_applying_eq_preset = False
+
+def apply_eq_preset(name=None):
+    global _applying_eq_preset
+    name = name or eq_preset_var.get()
+    p = EQ_PRESETS.get(name)
+    if not p:
+        return
+    _applying_eq_preset = True
+    highpass_slider.set(p["highpass"])
+    lowpass_slider.set(p["lowpass"])
+    compressor_var.set(p["compressor"])
+    compressor_slider.set(p["compressor_ratio"])
+    reverb_slider.set(p["reverb"])
+    gain_slider.set(p["gain"])
+    noise_gate_var.set(p["noise_gate"])
+    trim_var.set(p["trim"])
+    _applying_eq_preset = False
+    update_all_labels()
+
 # ── Cancellation ─────────────────────────────────────────────────────────────
 # GenerationCancelled imported from tts_utils
 _cancel_event = threading.Event()
@@ -1124,10 +1315,53 @@ def queue_add():
     if not text:
         status_label.configure(text="⚠️ No text to add.")
         return
+
     _queue_counter += 1
-    queue_items.append({"name": f"Item {_queue_counter}", "text": text})
-    refresh_queue_display()
-    status_label.configure(text=f"✅ Added. {len(queue_items)} item(s) in queue.")
+    # Suggest first ~5 words of the text as the default name
+    suggested = " ".join(text.split()[:5])
+    if len(text.split()) > 5:
+        suggested += "…"
+
+    # ── Name popup ────────────────────────────────────────────────────────────
+    dlg = ctk.CTkToplevel(app)
+    dlg.title("Name this queue item")
+    dlg.geometry("360x140")
+    dlg.resizable(False, False)
+    dlg.configure(fg_color=C_BG)
+    dlg.grab_set()
+    dlg.transient(app)
+
+    ctk.CTkLabel(dlg, text="Queue item name:",
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT2).pack(anchor="w", padx=20, pady=(18, 4))
+
+    name_entry = ctk.CTkEntry(dlg, width=320, height=34,
+                              font=ctk.CTkFont(family="Segoe UI", size=12))
+    name_entry.insert(0, suggested)
+    name_entry.select_range(0, "end")
+    name_entry.pack(padx=20)
+    name_entry.focus_set()
+
+    btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+    btn_row.pack(fill="x", padx=20, pady=(12, 0))
+
+    def _confirm(e=None):
+        name = name_entry.get().strip() or suggested
+        queue_items.append({"name": name, "text": text})
+        refresh_queue_display()
+        status_label.configure(text=f"✅ Added '{name}'. {len(queue_items)} item(s) in queue.")
+        dlg.destroy()
+
+    ctk.CTkButton(btn_row, text="Add to Queue", width=120, height=32,
+                  font=ctk.CTkFont(family="Segoe UI", size=12),
+                  fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
+                  command=_confirm).pack(side="left", padx=(0, 8))
+    ctk.CTkButton(btn_row, text="Cancel", width=80, height=32,
+                  font=ctk.CTkFont(family="Segoe UI", size=12),
+                  **BTN_GHOST, command=dlg.destroy).pack(side="left")
+
+    name_entry.bind("<Return>", _confirm)
+    dlg.bind("<Escape>", lambda _e: dlg.destroy())
 
 def queue_remove():
     sel = queue_listbox.curselection()
@@ -1175,7 +1409,11 @@ def queue_generate_all():
     set_default_folder(out_dir)
 
     voice       = VOICES[voice_var.get()]
-    voice_name  = voice_var.get()
+    if engine_var.get() == "🎙️ Natural":
+        _sel = cb_clone_var.get()
+        voice_name = _sel if _sel != _CLONE_DEFAULT else "Default"
+    else:
+        voice_name = voice_var.get()
     speed       = round(speed_slider.get(), 2)
     total_items = len(queue_items)
     total_words = sum(len(i["text"].split()) for i in queue_items)
@@ -1211,7 +1449,8 @@ def queue_generate_all():
                 cancelled = True
                 break
             except Exception as e:
-                scb(f"❌ {e}")
+                _log_crash(e)
+                scb(f"❌ {_fmt_err(e)}")
             time.sleep(0.05)
         smooth.finish()
         is_generating = False
@@ -1244,8 +1483,13 @@ def _do_word_count():
     proc  = estimate_processing_time(text)
     cal       = _get_calibration()
     use_cb    = engine_var.get() == "🎙️ Natural"
-    calibrated = cal.get("cb_words_per_second" if use_cb else "words_per_second")
-    note      = "" if calibrated else "  (improves after first generation)"
+    n_samples = len(cal.get("cb_samples" if use_cb else "samples") or [])
+    if n_samples == 0:
+        note = "  (Calibrating — improves after first run)"
+    elif n_samples == 1:
+        note = "  (Calibrating...)"
+    else:
+        note = ""
     word_count_label.configure(
         text=f"Words: {words:,}  |  Chars: {chars:,}  |  "
              f"Audio: ~{format_time(audio)}  |  Processing: ~{format_time(proc)}{note}"
@@ -1294,6 +1538,7 @@ def generate_and_store():
             smooth.finish()
             status_label.configure(text="⏹ Generation cancelled.")
         except Exception as e:
+            _log_crash(e)
             smooth.finish()
             status_label.configure(text=f"❌ {_fmt_err(e)}")
         finally:
@@ -1331,6 +1576,7 @@ def preview_voice():
             sd.wait()
             status_label.configure(text="✅ Preview done!")
         except Exception as e:
+            _log_crash(e)
             status_label.configure(text=f"❌ {_fmt_err(e)}")
         finally:
             preview_button.configure(state="normal")
@@ -1484,14 +1730,14 @@ def show_settings():
 
 def show_about():
     win = ctk.CTkToplevel(app)
-    win.title("About")
-    win.geometry("400x540")
+    win.title("About TTS Studio")
+    win.geometry("460x620")
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
 
-    # Header band
-    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=160)
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=150)
     hdr.pack(fill="x")
     hdr.pack_propagate(False)
     if LOGO_IMG_LG:
@@ -1499,26 +1745,41 @@ def show_about():
     ctk.CTkLabel(hdr, text="AI TTS Studio",
                  font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
                  text_color=C_TXT).pack()
-    ctk.CTkLabel(hdr, text=f"Version {VERSION}",
+    ctk.CTkLabel(hdr, text=f"Version {VERSION}  ·  100% local · no internet required",
                  font=ctk.CTkFont(family="Segoe UI", size=11),
                  text_color=C_ACCENT).pack()
 
-    body = ctk.CTkFrame(win, fg_color="transparent")
-    body.pack(fill="both", expand=True, padx=24, pady=16)
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
 
-    ctk.CTkLabel(body, text="Powered by",
+    # ── Scrollable body ───────────────────────────────────────────────────────
+    scroll = ctk.CTkScrollableFrame(win, fg_color="transparent",
+                                    scrollbar_button_color=C_ELEVATED,
+                                    scrollbar_button_hover_color=C_ACCENT_D)
+    scroll.pack(fill="both", expand=True, padx=20, pady=(12, 0))
+
+    def _section(text):
+        ctk.CTkLabel(scroll, text=text,
+                     font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                     text_color=C_TXT3, anchor="w").pack(fill="x", pady=(10, 3))
+        ctk.CTkFrame(scroll, fg_color=C_BORDER, height=1,
+                     corner_radius=0).pack(fill="x", pady=(0, 6))
+
+    # ── Watermark notice ─────────────────────────────────────────────────────
+    notice = ctk.CTkFrame(scroll, fg_color=C_ACCENT_D, corner_radius=8)
+    notice.pack(fill="x", pady=(0, 10))
+    ctk.CTkLabel(notice,
+                 text="Audio Watermarking Notice",
                  font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-                 text_color=C_TXT3, anchor="w").pack(fill="x")
-    ctk.CTkLabel(body, text="Kokoro TTS v1.0  ·  Chatterbox Turbo  ·  CustomTkinter",
+                 text_color=C_ACCENT, anchor="w").pack(anchor="w", padx=12, pady=(10, 2))
+    ctk.CTkLabel(notice,
+                 text="Audio generated in Natural mode contains an imperceptible\n"
+                      "neural watermark applied by Resemble AI's Perth library.\n"
+                      "This watermark is inaudible and does not affect quality.",
                  font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT2).pack(anchor="w", pady=(2, 16))
+                 text_color=C_TXT2, anchor="w", justify="left").pack(anchor="w", padx=12, pady=(0, 10))
 
-    ctk.CTkFrame(body, fg_color=C_BORDER, height=1).pack(fill="x", pady=(0, 12))
-
-    ctk.CTkLabel(body, text="Keyboard Shortcuts",
-                 font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-                 text_color=C_TXT3, anchor="w").pack(fill="x", pady=(0, 6))
-
+    # ── Keyboard shortcuts ────────────────────────────────────────────────────
+    _section("KEYBOARD SHORTCUTS")
     shortcuts = [
         ("Ctrl + Enter", "Generate audio"),
         ("Ctrl + P",     "Play latest audio"),
@@ -1526,23 +1787,55 @@ def show_about():
         ("Ctrl + I",     "Import text file"),
         ("Ctrl + Q",     "Add to queue"),
         ("Escape",       "Stop playback"),
+        ("Ctrl + /",     "Open About"),
     ]
     for key, desc in shortcuts:
-        row = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=6)
+        row = ctk.CTkFrame(scroll, fg_color=C_CARD, corner_radius=6)
         row.pack(fill="x", pady=2)
-        ctk.CTkLabel(row, text=key, width=110, anchor="w",
+        ctk.CTkLabel(row, text=key, width=120, anchor="w",
                      font=ctk.CTkFont(family="Consolas", size=11),
                      text_color=C_ACCENT).pack(side="left", padx=10, pady=5)
         ctk.CTkLabel(row, text=desc, anchor="w",
                      font=ctk.CTkFont(family="Segoe UI", size=11),
                      text_color=C_TXT2).pack(side="left")
 
-    ctk.CTkLabel(body, text="100% local · no internet required after setup",
-                 font=ctk.CTkFont(family="Segoe UI", size=10),
-                 text_color=C_TXT3).pack(pady=(16, 8))
+    # ── Open source credits ───────────────────────────────────────────────────
+    _section("OPEN SOURCE CREDITS")
+    credits = [
+        ("Kokoro TTS v1.0",    "Apache 2.0",  "hexgrad/kokoro"),
+        ("Chatterbox TTS",     "MIT",          "ResembleAI/chatterbox"),
+        ("Perth Watermarker",  "MIT",          "resemble-ai/perth"),
+        ("CustomTkinter",      "MIT",          "TomSchimansky/CustomTkinter"),
+        ("ONNX Runtime",       "MIT",          "microsoft/onnxruntime"),
+        ("SciPy",              "BSD-3-Clause", "scipy/scipy"),
+        ("sounddevice",        "MIT",          "spatialaudio/python-sounddevice"),
+        ("soundfile",          "BSD-3-Clause", "bastibe/python-soundfile"),
+        ("NumPy",              "BSD-3-Clause", "numpy/numpy"),
+        ("PyTorch",            "BSD-3-Clause", "pytorch/pytorch"),
+        ("torchaudio",         "BSD-2-Clause", "pytorch/audio"),
+    ]
+    for lib, lic, repo in credits:
+        row = ctk.CTkFrame(scroll, fg_color="transparent")
+        row.pack(fill="x", pady=1)
+        ctk.CTkLabel(row, text=lib, width=190, anchor="w",
+                     font=ctk.CTkFont(family="Segoe UI", size=11),
+                     text_color=C_TXT).pack(side="left")
+        ctk.CTkLabel(row, text=lic, width=120, anchor="w",
+                     font=ctk.CTkFont(family="Segoe UI", size=10),
+                     text_color=C_TXT2).pack(side="left")
+        ctk.CTkLabel(row, text=repo, anchor="w",
+                     font=ctk.CTkFont(family="Consolas", size=10),
+                     text_color=C_TXT3).pack(side="left")
 
-    ctk.CTkButton(body, text="Close", command=win.destroy,
-                  width=100, height=32, **BTN_GHOST).pack()
+    ctk.CTkLabel(scroll, text=" ", text_color=C_BG).pack()  # bottom padding
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+    foot = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=52)
+    foot.pack(fill="x")
+    foot.pack_propagate(False)
+    ctk.CTkButton(foot, text="Close", command=win.destroy,
+                  width=100, height=32, **BTN_GHOST).pack(side="right", padx=16, pady=10)
 
 # ── Close Handler ─────────────────────────────────────────────────────────────
 def on_close():
@@ -1611,6 +1904,19 @@ status_label = ctk.CTkLabel(
     font=ctk.CTkFont(family="Segoe UI", size=12))
 status_label.pack(side="left", padx=16, pady=6)
 
+def _copy_status():
+    txt = status_label.cget("text")
+    app.clipboard_clear()
+    app.clipboard_append(txt)
+
+_copy_btn = ctk.CTkButton(
+    status_bar, text="⎘", width=24, height=20,
+    font=ctk.CTkFont(family="Segoe UI", size=11),
+    fg_color="transparent", hover_color=C_BORDER,
+    text_color=C_TXT3, corner_radius=4,
+    command=_copy_status)
+_copy_btn.pack(side="right", padx=(0, 8), pady=6)
+
 # ── Header ────────────────────────────────────────────────────────────────────
 header = ctk.CTkFrame(app, fg_color=C_SURFACE, corner_radius=0, height=58)
 header.pack(fill="x")
@@ -1640,6 +1946,14 @@ ctk.CTkButton(header, text="Settings", command=show_settings,
               width=84, height=30,
               font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_GHOST).pack(side="right", padx=(0, 6), pady=14)
+_activate_btn = ctk.CTkButton(
+    header, text="🔑 Activate", command=lambda: _show_activation_modal(can_skip=True),
+    width=98, height=30,
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    **BTN_GHOST)
+# Only show when not yet activated
+if not _lic.load_license().get("activated"):
+    _activate_btn.pack(side="right", padx=(0, 6), pady=14)
 
 _sep(app)
 
@@ -1664,8 +1978,8 @@ tabs = ctk.CTkTabview(app, fg_color=C_BG)
 tabs.pack(fill="both", expand=True, padx=0, pady=0)
 tabs.add("  Studio  ")
 tabs.add("  Queue  ")
-tabs.add("  Profiles  ")
 tabs.add("  Dialogue  ")
+tabs.add("  Profiles  ")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STUDIO TAB
@@ -1826,6 +2140,9 @@ cb_clone_btns.pack(fill="x", padx=14, pady=(0, 6))
 def _delete_clone():
     name = cb_clone_var.get()
     if name == _CLONE_DEFAULT:
+        status_label.configure(text="⚠️ Default voice cannot be deleted.")
+        return
+    if not messagebox.askyesno("Delete Voice Clone", f"Delete '{name}'? This cannot be undone."):
         return
     lib = load_clone_library()
     entry = next((e for e in lib if e["name"] == name), None)
@@ -1965,8 +2282,14 @@ def show_voice_recorder():
             return
         _samples[0] = np.concatenate(_chunks).flatten()
         dur = len(_samples[0]) / SAMPLE_RATE
+        peak = float(np.abs(_samples[0]).max()) if len(_samples[0]) else 0.0
         if dur < 3:
             rec_status.configure(text=f"Only {dur:.1f}s — try for at least 5s.", text_color=C_WARN)
+            play_btn.configure(state="normal")
+        elif peak < 0.01:
+            rec_status.configure(
+                text=f"Recording is too quiet (level: {peak:.4f}) — check your mic gain in Windows Sound settings and re-record.",
+                text_color=C_WARN)
             play_btn.configure(state="normal")
         else:
             # Write to a temp file so preview works before library save
@@ -2144,6 +2467,15 @@ enh_panel = _panel(studio, 2)
 
 _section_label(enh_panel, "AUDIO FX")
 
+eq_preset_var = ctk.StringVar(value="Custom")
+eq_preset_menu = ctk.CTkOptionMenu(
+    enh_panel, variable=eq_preset_var,
+    values=list(EQ_PRESETS.keys()),
+    font=ctk.CTkFont(family="Segoe UI", size=11),
+    width=214, dynamic_resizing=False)
+eq_preset_menu.pack(padx=14, pady=(0, 8))
+eq_preset_var.trace_add("write", lambda *_: apply_eq_preset())
+
 checks = ctk.CTkFrame(enh_panel, fg_color="transparent")
 checks.pack(fill="x", padx=14, pady=(0, 8))
 noise_gate_var = ctk.BooleanVar(value=False)
@@ -2161,6 +2493,18 @@ highpass_slider,   hp_label     = make_slider(enh_panel, "High Pass",   20,   50
 lowpass_slider,    lp_label     = make_slider(enh_panel, "Low Pass",  4000, 18000,  56, 18000)
 reverb_slider,     reverb_label = make_slider(enh_panel, "Reverb",    0.0,   1.0,  20, 0.0)
 gain_slider,       gain_label   = make_slider(enh_panel, "Gain",       -12,    12,  24,   0)
+
+def _on_eq_manual_change(_=None):
+    if not _applying_eq_preset:
+        eq_preset_var.set("Custom")
+    update_all_labels()
+
+for _eq_s in (compressor_slider, highpass_slider, lowpass_slider, reverb_slider, gain_slider):
+    _eq_s.configure(command=_on_eq_manual_change)
+
+noise_gate_var.trace_add("write",  lambda *_: eq_preset_var.set("Custom") if not _applying_eq_preset else None)
+trim_var.trace_add("write",        lambda *_: eq_preset_var.set("Custom") if not _applying_eq_preset else None)
+compressor_var.trace_add("write",  lambda *_: eq_preset_var.set("Custom") if not _applying_eq_preset else None)
 
 ctk.CTkButton(enh_panel, text="Reset to defaults", command=reset_enhancements,
               width=214, height=28,
@@ -2482,6 +2826,7 @@ def dlg_generate():
             add_to_history(samples, sr, text, label, segments=segments)
             status_label.configure(text="✅ Dialogue ready! View in Studio → History panel.")
         except Exception as e:
+            _log_crash(e)
             status_label.configure(text=f"❌ {_fmt_err(e)}")
             smooth.finish()
         finally:
@@ -2513,6 +2858,7 @@ if _saved_clone and _saved_clone != _CLONE_DEFAULT:
     _match = next((e for e in _lib if e["name"] == _saved_clone), None)
     if _match and os.path.exists(_match["file"]):
         cb_clone_var.set(_saved_clone)
+        status_label.configure(text="Ready  ·  Ctrl+Enter to generate  ·  Ctrl+P to play  ·  Esc to stop")
     # if not found (deleted), dropdown stays at Default
 
 def _load_chatterbox_bg():
@@ -2528,17 +2874,182 @@ def _load_chatterbox_bg():
         app.after(0, lambda: play_button.configure(state="normal"))
         _st("✅ Natural mode ready  ·  Ctrl+Enter to generate")
     except Exception as e:
+        _log_crash(e)
         err = _fmt_err(e)
-        if "paging file" in err.lower() or "1455" in err or "memory" in err.lower():
-            err = "Not enough RAM — increase virtual memory in System → Advanced → Virtual Memory"
         app.after(0, lambda: engine_var.set("⚡ Fast"))   # revert the toggle
         app.after(0, lambda: engine_toggle.configure(state="normal"))
         app.after(0, lambda: play_button.configure(state="normal"))
         _st(f"❌ Natural mode failed: {err}")
 
+# ── License activation modal ──────────────────────────────────────────────────
+def _show_activation_modal(can_skip=True, remaining=0):
+    """
+    Show the license key activation dialog.
+    can_skip  → whether the user can dismiss without activating.
+    remaining → launches left in grace period (for the countdown message).
+    """
+
+    win = ctk.CTkToplevel(app)
+    win.title("Activate TTS Studio")
+    win.geometry("460x310")
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
+    hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    hdr_inner = ctk.CTkFrame(hdr, fg_color="transparent")
+    hdr_inner.pack(side="left", padx=16, pady=10)
+    ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=4, height=20,
+                 corner_radius=2).pack(side="left", padx=(0, 10))
+    ctk.CTkLabel(hdr_inner, text="Activate TTS Studio",
+                 font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                 text_color=C_TXT).pack(side="left")
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+
+    # ── Body ──────────────────────────────────────────────────────────────────
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=24, pady=(16, 8))
+
+    if can_skip and remaining > 0:
+        note = f"{remaining} free launch{'es' if remaining != 1 else ''} left after this one."
+        ctk.CTkLabel(body, text=note,
+                     font=ctk.CTkFont(family="Segoe UI", size=11),
+                     text_color=C_WARN).pack(anchor="w", pady=(0, 10))
+    elif not can_skip:
+        ctk.CTkLabel(body, text="Your free trial has ended. Enter your license key to continue.",
+                     font=ctk.CTkFont(family="Segoe UI", size=11),
+                     text_color=C_WARN).pack(anchor="w", pady=(0, 10))
+
+    ctk.CTkLabel(body, text="License Key",
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT2).pack(anchor="w")
+    key_entry = ctk.CTkEntry(
+        body, width=410, height=36,
+        placeholder_text="XXXX-XXXX-XXXX-XXXX",
+        font=ctk.CTkFont(family="Segoe UI", size=13))
+    key_entry.pack(pady=(4, 8))
+
+    # Pre-fill if there's a saved (unactivated) key
+    saved_key = _lic.load_license().get("key") or ""
+    if saved_key:
+        key_entry.insert(0, saved_key)
+
+    msg_label = ctk.CTkLabel(body, text="",
+                             font=ctk.CTkFont(family="Segoe UI", size=11),
+                             text_color=C_DANGER)
+    msg_label.pack(anchor="w")
+
+    # ── Buttons ───────────────────────────────────────────────────────────────
+    btn_row = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=52)
+    btn_row.pack(fill="x", side="bottom")
+    btn_row.pack_propagate(False)
+    ctk.CTkFrame(btn_row, fg_color=C_BORDER, height=1,
+                 corner_radius=0).pack(fill="x", side="top")
+
+    def _do_activate():
+        activate_btn.configure(state="disabled", text="Activating…")
+        msg_label.configure(text="", text_color=C_DANGER)
+        key = key_entry.get().strip()
+
+        def _run():
+            ok, msg = _lic.activate_license(key)
+            def _done():
+                if ok:
+                    msg_label.configure(text=f"✅ {msg}", text_color=C_SUCCESS)
+                    activate_btn.configure(text="Activate")
+                    _activate_btn.pack_forget()   # hide header button
+                    app.after(900, win.destroy)
+                else:
+                    msg_label.configure(text=f"❌ {msg}", text_color=C_DANGER)
+                    activate_btn.configure(state="normal", text="Activate")
+            app.after(0, _done)
+        threading.Thread(target=_run, daemon=True).start()
+
+    activate_btn = ctk.CTkButton(
+        btn_row, text="Activate", width=110, height=34,
+        font=ctk.CTkFont(family="Segoe UI", size=13),
+        fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
+        command=_do_activate)
+    activate_btn.pack(side="left", padx=14, pady=9)
+    key_entry.bind("<Return>", lambda _e: _do_activate())
+
+    def _open_store():
+        import webbrowser
+        webbrowser.open(_lic.STORE_URL)
+
+    ctk.CTkButton(
+        btn_row, text="Buy a License", width=110, height=34,
+        font=ctk.CTkFont(family="Segoe UI", size=12),
+        **BTN_GHOST, command=_open_store
+    ).pack(side="left", padx=(0, 6), pady=9)
+
+    if can_skip:
+        ctk.CTkButton(
+            btn_row, text="Later", width=72, height=34,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            **BTN_GHOST, command=win.destroy
+        ).pack(side="right", padx=14, pady=9)
+    else:
+        ctk.CTkButton(
+            btn_row, text="Exit App", width=80, height=34,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            fg_color="transparent", hover_color="#3d1515",
+            text_color=C_DANGER, border_width=1, border_color="#3d1515",
+            command=app.destroy
+        ).pack(side="right", padx=14, pady=9)
+
+
 def _on_splash_done():
     app.deiconify()
     app.state("zoomed")   # maximize (fullscreen with taskbar visible)
+    _handle_license_on_startup()
+
+
+def _handle_license_on_startup():
+    """Check license state and show banner or blocking modal as appropriate."""
+    lic = _lic.load_license()
+
+    # Already activated — silently re-validate in background once per session
+    if lic.get("activated"):
+        def _revalidate():
+            valid = _lic.validate_license_silent(lic.get("key"), lic.get("instance_id"))
+            if not valid:
+                app.after(0, lambda: status_label.configure(
+                    text="⚠️ License validation failed. Please re-activate via the 🔑 Activate button."))
+                app.after(0, lambda: _activate_btn.pack(side="right", padx=(0, 6), pady=14))
+        threading.Thread(target=_revalidate, daemon=True).start()
+        return
+
+    state, remaining = _lic.check_startup()
+
+    if state == "grace":
+        pl = "launch" if remaining == 1 else "launches"
+        status_label.configure(
+            text=f"🔑 {remaining} free {pl} remaining — click 🔑 Activate in the toolbar to unlock.")
+        # Also allow opening the modal from the status bar message click (optional)
+        # The header button already handles this.
+    elif state == "required":
+        # Slight delay so the window is fully rendered before the modal appears
+        app.after(300, lambda: _show_activation_modal(can_skip=False, remaining=0))
+
+# Seed Kokoro calibration on first-ever launch using a quick inference.
+# Skipped if calibration data already exists. Takes ~150-250ms — imperceptible.
+def _run_kokoro_benchmark():
+    _BENCH_TEXT = "The quick brown fox jumps over the lazy dog today."
+    try:
+        if load_calibration().get("words_per_second"):
+            return  # already calibrated
+        _t0 = time.time()
+        kokoro.create(_BENCH_TEXT, voice="af_heart", speed=1.0)
+        record_calibration(len(_BENCH_TEXT.split()), time.time() - _t0, use_cb=False)
+    except Exception:
+        pass  # non-critical; never block startup
+
+_run_kokoro_benchmark()
 
 _splash = _run_splash(_on_splash_done)
 # Kokoro is already loaded at this point — complete the splash bar
