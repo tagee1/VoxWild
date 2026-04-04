@@ -106,6 +106,59 @@ class TestChunkText(unittest.TestCase):
         self.assertIn("Hello", combined)
         self.assertIn("World", combined)
 
+    def test_no_double_period_at_end(self):
+        # A sentence that already ends with a period must not gain a second one.
+        # Double periods confuse neural TTS and cause the last line to be dropped.
+        text = "First sentence. Second sentence. Let's begin."
+        for chunk in chunk_text(text):
+            self.assertNotIn("..", chunk)
+
+    def test_final_sentence_with_period_is_preserved(self):
+        # "Let's begin." must appear verbatim in the output — the exact regression
+        # that caused Chatterbox to silently drop the last line of the sleepy-science
+        # script.
+        text = (
+            "Welcome to the Sleepy Science Channel.\n\n"
+            "Tonight, we're going to slowly explore a collection of quiet and relaxing facts.\n\n"
+            "Take a moment to get comfortable.\n\n"
+            "Allow your body to settle.\n\n"
+            "And if you'd like, gently close your eyes.\n\n"
+            "There's no need to focus too hard.\n\n"
+            "Just let the information drift by.\n\n"
+            "There is nothing you need to do, and nowhere you need to be.\n\n"
+            "Just listen... and rest.\n\n"
+            "Let's begin."
+        )
+        combined = " ".join(chunk_text(text))
+        self.assertIn("Let's begin", combined)
+        # "Let's begin." must not become "Let's begin.." (the specific bug).
+        # Note: "..." (ellipsis) legitimately contains ".." so we check the
+        # exact bad pattern — a word boundary followed by exactly two periods.
+        self.assertNotIn("begin..", combined)
+        # Ellipsis must be preserved intact
+        self.assertIn("listen...", combined)
+
+    def test_short_final_chunk_merged_into_previous(self):
+        # When the last chunk is very short (< min_chars), it gets folded into
+        # the second-to-last chunk to prevent Chatterbox distortion artifacts.
+        long_sentence = "A" * 790  # forces its own chunk
+        short_ending  = "Short end."
+        text = long_sentence + ". " + short_ending
+        chunks = chunk_text(text, max_chars=800, min_chars=80)
+        # The short ending must be merged — there should only be one chunk
+        # (or the last chunk must contain the short ending content).
+        combined = " ".join(chunks)
+        self.assertIn("Short end", combined)
+        for chunk in chunks:
+            self.assertGreaterEqual(len(chunk), 80,
+                msg=f"Chunk is suspiciously short (orphan not merged?): {chunk!r}")
+
+    def test_question_mark_ending_no_double_period(self):
+        text = "Are you comfortable? Let's begin."
+        for chunk in chunk_text(text):
+            self.assertNotIn("..", chunk)
+            self.assertNotIn("?.", chunk)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # parse_dialogue
