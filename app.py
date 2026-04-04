@@ -1,3 +1,4 @@
+import sys
 import customtkinter as ctk
 from kokoro_onnx import Kokoro
 import sounddevice as sd
@@ -29,6 +30,18 @@ from clone_library import (
 )
 from audio_utils import trim_silence
 import license as _lic
+
+# ── Resource path helper (PyInstaller one-dir compatible) ─────────────────────
+def _res(relative_path):
+    """Return the absolute path to a bundled resource.
+    Works both in development (relative to this file) and when frozen by
+    PyInstaller one-dir builds (sys._MEIPASS == directory of the .exe).
+    """
+    if getattr(sys, "frozen", False):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, relative_path)
 
 # ── In-memory caches (eliminates repeated disk reads in hot paths) ────────────
 _settings_cache     = None
@@ -83,6 +96,8 @@ CLONE_INDEX      = os.path.join(CLONE_DIR, "library.json")
 # ── One-time migration: copy existing user files from app dir to %APPDATA% ────
 def _migrate_user_data():
     """Copy legacy files from the app directory to %APPDATA% on first launch."""
+    if getattr(sys, "frozen", False):
+        return  # frozen installs have no legacy files to migrate
     _app_dir = os.path.dirname(os.path.abspath(__file__))
     _migrations = [
         ("tts_profiles.json",       PROFILES_FILE),
@@ -173,7 +188,7 @@ BTN_DANGER  = dict(fg_color="#2a0f0f", hover_color="#3d1515", text_color=C_DANGE
 
 # ── App Window ────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme(os.path.join(os.path.dirname(os.path.abspath(__file__)), "theme.json"))
+ctk.set_default_color_theme(_res("theme.json"))
 
 app = ctk.CTk()
 app.title(f"AI Text to Speech Studio  v{VERSION}")
@@ -183,9 +198,9 @@ app.configure(fg_color=C_BG)
 app.withdraw()   # hidden until splash finishes
 
 # Set app icon
-_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_APP_DIR = _res(".")
 try:
-    app.iconbitmap(os.path.join(_APP_DIR, "icon.ico"))
+    app.iconbitmap(_res("icon.ico"))
 except:
     pass
 
@@ -298,7 +313,7 @@ def _run_splash(on_done):
     return splash
 
 # ── Load Kokoro ───────────────────────────────────────────────────────────────
-kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+kokoro = Kokoro(_res("kokoro-v1.0.onnx"), _res("voices-v1.0.bin"))
 
 _fmt_err = fmt_err  # local alias kept so existing call sites are unchanged
 
@@ -306,8 +321,8 @@ _fmt_err = fmt_err  # local alias kept so existing call sites are unchanged
 class ChatterboxEngine:
     """Manages a persistent chatterbox_worker.py subprocess."""
 
-    WORKER  = os.path.join(os.path.dirname(__file__), "chatterbox_worker.py")
-    PYTHON  = os.path.join(os.path.dirname(__file__), "chatterbox_env", "Scripts", "python.exe")
+    WORKER  = _res("chatterbox_worker.py")
+    PYTHON  = _res(os.path.join("chatterbox_env", "Scripts", "python.exe"))
 
     def __init__(self):
         self._proc   = None
