@@ -46,22 +46,25 @@ REM ── Step 3: Inno Setup ────────────────�
 echo.
 echo [3/3] Running Inno Setup...
 
-REM Diagnostics — show where iscc is (or isn't)
-echo   Searching for iscc in PATH...
-where iscc 2>&1
-echo   ERRORLEVEL after where: %ERRORLEVEL%
-echo.
-
+REM Try PATH first, then fall back to default install locations
+set "ISCC_EXE="
 where iscc >nul 2>&1
-if errorlevel 1 (
+if not errorlevel 1 (
+    set "ISCC_EXE=iscc"
+) else if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" (
+    set "ISCC_EXE=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+) else if exist "C:\Program Files\Inno Setup 6\ISCC.exe" (
+    set "ISCC_EXE=C:\Program Files\Inno Setup 6\ISCC.exe"
+)
+
+if "%ISCC_EXE%"=="" (
     echo.
-    echo WARNING: iscc not found in PATH. Is Inno Setup 6 installed?
-    echo   Download from: https://jrsoftware.org/isinfo.php
-    echo   Then re-run this script.
+    echo ERROR: Inno Setup 6 not found. Download from: https://jrsoftware.org/isinfo.php
     exit /b 1
 )
 
-iscc "%APP_DIR%installer.iss"
+echo   Using: %ISCC_EXE%
+"%ISCC_EXE%" "%APP_DIR%installer.iss"
 if errorlevel 1 (
     echo.
     echo ERROR: Inno Setup compilation failed. Check output above.
@@ -87,7 +90,7 @@ echo.
 echo  Next steps:
 echo    1. Test the installer on a clean Windows machine
 echo    2. Sign with: signtool sign /tr http://timestamp.sectigo.com /td sha256 /fd sha256 /a installer_output\TTS-Studio-Setup.exe
-echo    3. Upload to Lemon Squeezy / Gumroad
+echo    3. Upload installer_output\TTS-Studio-Setup.exe as a GitHub Release asset
 echo.
 
 endlocal
