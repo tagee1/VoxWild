@@ -97,7 +97,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.0.1"
+VERSION          = "1.0.2"
 GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
