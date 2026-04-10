@@ -468,7 +468,7 @@ class ChatterboxEngine:
                     continue  # skip any non-JSON noise
                 if msg["type"] == "status":
                     if status_cb:
-                        status_cb(f"🎙️ {msg['msg']}")
+                        status_cb(msg['msg'])
                 elif msg["type"] == "ready":
                     self._sr   = msg.get("sr", 24000)
                     self._proc = proc
@@ -525,7 +525,7 @@ class ChatterboxEngine:
                 continue  # skip non-JSON noise
             if msg["type"] == "status":
                 if status_cb:
-                    status_cb(f"🎙️ {msg['msg']}")
+                    status_cb(msg['msg'])
             elif msg["type"] == "done":
                 samples, sr = sf.read(tmp.name)
                 os.unlink(tmp.name)
@@ -787,7 +787,7 @@ def save_calibration(data):
 def record_calibration(word_count, elapsed_seconds, use_cb=None):
     data = _get_calibration()
     if use_cb is None:
-        use_cb = engine_var.get() == "🎙️ Natural"
+        use_cb = engine_var.get() == "Natural"
     wps = word_count / elapsed_seconds if elapsed_seconds > 0 else (0.5 if use_cb else 55)
     _EMA_ALPHA = 0.4
     if use_cb:
@@ -805,7 +805,7 @@ def record_calibration(word_count, elapsed_seconds, use_cb=None):
 
 def get_words_per_second():
     data = _get_calibration()
-    if engine_var.get() == "🎙️ Natural":
+    if engine_var.get() == "Natural":
         return data.get("cb_words_per_second") or 0.5
     return data.get("words_per_second") or 55
 
@@ -1151,18 +1151,18 @@ def _make_history_card(parent, idx, entry):
     row_play.pack(fill="x", pady=(7, 0))
 
     play_btn = ctk.CTkButton(
-        row_play, text="▶  Play", width=72, height=26,
+        row_play, text="Play", width=72, height=26,
         font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
         fg_color=C_ACCENT_D, hover_color=C_ACCENT, text_color=C_TXT, corner_radius=5,
     )
     pause_btn = ctk.CTkButton(
-        row_play, text="⏸", width=30, height=26,
-        font=ctk.CTkFont(family="Segoe UI", size=13),
+        row_play, text="Pause", width=50, height=26,
+        font=ctk.CTkFont(family="Segoe UI", size=11),
         state="disabled", **BTN_GHOST, corner_radius=5,
     )
     stop_btn = ctk.CTkButton(
-        row_play, text="⏹", width=30, height=26,
-        font=ctk.CTkFont(family="Segoe UI", size=13),
+        row_play, text="Stop", width=44, height=26,
+        font=ctk.CTkFont(family="Segoe UI", size=11),
         state="disabled", **BTN_GHOST, corner_radius=5,
     )
     play_btn.configure(command=lambda e=entry, b=play_btn, p=pause_btn, s=stop_btn:
@@ -1218,13 +1218,13 @@ def _make_history_card(parent, idx, entry):
             **BTN_GHOST, corner_radius=5,
         )
         orig_pause_btn = ctk.CTkButton(
-            row_act, text="⏸", width=26, height=22,
-            font=ctk.CTkFont(family="Segoe UI", size=11),
+            row_act, text="Pause", width=46, height=22,
+            font=ctk.CTkFont(family="Segoe UI", size=10),
             state="disabled", **BTN_GHOST, corner_radius=5,
         )
         orig_stop_btn  = ctk.CTkButton(
-            row_act, text="⏹", width=26, height=22,
-            font=ctk.CTkFont(family="Segoe UI", size=11),
+            row_act, text="Stop", width=40, height=22,
+            font=ctk.CTkFont(family="Segoe UI", size=10),
             state="disabled", **BTN_GHOST, corner_radius=5,
         )
         orig_play_btn.configure(
@@ -1252,7 +1252,7 @@ def _reset_play_btn():
     pause_btn = _active_pause_btn[0]
     if pause_btn:
         try:
-            pause_btn.configure(text="⏸", state="disabled")
+            pause_btn.configure(text="Pause", state="disabled")
         except Exception:
             pass
     stop_btn = _active_stop_btn[0]
@@ -1339,7 +1339,7 @@ def _history_stop(play_btn):
         _play_id[0] += 1   # invalidate any bg thread before stopping
         sd.stop()
         _reset_play_btn()
-        status_label.configure(text="⏹ Stopped.")
+        status_label.configure(text="Stopped.")
     except Exception as e:
         _log_crash(e)
 
@@ -1362,17 +1362,17 @@ def _toggle_history_pause(entry, play_btn, pause_btn):
             _log_crash(e)
         if pause_btn:
             try:
-                pause_btn.configure(text="▶")
+                pause_btn.configure(text="Resume")
             except Exception:
                 pass
-        status_label.configure(text="⏸ Paused.")
+        status_label.configure(text="Paused.")
     else:
         # ── Resume ───────────────────────────────────────────────────────────
         resume_pos = _pause_pos[0]
         _pause_pos[0] = None
         if pause_btn:
             try:
-                pause_btn.configure(text="⏸")
+                pause_btn.configure(text="Pause")
             except Exception:
                 pass
 
@@ -1532,7 +1532,7 @@ def _save_as_mp3(entry, filepath):
         _year    = year_var.get().strip()
         _quality = quality_var.get()
         win.destroy()
-        status_label.configure(text="⏳ Encoding MP3...")
+        status_label.configure(text="Encoding MP3...")
         app.update_idletasks()
 
         try:
@@ -1819,12 +1819,12 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
     """
     lo, hi = progress_range
     text = apply_pronunciation(text)
-    use_chatterbox = engine_var.get() == "🎙️ Natural"
+    use_chatterbox = engine_var.get() == "Natural"
 
     if use_chatterbox:
         # ── Chatterbox path ────────────────────────────────────────────────────
         if not chatterbox_engine.is_ready:
-            if status_cb: status_cb("🎙️ Waiting for Natural mode to finish loading...")
+            if status_cb: status_cb("Waiting for Natural mode to finish loading...")
             chatterbox_engine.start(status_cb=status_cb)
         chunks = chunk_text(text)
         all_samples, sample_rate = [], None
@@ -1838,7 +1838,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
         for i, chunk in enumerate(chunks):
             if _cancel_event.is_set():
                 raise GenerationCancelled()
-            if status_cb: status_cb(f"🎙️ Generating chunk {i+1}/{len(chunks)}...")
+            if status_cb: status_cb(f"Generating chunk {i+1}/{len(chunks)}...")
             samples, sr = chatterbox_engine.generate_chunk(
                 chunk,
                 audio_prompt_path=prompt,
@@ -2223,7 +2223,7 @@ def queue_generate_all():
     bitrate      = {"128 kbps": 128, "192 kbps": 192, "320 kbps": 320}.get(
                        queue_mp3_quality_var.get(), 192)
     ext          = ".mp3" if use_mp3 else ".wav"
-    queue_natural = engine_var.get() == "🎙️ Natural"
+    queue_natural = engine_var.get() == "Natural"
 
     # ── Freemium gate: Natural mode — check before starting the batch ─────────
     if queue_natural and not _lic.can_use_natural():
@@ -2279,7 +2279,7 @@ def queue_generate_all():
                 safe_name = item['name'].replace(' ', '_')
                 out_path  = os.path.join(out_dir, f"{i+1:02d}_{safe_name}{ext}")
                 if use_mp3:
-                    scb(f"⏳ Encoding MP3...")
+                    scb(f"Encoding MP3...")
                     _encode_mp3_file(out_path, samples, sr, bitrate,
                                      title=item["name"], artist=voice_name)
                 else:
@@ -2328,7 +2328,7 @@ def _do_word_count():
     audio = estimate_audio_duration(text, speed)
     proc  = estimate_processing_time(text)
     cal       = _get_calibration()
-    use_cb    = engine_var.get() == "🎙️ Natural"
+    use_cb    = engine_var.get() == "Natural"
     n_samples = len(cal.get("cb_samples" if use_cb else "samples") or [])
     if n_samples == 0:
         note = "  (Calibrating — improves after first run)"
@@ -2350,7 +2350,7 @@ def generate_and_store():
         status_label.configure(text="⚠️ Please enter some text.")
         return
 
-    using_natural = engine_var.get() == "🎙️ Natural"
+    using_natural = engine_var.get() == "Natural"
 
     # ── Freemium gate: Natural mode ───────────────────────────────────────────
     if using_natural and not _lic.can_use_natural():
@@ -2368,7 +2368,7 @@ def generate_and_store():
     est        = estimate_processing_time(text)
 
     _cancel_event.clear()
-    play_button.configure(state="disabled", text="⏳ Working...")
+    play_button.configure(state="disabled", text="Working...")
     stop_button.configure(state="normal", text="Cancel",
                           fg_color="#2a0f0f", hover_color="#3d1515",
                           text_color=C_DANGER, border_width=1, border_color="#3d1515")
@@ -2393,7 +2393,7 @@ def generate_and_store():
                 text="✅ Audio ready! Click ▶ Play in the history panel."))
         except GenerationCancelled:
             smooth.finish()
-            app.after(0, lambda: status_label.configure(text="⏹ Generation cancelled."))
+            app.after(0, lambda: status_label.configure(text="Generation cancelled."))
         except Exception as e:
             _log_crash(e)
             smooth.finish()
@@ -2401,7 +2401,7 @@ def generate_and_store():
             app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
         finally:
             is_generating = False
-            app.after(0, lambda: play_button.configure(state="normal", text="▶  Generate"))
+            app.after(0, lambda: play_button.configure(state="normal", text="Generate"))
             app.after(0, lambda: stop_button.configure(
                 state="disabled", text="Stop",
                 fg_color="transparent", hover_color=C_ELEVATED,
@@ -2415,8 +2415,8 @@ def stop_audio():
         cancel_generation()   # signals the generation thread to stop after current chunk
     else:
         sd.stop()
-        status_label.configure(text="⏹ Stopped.")
-        play_button.configure(state="normal", text="▶  Generate")
+        status_label.configure(text="Stopped.")
+        play_button.configure(state="normal", text="Generate")
         stop_button.configure(state="disabled", text="Stop",
                               fg_color="transparent", hover_color=C_ELEVATED,
                               text_color=C_TXT2, border_width=1, border_color=C_BORDER)
@@ -3025,9 +3025,9 @@ mid_panel = _panel(studio, 1)
 _section_label(mid_panel, "ENGINE",
     tooltip="Choose between Fast mode (Kokoro — instant, offline) and Natural mode "
             "(Chatterbox — slower, more human-sounding, supports voice cloning).")
-engine_var = ctk.StringVar(value="⚡ Fast")
+engine_var = ctk.StringVar(value="Fast")
 engine_toggle = ctk.CTkSegmentedButton(
-    mid_panel, values=["⚡ Fast", "🎙️ Natural"],
+    mid_panel, values=["Fast", "Natural"],
     variable=engine_var,
     font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
     width=214)
@@ -3251,12 +3251,12 @@ def show_voice_recorder():
                               text_color=C_TXT3)
     timer_lbl.pack(side="left", padx=(14, 8), pady=12)
 
-    record_btn = ctk.CTkButton(ctrl, text="⏺  Record", width=120, height=36,
+    record_btn = ctk.CTkButton(ctrl, text="Record", width=120, height=36,
                                 font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
                                 fg_color=C_REC, hover_color="#a52020", corner_radius=8)
     record_btn.pack(side="left", padx=(0, 6), pady=12)
 
-    play_btn = ctk.CTkButton(ctrl, text="▶  Preview", width=100, height=36,
+    play_btn = ctk.CTkButton(ctrl, text="Preview", width=100, height=36,
                               font=ctk.CTkFont(family="Segoe UI", size=12),
                               **BTN_GHOST, corner_radius=8, state="disabled")
     play_btn.pack(side="left", padx=(0, 6), pady=12)
@@ -3291,7 +3291,7 @@ def show_voice_recorder():
             _chunks.clear()
         _recording.set()
         _start[0] = time.time()
-        record_btn.configure(text="⏹  Stop")
+        record_btn.configure(text="Stop")
         play_btn.configure(state="disabled")
         save_btn.configure(state="disabled")
         rec_status.configure(text="Recording...", text_color=C_REC)
@@ -3310,7 +3310,7 @@ def show_voice_recorder():
         if _stream[0]:
             _stream[0].stop(); _stream[0].close(); _stream[0] = None
         timer_lbl.configure(text_color=C_TXT3)
-        record_btn.configure(text="⏺  Record Again")
+        record_btn.configure(text="Record Again")
         with _chunks_lock:
             chunks_snap = list(_chunks)
         if not chunks_snap:
@@ -3489,7 +3489,7 @@ speed_slider, speed_label = make_slider(mid_panel, "Playback Speed", 0.5, 2.0, 3
 
 # Engine switch logic
 def _on_engine_change(*_):
-    if engine_var.get() == "🎙️ Natural":
+    if engine_var.get() == "Natural":
         kokoro_frame.pack_forget()
         cb_frame.pack(fill="x")
         if not chatterbox_engine.is_ready:
@@ -3507,7 +3507,7 @@ def _on_engine_change(*_):
                 ).start()
 
             def _revert_to_fast():
-                engine_var.set("⚡ Fast")
+                engine_var.set("Fast")
 
             def _after_setup():
                 """Called when auto-setup completes successfully — proceed with normal load."""
@@ -3530,7 +3530,7 @@ def _on_engine_change(*_):
         cb_frame.pack_forget()
         kokoro_frame.pack(fill="x")
         if chatterbox_engine.is_ready:
-            status_label.configure(text="⚡ Fast mode active — Natural mode unloaded.")
+            status_label.configure(text="Fast mode active — Natural mode unloaded.")
             threading.Thread(target=chatterbox_engine.stop, daemon=True).start()
 
 engine_var.trace_add("write", _on_engine_change)
@@ -3541,7 +3541,7 @@ gen_btns = ctk.CTkFrame(mid_panel, fg_color="transparent")
 gen_btns.pack(fill="x", padx=14, pady=10)
 
 play_button = ctk.CTkButton(
-    gen_btns, text="▶  Generate", command=generate_and_store,
+    gen_btns, text="Generate", command=generate_and_store,
     width=214, height=46,
     font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
     corner_radius=10)
@@ -4202,7 +4202,7 @@ def dlg_detect_speakers():
                 dlg_detect_speakers()
             return _do
 
-        ctk.CTkButton(row, text="↺", width=28, height=28,
+        ctk.CTkButton(row, text="Reset", width=52, height=28,
                       font=ctk.CTkFont(family="Segoe UI", size=12),
                       command=_make_rename(speaker, name_var),
                       **BTN_GHOST).pack(side="left", padx=(0, 6), pady=8)
@@ -4237,7 +4237,7 @@ def dlg_generate():
     est            = estimate_processing_time(" ".join(t for _, t in d_lines))
 
     _dlg_cancel_event.clear()
-    dlg_gen_btn.configure(state="disabled", text="⏳ Generating...")
+    dlg_gen_btn.configure(state="disabled", text="Generating...")
     dlg_detect_btn.configure(state="disabled")
     dlg_cancel_btn.configure(command=lambda: _dlg_cancel_event.set())
     dlg_cancel_btn.pack(pady=(0, 4))
@@ -4660,7 +4660,7 @@ def _load_chatterbox_bg(update_modal, close_modal):
         _log_crash(e)
         err = _fmt_err(e)
         close_modal()
-        app.after(0, lambda: engine_var.set("⚡ Fast"))   # revert the toggle
+        app.after(0, lambda: engine_var.set("Fast"))   # revert the toggle
         app.after(0, lambda: engine_toggle.configure(state="normal"))
         app.after(0, lambda: play_button.configure(state="normal"))
         _raw = str(e).lower()
@@ -4791,7 +4791,7 @@ def _show_activation_modal(can_skip=True, remaining=0):
 
 _UPSELL_FEATURE_TEXT = {
     "natural": (
-        "🎙️ Natural Mode — free trial used up",
+        "Natural Mode — free trial used up",
         "You've used your 3 free Natural mode generations.\n\n"
         "Upgrade to Pro for unlimited Natural mode, unlimited\n"
         "AI Enhancement, and priority support.",
@@ -5013,7 +5013,7 @@ def _show_onboarding(on_done=None):
     fast_card.pack(fill="x", pady=(0, 10))
     fast_inner = ctk.CTkFrame(fast_card, fg_color="transparent")
     fast_inner.pack(fill="x", padx=14, pady=12)
-    ctk.CTkLabel(fast_inner, text="⚡  Fast Mode",
+    ctk.CTkLabel(fast_inner, text="Fast Mode",
                  font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
                  text_color=C_ACCENT).pack(anchor="w")
     ctk.CTkLabel(fast_inner,
@@ -5029,7 +5029,7 @@ def _show_onboarding(on_done=None):
     nat_card.pack(fill="x", pady=(0, 10))
     nat_inner = ctk.CTkFrame(nat_card, fg_color="transparent")
     nat_inner.pack(fill="x", padx=14, pady=12)
-    ctk.CTkLabel(nat_inner, text="🎙️  Natural Mode",
+    ctk.CTkLabel(nat_inner, text="Natural Mode",
                  font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
                  text_color=C_TXT).pack(anchor="w")
     ctk.CTkLabel(nat_inner,
