@@ -130,12 +130,38 @@ def main():
         emit({"type": "error", "msg": f"Not enough RAM to load model: {e}"})
         return
     except OSError as e:
-        if getattr(e, "winerror", None) == 1455 or "paging file" in str(e).lower():
+        import traceback as _tb
+        _winerr = getattr(e, "winerror", None)
+        _full   = _tb.format_exc()
+        # Write full diagnostics to log so the truncated UI message isn't the only info
+        try:
+            _log_path = os.path.join(
+                os.environ.get("APPDATA", ""), "TTS Studio", "natural_mode_error.log"
+            )
+            with open(_log_path, "w", encoding="utf-8") as _lf:
+                _lf.write(f"winerror: {_winerr}\n")
+                _lf.write(f"str(e):   {e}\n\n")
+                _lf.write(_full)
+        except Exception:
+            pass
+        if _winerr == 1455 or "paging file" in str(e).lower():
             emit({"type": "error", "msg": f"Not enough RAM/virtual memory to load model: {e}"})
         else:
-            emit({"type": "error", "msg": f"Model load failed (OS error): {e}"})
+            emit({"type": "error", "msg": f"Model load failed (OS error {_winerr}): {e}  [E099]"})
         return
     except Exception as e:
+        import traceback as _tb
+        _full = _tb.format_exc()
+        try:
+            _log_path = os.path.join(
+                os.environ.get("APPDATA", ""), "TTS Studio", "natural_mode_error.log"
+            )
+            with open(_log_path, "w", encoding="utf-8") as _lf:
+                _lf.write(f"Exception type: {type(e).__name__}\n")
+                _lf.write(f"str(e): {e}\n\n")
+                _lf.write(_full)
+        except Exception:
+            pass
         emit({"type": "error", "msg": f"Model load failed: {e}"})
         return
 
