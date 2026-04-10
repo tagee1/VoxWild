@@ -300,6 +300,32 @@ def main():
     except Exception as _se:
         pass
 
+    # ── Patch perth watermarker ───────────────────────────────────────────────
+    # perth (resemble-perth) is chatterbox's audio watermarking dependency.
+    # Its C extension silently fails on some machines (missing native deps),
+    # causing perth.PerthImplicitWatermarker to be set to None by perth itself.
+    # chatterbox-tts 0.1.7 calls it without a None check → TypeError.
+    # We don't use watermarking in TTS Studio, so inject a no-op stub.
+    try:
+        import perth as _perth
+        if not callable(getattr(_perth, "PerthImplicitWatermarker", None)):
+            class _NoOpWatermarker:
+                def __call__(self, wav, sr=None):
+                    return wav
+            _perth.PerthImplicitWatermarker = _NoOpWatermarker
+            del _NoOpWatermarker
+        del _perth
+    except ImportError:
+        import types as _types
+        _perth_stub = _types.ModuleType("perth")
+        class _NoOpWatermarker:
+            def __call__(self, wav, sr=None):
+                return wav
+        _perth_stub.PerthImplicitWatermarker = _NoOpWatermarker
+        sys.modules["perth"] = _perth_stub
+        del _types, _perth_stub, _NoOpWatermarker
+    # ─────────────────────────────────────────────────────────────────────────
+
     try:
         import torchaudio
         from chatterbox.tts import ChatterboxTTS
