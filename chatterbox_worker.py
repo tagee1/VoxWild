@@ -43,6 +43,30 @@ if os.name == "nt":
         for _d in _dll_dirs:
             os.add_dll_directory(_d)
 
+    # Diagnostic log — helps identify missing DLLs
+    try:
+        _log_path = os.path.join(os.path.dirname(_py_dir), "natural_mode_error.log")
+        with open(_log_path, "w", encoding="utf-8") as _lf:
+            _lf.write(f"sys.executable: {sys.executable}\n")
+            _lf.write(f"py_dir:         {_py_dir}\n")
+            _lf.write(f"torch_lib:      {_torch_lib} — exists={os.path.isdir(_torch_lib)}\n")
+            _lf.write(f"taudio_lib:     {_taudio_lib} — exists={os.path.isdir(_taudio_lib)}\n")
+            _lf.write(f"dll_dirs added: {_dll_dirs}\n\n")
+            if os.path.isdir(_torch_lib):
+                _lf.write("torch/lib contents:\n")
+                for _f in sorted(os.listdir(_torch_lib)):
+                    _lf.write(f"  {_f}\n")
+            else:
+                _lf.write("torch/lib does NOT exist — install incomplete!\n")
+            if os.path.isdir(_taudio_lib):
+                _lf.write("\ntorchaudio/lib contents:\n")
+                for _f in sorted(os.listdir(_taudio_lib)):
+                    _lf.write(f"  {_f}\n")
+            else:
+                _lf.write("\ntorchaudio/lib does NOT exist — install incomplete!\n")
+    except Exception:
+        pass
+
     del _py_dir, _torch_lib, _taudio_lib, _scripts_dir, _dll_dirs
 # ──────────────────────────────────────────────────────────────────────────────
 
