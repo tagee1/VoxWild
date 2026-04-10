@@ -417,12 +417,13 @@ class ChatterboxEngine:
     WORKER = _res("chatterbox_worker.py")
 
     # Dev env (running from source) — sibling of app.py
-    _PYTHON_DEV  = _res(os.path.join("chatterbox_env", "Scripts", "python.exe"))
-    # Installed env — created by auto-setup, lives in APPDATA (always user-writable)
-    _CB_ENV_DIR  = os.path.join(
-        os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio", "chatterbox_env"
+    _PYTHON_DEV    = _res(os.path.join("chatterbox_env", "Scripts", "python.exe"))
+    # Auto-installed env: embeddable Python extracted to APPDATA (no system Python needed)
+    _CB_BASE_DIR   = os.path.join(
+        os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio"
     )
-    _PYTHON_USER = os.path.join(_CB_ENV_DIR, "Scripts", "python.exe")
+    _CB_PYTHON_DIR = os.path.join(_CB_BASE_DIR, "python_embed")
+    _PYTHON_USER   = os.path.join(_CB_PYTHON_DIR, "python.exe")
 
     def __init__(self):
         self._proc   = None
@@ -541,111 +542,98 @@ chatterbox_engine = ChatterboxEngine()
 # ── Chatterbox auto-setup helpers ─────────────────────────────────────────────
 
 def _cb_env_exists():
-    """Return True if a usable chatterbox_env Python is already installed."""
+    """Return True if a usable Natural mode Python is already installed."""
     return os.path.exists(chatterbox_engine.PYTHON)
-
-
-def _find_system_python():
-    """
-    Find Python 3.10+ on the system.
-    Tries the Windows py launcher with specific versions first, then generic names.
-    Returns the executable path string, or None if not found.
-    """
-    import shutil
-
-    # Windows Python Launcher — most reliable (tries 3.11 first to match our env)
-    if shutil.which("py"):
-        for ver in ("3.11", "3.12", "3.10", "3.13"):
-            try:
-                r = subprocess.run(
-                    ["py", f"-{ver}", "-c", "import sys; print(sys.executable)"],
-                    capture_output=True, text=True, timeout=8,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    return r.stdout.strip()
-            except Exception:
-                pass
-
-    # Fall back to generic interpreter names
-    for name in ("python3", "python"):
-        path = shutil.which(name)
-        if not path:
-            continue
-        try:
-            r = subprocess.run(
-                [path, "-c",
-                 "import sys; v=sys.version_info; "
-                 "print(v.major, v.minor); print(sys.executable)"],
-                capture_output=True, text=True, timeout=8,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            if r.returncode == 0:
-                lines = r.stdout.strip().splitlines()
-                if len(lines) >= 2:
-                    major, minor = map(int, lines[0].split())
-                    if (major, minor) >= (3, 10):
-                        return lines[1]
-        except Exception:
-            pass
-
-    return None
 
 
 def _run_chatterbox_setup(update_status, on_success, on_failure):
     """
-    Background thread: find Python → create venv → install packages.
+    Background thread: download embeddable Python → bootstrap pip → install packages.
+    No system Python required — downloads and manages its own interpreter.
     Calls on_success() or on_failure(error_message) when done.
     """
-    env_dir     = ChatterboxEngine._CB_ENV_DIR
-    python_user = ChatterboxEngine._PYTHON_USER
+    import urllib.request
+    import urllib.error
+    import zipfile
+    import glob as _glob
+    import tempfile
 
-    # Step 1 — find Python
-    update_status("Looking for Python 3.10+ on your system…")
-    py = _find_system_python()
-    if not py:
-        on_failure(
-            "Python 3.10 or later was not found on your system.\n\n"
-            "Please install Python from python.org (3.10, 3.11, 3.12, or 3.13),\n"
-            "then switch to Natural mode again."
-        )
-        return
+    python_dir = ChatterboxEngine._CB_PYTHON_DIR
+    python_exe = ChatterboxEngine._PYTHON_USER
 
-    # Step 2 — create venv
-    update_status("Creating Natural mode environment…")
-    try:
-        os.makedirs(os.path.dirname(env_dir), exist_ok=True)
-        r = subprocess.run(
-            [py, "-m", "venv", env_dir],
-            capture_output=True, text=True, timeout=120,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        if r.returncode != 0:
-            on_failure(
-                "Failed to create Python environment:\n"
-                + (r.stderr or r.stdout or "Unknown error").strip()[-400:]
-            )
+    # ── Step 1: download + extract Python embeddable ─────────────────────────
+    if not os.path.exists(python_exe):
+        update_status("Downloading Python 3.11 (~15 MB)…")
+        py_url  = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+        zip_tmp = os.path.join(tempfile.gettempdir(), "tts_python_embed.zip")
+        try:
+            os.makedirs(python_dir, exist_ok=True)
+            urllib.request.urlretrieve(py_url, zip_tmp)
+        except urllib.error.URLError as e:
+            on_failure(f"Could not download Python — check your internet connection.\n({e})")
             return
-    except Exception as e:
-        on_failure(f"Failed to create Python environment: {e}")
-        return
+        except Exception as e:
+            on_failure(f"Failed to download Python: {e}")
+            return
 
-    # Step 3 — upgrade pip (non-fatal if it fails)
-    update_status("Upgrading pip…")
-    try:
-        subprocess.run(
-            [python_user, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
-            capture_output=True, timeout=120,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    except Exception:
-        pass
+        update_status("Extracting Python 3.11…")
+        try:
+            with zipfile.ZipFile(zip_tmp, "r") as zf:
+                zf.extractall(python_dir)
+            os.unlink(zip_tmp)
+        except Exception as e:
+            on_failure(f"Failed to extract Python: {e}")
+            return
 
-    # Step 4 — install PyTorch CPU (~800 MB)
-    update_status("Downloading PyTorch (CPU) — ~800 MB, this may take a few minutes…")
+        # Enable site-packages so pip-installed libraries are importable.
+        # The embeddable zip ships with '#import site' commented out — uncomment it.
+        try:
+            for pth in _glob.glob(os.path.join(python_dir, "python*._pth")):
+                with open(pth, encoding="utf-8") as f:
+                    content = f.read()
+                content = content.replace("#import site", "import site")
+                with open(pth, "w", encoding="utf-8") as f:
+                    f.write(content)
+        except Exception as e:
+            on_failure(f"Failed to configure Python environment: {e}")
+            return
+
+    # ── Step 2: bootstrap pip ─────────────────────────────────────────────────
+    pip_exe = os.path.join(python_dir, "Scripts", "pip.exe")
+    if not os.path.exists(pip_exe):
+        update_status("Installing pip…")
+        get_pip_url = "https://bootstrap.pypa.io/get-pip.py"
+        get_pip_tmp = os.path.join(tempfile.gettempdir(), "tts_get_pip.py")
+        try:
+            urllib.request.urlretrieve(get_pip_url, get_pip_tmp)
+        except urllib.error.URLError as e:
+            on_failure(f"Could not download pip installer — check your internet connection.\n({e})")
+            return
+        except Exception as e:
+            on_failure(f"Failed to download pip installer: {e}")
+            return
+        try:
+            r = subprocess.run(
+                [python_exe, get_pip_tmp, "--quiet"],
+                capture_output=True, text=True, timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            os.unlink(get_pip_tmp)
+            if r.returncode != 0:
+                on_failure(
+                    "Failed to install pip:\n"
+                    + (r.stderr or r.stdout or "Unknown error").strip()[-400:]
+                )
+                return
+        except Exception as e:
+            on_failure(f"Failed to install pip: {e}")
+            return
+
+    # ── Step 3: install PyTorch CPU (~800 MB) ─────────────────────────────────
+    update_status("Downloading PyTorch (CPU) — ~800 MB, this may take several minutes…")
     try:
         r = subprocess.run(
-            [python_user, "-m", "pip", "install",
+            [python_exe, "-m", "pip", "install",
              "torch==2.6.0", "torchaudio==2.6.0",
              "--index-url", "https://download.pytorch.org/whl/cpu",
              "--quiet"],
@@ -665,11 +653,11 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
         on_failure(f"Failed to install PyTorch: {e}")
         return
 
-    # Step 5 — install chatterbox-tts (~200 MB)
+    # ── Step 4: install chatterbox-tts (~200 MB) ──────────────────────────────
     update_status("Installing Chatterbox TTS and dependencies…")
     try:
         r = subprocess.run(
-            [python_user, "-m", "pip", "install", "chatterbox-tts==0.1.7", "--quiet"],
+            [python_exe, "-m", "pip", "install", "chatterbox-tts==0.1.7", "--quiet"],
             capture_output=True, text=True, timeout=600,    # 10 min
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
@@ -686,9 +674,8 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
         on_failure(f"Failed to install Chatterbox: {e}")
         return
 
-    # Verify
-    if not os.path.exists(python_user):
-        on_failure("Setup finished but environment not found — please try again.")
+    if not os.path.exists(python_exe):
+        on_failure("Setup finished but Python not found — please try again.")
         return
 
     on_success()
@@ -4319,16 +4306,18 @@ if _saved_clone and _saved_clone != _CLONE_DEFAULT:
 
 def _show_chatterbox_setup_modal(on_complete, on_cancel):
     """
-    Show a setup modal and install chatterbox_env in the background.
-    Calls on_complete() on success, on_cancel() if the user dismisses after failure.
+    Two-phase setup modal:
+      Phase 1 — confirm: shows what will be downloaded, Set Up / Cancel buttons.
+      Phase 2 — progress: downloads and installs in background; dismissible only on failure.
+    Calls on_complete() on success, on_cancel() if user cancels or dismisses after failure.
     """
     win = ctk.CTkToplevel(app)
     win.title("Natural Mode Setup")
-    _center_window(win, 500, 310)
+    _center_window(win, 500, 400)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.transient(app)
-    win.protocol("WM_DELETE_WINDOW", lambda: None)   # blocked until success/failure
+    win.protocol("WM_DELETE_WINDOW", lambda: None)
     win.attributes("-topmost", True)
     win.lift()
 
@@ -4340,47 +4329,69 @@ def _show_chatterbox_setup_modal(on_complete, on_cancel):
     hdr_inner.pack(side="left", padx=16, pady=10)
     ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=4, height=20,
                  corner_radius=2).pack(side="left", padx=(0, 10))
-    ctk.CTkLabel(hdr_inner, text="Setting Up Natural Mode",
+    ctk.CTkLabel(hdr_inner, text="Natural Mode Setup",
                  font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
                  text_color=C_TXT).pack(side="left")
     ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
 
-    # ── Info callout ──────────────────────────────────────────────────────────
-    callout = ctk.CTkFrame(win, fg_color=C_ACCENT_D, corner_radius=8)
-    callout.pack(fill="x", padx=20, pady=(16, 0))
-    ctk.CTkLabel(
-        callout,
-        text="Downloading PyTorch + Chatterbox (~1 GB). Keep the app open.\n"
-             "The 3 GB model files are downloaded on your first generation.",
-        font=ctk.CTkFont(family="Segoe UI", size=11),
-        text_color=C_WARN,
-        justify="left",
-    ).pack(anchor="w", padx=12, pady=8)
+    # ── Phase 1: confirmation body ────────────────────────────────────────────
+    confirm_frame = ctk.CTkFrame(win, fg_color="transparent")
+    confirm_frame.pack(fill="x", padx=20, pady=(16, 0))
 
-    # ── Progress bar ──────────────────────────────────────────────────────────
+    ctk.CTkLabel(confirm_frame,
+                 text="Natural mode uses a separate AI engine that needs to be\n"
+                      "downloaded once. The app will handle everything automatically.",
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT2, justify="left", anchor="w",
+                 ).pack(anchor="w", pady=(0, 14))
+
+    ctk.CTkLabel(confirm_frame, text="WHAT WILL BE DOWNLOADED",
+                 font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
+                 text_color=C_TXT3, anchor="w").pack(anchor="w", pady=(0, 6))
+
+    items_frame = ctk.CTkFrame(confirm_frame, fg_color=C_ELEVATED, corner_radius=8)
+    items_frame.pack(fill="x", pady=(0, 4))
+    for label, size in (
+        ("Python 3.11  (runtime environment)", "~15 MB"),
+        ("PyTorch CPU  (AI inference library)", "~800 MB"),
+        ("Chatterbox TTS  (voice model)",       "~200 MB"),
+    ):
+        row = ctk.CTkFrame(items_frame, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(row, text=label,
+                     font=ctk.CTkFont(family="Segoe UI", size=11),
+                     text_color=C_TXT2, anchor="w").pack(side="left")
+        ctk.CTkLabel(row, text=size,
+                     font=ctk.CTkFont(family="Segoe UI", size=11),
+                     text_color=C_TXT3, anchor="e").pack(side="right")
+
+    ctk.CTkLabel(confirm_frame,
+                 text="The 3 GB voice model downloads on your first generation.",
+                 font=ctk.CTkFont(family="Segoe UI", size=10),
+                 text_color=C_TXT3, anchor="w").pack(anchor="w", pady=(8, 0))
+
+    # ── Phase 1: buttons ──────────────────────────────────────────────────────
+    btn_frame = ctk.CTkFrame(win, fg_color="transparent")
+    btn_frame.pack(fill="x", padx=20, pady=16)
+
+    # ── Phase 2: progress elements (hidden until setup starts) ────────────────
     bar = ctk.CTkProgressBar(win, mode="indeterminate",
                              progress_color=C_ACCENT, fg_color=C_ACCENT_D)
-    bar.pack(fill="x", padx=20, pady=(14, 6))
-    bar.start()
-
-    # ── Status text ───────────────────────────────────────────────────────────
-    status_var = ctk.StringVar(value="Initializing…")
-    ctk.CTkLabel(win, textvariable=status_var,
-                 font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT2, wraplength=460, anchor="w", justify="left",
-                 ).pack(padx=20, anchor="w")
-
-    # ── Dismiss button (hidden until failure) ─────────────────────────────────
-    dismiss_btn = ctk.CTkButton(win, text="Cancel — Use Fast Mode",
+    status_var = ctk.StringVar(value="")
+    status_lbl = ctk.CTkLabel(win, textvariable=status_var,
+                              font=ctk.CTkFont(family="Segoe UI", size=11),
+                              text_color=C_TXT2, wraplength=460, anchor="w", justify="left")
+    cancel_btn2 = ctk.CTkButton(win, text="Cancel — Use Fast Mode",
                                 width=180, height=32,
                                 font=ctk.CTkFont(family="Segoe UI", size=12),
                                 fg_color=C_SURFACE, hover_color=C_ELEVATED,
                                 border_width=1, border_color=C_BORDER, text_color=C_TXT2)
-    # not packed yet — only shown on failure
+    # Not packed yet — appear only when needed
 
     win.update()
     _fade_in(win)
 
+    # ── Callbacks ─────────────────────────────────────────────────────────────
     def update_status(msg):
         app.after(0, lambda m=msg: status_var.set(m))
 
@@ -4400,16 +4411,37 @@ def _show_chatterbox_setup_modal(on_complete, on_cancel):
                 _fade_out(win, win.destroy)
                 on_cancel()
 
-            dismiss_btn.configure(command=_dismiss)
-            dismiss_btn.pack(pady=(10, 4))
+            cancel_btn2.configure(command=_dismiss)
+            cancel_btn2.pack(padx=20, pady=(6, 12))
             win.protocol("WM_DELETE_WINDOW", _dismiss)
         app.after(0, _ui)
 
-    threading.Thread(
-        target=_run_chatterbox_setup,
-        args=(update_status, _on_success, _on_failure),
-        daemon=True,
-    ).start()
+    def _start_setup():
+        # Transition to phase 2
+        confirm_frame.pack_forget()
+        btn_frame.pack_forget()
+        bar.pack(fill="x", padx=20, pady=(20, 6))
+        bar.start()
+        status_lbl.pack(padx=20, anchor="w")
+        win.protocol("WM_DELETE_WINDOW", lambda: None)  # lock close during download
+        threading.Thread(
+            target=_run_chatterbox_setup,
+            args=(update_status, _on_success, _on_failure),
+            daemon=True,
+        ).start()
+
+    def _cancel():
+        _fade_out(win, win.destroy)
+        on_cancel()
+
+    ctk.CTkButton(btn_frame, text="Set Up Natural Mode", command=_start_setup,
+                  height=36, font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                  fg_color=C_ACCENT, hover_color=C_ACCENT_H,
+                  text_color="#000000").pack(side="left", padx=(0, 10))
+    ctk.CTkButton(btn_frame, text="Cancel", command=_cancel,
+                  height=36, width=90,
+                  font=ctk.CTkFont(family="Segoe UI", size=12),
+                  **BTN_GHOST).pack(side="left")
 
 
 def _make_chatterbox_loading_modal():
