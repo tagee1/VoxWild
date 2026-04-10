@@ -17,25 +17,33 @@ import json
 import logging
 import copy
 
-# ── DLL search path fix (Windows, Python 3.8+) ────────────────────────────────
-# Python 3.8+ loads C extension modules (.pyd) with LoadLibraryEx using the
-# LOAD_LIBRARY_SEARCH_DEFAULT_DIRS flag, which does NOT search PATH.
-# We must explicitly register directories via os.add_dll_directory() so that
-# torch and other C extensions can find python3xx.dll and their own DLLs.
-if os.name == "nt" and hasattr(os, "add_dll_directory"):
-    _py_dir = os.path.dirname(os.path.abspath(sys.executable))
-    os.add_dll_directory(_py_dir)
-    _scripts_dir = os.path.join(_py_dir, "Scripts")
-    if os.path.isdir(_scripts_dir):
-        os.add_dll_directory(_scripts_dir)
-    # Register torch's bundled DLL directory (torch/lib/) if torch is installed.
-    import glob as _dll_glob
-    for _tlib in _dll_glob.glob(
-        os.path.join(_py_dir, "Lib", "site-packages", "torch", "lib")
-    ):
-        if os.path.isdir(_tlib):
-            os.add_dll_directory(_tlib)
-    del _py_dir, _scripts_dir, _dll_glob
+# ── DLL search path fix (Windows) ─────────────────────────────────────────────
+# Two separate mechanisms are needed because different loaders check different
+# sources:
+#   - LoadLibraryW (used by ctypes.CDLL)  → checks os.environ["PATH"]
+#   - LoadLibraryExW with LOAD_LIBRARY_SEARCH_* flags (used by Python C
+#     extension imports) → checks os.add_dll_directory() registrations
+#
+# torchaudio loads libtorchaudio.pyd via ctypes.CDLL, so its dependencies
+# (torch DLLs) must be on PATH. We add all relevant DLL dirs to both.
+if os.name == "nt":
+    _py_dir       = os.path.dirname(os.path.abspath(sys.executable))
+    _torch_lib    = os.path.join(_py_dir, "Lib", "site-packages", "torch",      "lib")
+    _taudio_lib   = os.path.join(_py_dir, "Lib", "site-packages", "torchaudio", "lib")
+    _scripts_dir  = os.path.join(_py_dir, "Scripts")
+
+    _dll_dirs = [d for d in [_py_dir, _scripts_dir, _torch_lib, _taudio_lib]
+                 if os.path.isdir(d)]
+
+    # 1. PATH — for ctypes.CDLL / LoadLibraryW dependency resolution
+    os.environ["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + os.environ.get("PATH", "")
+
+    # 2. add_dll_directory — for Python C-extension / LoadLibraryExW resolution
+    if hasattr(os, "add_dll_directory"):
+        for _d in _dll_dirs:
+            os.add_dll_directory(_d)
+
+    del _py_dir, _torch_lib, _taudio_lib, _scripts_dir, _dll_dirs
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Save the real stdout for our JSON protocol BEFORE anything else touches it
