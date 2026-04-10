@@ -1,4 +1,18 @@
 import sys
+import ctypes
+
+# ── Suppress console windows for ALL subprocesses (torch, resemble-enhance, etc.) ──
+# Any library that calls subprocess.Popen without CREATE_NO_WINDOW would pop a
+# visible CMD window on Windows. Patch it globally before any imports happen.
+if sys.platform == "win32":
+    import subprocess as _sp
+    _popen_init_orig = _sp.Popen.__init__
+    def _popen_no_window(self, *args, _orig=_popen_init_orig, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | 0x08000000
+        _orig(self, *args, **kwargs)
+    _sp.Popen.__init__ = _popen_no_window
+    del _sp, _popen_init_orig, _popen_no_window
+
 import customtkinter as ctk
 from kokoro_onnx import Kokoro
 import sounddevice as sd
@@ -11,6 +25,7 @@ import re
 import time
 import subprocess
 import tempfile
+import webbrowser
 from tkinter import filedialog, messagebox
 from scipy.signal import butter, sosfilt
 import tkinter as tk
@@ -22,6 +37,7 @@ from tts_utils import (
     format_time, chunk_text, parse_dialogue,
     _srt_time, _wrap_for_subtitle, build_srt,
     fmt_err, estimate_audio_duration, GenerationCancelled,
+    history_card_preview, history_card_voice_label,
 )
 from clone_library import (
     load_clone_library   as _lib_load,
@@ -29,7 +45,7 @@ from clone_library import (
     add_clone_to_library as _lib_add,
     rename_clone_in_library as _lib_rename,
 )
-from audio_utils import trim_silence, cleanup_audio
+from audio_utils import trim_silence, enhance_audio
 import license as _lic
 
 # ── Resource path helper (PyInstaller one-dir compatible) ─────────────────────
@@ -82,6 +98,7 @@ def _invalidate_clone_cache():
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 VERSION          = "1.0.0"
+GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
 # ── User data directory (%APPDATA%\TTS Studio) ────────────────────────────────
@@ -93,6 +110,9 @@ CALIBRATION_FILE = os.path.join(_USER_DIR, "calibration.json")
 SETTINGS_FILE    = os.path.join(_USER_DIR, "settings.json")
 CLONE_DIR        = os.path.join(_USER_DIR, "voice_clones")
 CLONE_INDEX      = os.path.join(CLONE_DIR, "library.json")
+HISTORY_JSON     = os.path.join(_USER_DIR, "history.json")
+HISTORY_AUDIO    = os.path.join(_USER_DIR, "history_audio")
+os.makedirs(HISTORY_AUDIO, exist_ok=True)
 
 # ── One-time migration: copy existing user files from app dir to %APPDATA% ────
 def _migrate_user_data():
@@ -184,6 +204,34 @@ C_REC       = "#dc3030"   # record button red
 BTN_GHOST   = dict(fg_color="transparent", hover_color=C_ELEVATED,
                    border_width=1, border_color=C_BORDER, text_color=C_TXT2)
 
+# ── Window helpers ───────────────────────────────────────────────────────────
+def _center_window(win, w: int, h: int) -> None:
+    """Set win to w×h and center it over the main app window.
+
+    Centers relative to the app window rather than the screen so it works
+    correctly on remote/cloud desktops (Shadow PC) and multi-monitor setups
+    where GetSystemMetrics may return the wrong coordinate space.
+    """
+    win.update_idletasks()
+    try:
+        ax = app.winfo_x()
+        ay = app.winfo_y()
+        aw = app.winfo_width()
+        ah = app.winfo_height()
+        x = ax + (aw - w) // 2
+        y = ay + (ah - h) // 2
+    except Exception:
+        try:
+            sw = ctypes.windll.user32.GetSystemMetrics(0)
+            sh = ctypes.windll.user32.GetSystemMetrics(1)
+        except Exception:
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+    win.geometry(f"{w}x{h}+{x}+{y}")
+
+
 # ── Window animation helpers ──────────────────────────────────────────────────
 def _fade_in(win, steps=10, delay=18):
     """Fade a CTkToplevel in from transparent to opaque."""
@@ -218,19 +266,36 @@ BTN_DANGER  = dict(fg_color="#2a0f0f", hover_color="#3d1515", text_color=C_DANGE
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme(_res("theme.json"))
 
+# Pin taskbar icon on Windows — must be set before the window is created
+try:
+    import ctypes
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        "CookieStudios.TTSStudio.1"
+    )
+except Exception:
+    pass
+
 app = ctk.CTk()
 app.title(f"AI Text to Speech Studio  v{VERSION}")
 app.geometry("1380x860")
 app.minsize(1100, 720)
+
+# Route Tkinter callback exceptions through the crash logger so they're never silent.
+def _on_tk_exception(exc_type, exc_val, exc_tb):
+    import traceback as _tb
+    _log_crash(exc_val, tb_str="".join(_tb.format_exception(exc_type, exc_val, exc_tb)))
+app.report_callback_exception = _on_tk_exception
 app.configure(fg_color=C_BG)
 app.withdraw()   # hidden until splash finishes
 
-# Set app icon
+# Set app icon (deferred slightly so taskbar picks it up after window is shown)
 _APP_DIR = _res(".")
-try:
-    app.iconbitmap(_res("icon.ico"))
-except:
-    pass
+def _set_icon():
+    try:
+        app.iconbitmap(_res("icon.ico"))
+    except Exception:
+        pass
+app.after(100, _set_icon)
 
 # ── Logo image (shared across UI) ────────────────────────────────────────────
 from PIL import Image as _PILImage
@@ -485,6 +550,50 @@ def set_default_folder(path):
     s["default_output_folder"] = path
     _save_settings(s)
 
+_FX_DEFAULTS = {
+    "fx_highpass": 20, "fx_lowpass": 18000, "fx_reverb": 0.0,
+    "fx_compressor": True, "fx_compressor_ratio": 2.0, "fx_gain": 0,
+    "fx_noise_gate": False, "fx_trim": True,
+    "fx_enhance": False, "fx_enhance_mode": "Async",
+}
+
+def _save_fx_settings():
+    """Persist current FX panel state into settings.json."""
+    try:
+        s = _get_settings()
+        s["fx_highpass"]          = highpass_slider.get()
+        s["fx_lowpass"]           = lowpass_slider.get()
+        s["fx_reverb"]            = reverb_slider.get()
+        s["fx_compressor"]        = compressor_var.get()
+        s["fx_compressor_ratio"]  = compressor_slider.get()
+        s["fx_gain"]              = gain_slider.get()
+        s["fx_noise_gate"]        = noise_gate_var.get()
+        s["fx_trim"]              = trim_var.get()
+        s["fx_enhance"]           = enhance_var.get()
+        s["fx_enhance_mode"]      = enhance_mode.get()
+        _save_settings(s)
+    except Exception:
+        pass
+
+def _restore_fx_settings():
+    """Load persisted FX panel state and apply to UI variables."""
+    try:
+        s = _get_settings()
+        highpass_slider.set(s.get("fx_highpass",         _FX_DEFAULTS["fx_highpass"]))
+        lowpass_slider.set(s.get("fx_lowpass",           _FX_DEFAULTS["fx_lowpass"]))
+        reverb_slider.set(s.get("fx_reverb",             _FX_DEFAULTS["fx_reverb"]))
+        compressor_var.set(s.get("fx_compressor",        _FX_DEFAULTS["fx_compressor"]))
+        compressor_slider.set(s.get("fx_compressor_ratio", _FX_DEFAULTS["fx_compressor_ratio"]))
+        gain_slider.set(s.get("fx_gain",                 _FX_DEFAULTS["fx_gain"]))
+        noise_gate_var.set(s.get("fx_noise_gate",        _FX_DEFAULTS["fx_noise_gate"]))
+        trim_var.set(s.get("fx_trim",                    _FX_DEFAULTS["fx_trim"]))
+        enhance_mode.set(s.get("fx_enhance_mode",        _FX_DEFAULTS["fx_enhance_mode"]))
+        # enhance_var last — its trace checks for resemble_enhance
+        enhance_var.set(s.get("fx_enhance",              _FX_DEFAULTS["fx_enhance"]))
+        update_all_labels()
+    except Exception:
+        pass
+
 # ── Calibration ───────────────────────────────────────────────────────────────
 def load_calibration():
     data = {"words_per_second": None, "samples": [],
@@ -548,50 +657,247 @@ def get_words_per_second():
 audio_history = []   # list of dicts: {samples, sample_rate, text, duration, timestamp, voice}
 _active_play_btn  = [None]   # currently playing card's Play button, or None
 _active_pause_btn = [None]   # pause button paired with the active play button
+_active_stop_btn  = [None]   # stop button paired with the active play button
 _pause_pos        = [None]   # sample index to resume from (None = not paused)
 _play_start_time  = [None]   # time.time() when sd.play() was last called
+_play_id          = [0]      # incremented each session; threads check this to avoid stomping
 
-def add_to_history(samples, sample_rate, text, voice_name, segments=None):
-    # Apply audio cleanup if enabled (before storing — affects playback and export)
-    if cleanup_var.get():
+def _save_history() -> None:
+    """Persist audio_history to disk. Safe to call from any thread via app.after."""
+    try:
+        records = []
+        for entry in audio_history:
+            if entry.get("enhancing"):
+                continue  # don't save mid-enhancement; called again in finally block
+            audio_file = entry.get("_audio_file")
+            if not audio_file:
+                continue
+            # Always write current samples (handles post-enhancement overwrite)
+            try:
+                sf.write(audio_file,
+                         np.clip(np.nan_to_num(entry["samples"], nan=0.0), -1.0, 1.0),
+                         entry["sample_rate"])
+            except Exception as e:
+                _log_crash(e)
+                continue  # skip this entry if we can't write audio
+
+            orig_file = entry.get("_orig_file")
+            if entry.get("original_samples") is not None:
+                if not orig_file:
+                    # Derive orig filename from the main audio filename
+                    base = os.path.splitext(os.path.basename(audio_file))[0]
+                    orig_file = os.path.join(HISTORY_AUDIO, base + "_orig.wav")
+                    entry["_orig_file"] = orig_file
+                try:
+                    sf.write(orig_file,
+                             np.clip(np.nan_to_num(entry["original_samples"], nan=0.0), -1.0, 1.0),
+                             entry["original_sr"])
+                except Exception as e:
+                    _log_crash(e)
+                    orig_file = None
+
+            records.append({
+                "timestamp":   entry.get("timestamp", ""),
+                "text":        entry.get("text", ""),
+                "voice":       entry.get("voice", ""),
+                "duration":    entry.get("duration", 0),
+                "segments":    entry.get("segments"),
+                "audio_file":  audio_file,
+                "sample_rate": entry.get("sample_rate", 22050),
+                "orig_file":   orig_file,
+                "original_sr": entry.get("original_sr"),
+            })
+
+        with open(HISTORY_JSON, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2)
+    except Exception as e:
+        _log_crash(e)
+
+
+def _load_history() -> None:
+    """Load persisted history from disk on startup. Runs on the main thread."""
+    global audio_history
+    if not os.path.exists(HISTORY_JSON):
+        return
+    try:
+        with open(HISTORY_JSON, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except Exception as e:
+        _log_crash(e)
+        return
+
+    loaded = []
+    for rec in records:
+        audio_file = rec.get("audio_file", "")
+        if not audio_file or not os.path.exists(audio_file):
+            continue  # audio missing — skip silently
         try:
-            mode = "noisereduce" if cleanup_mode.get().startswith("AI") else "pedalboard"
-            samples = cleanup_audio(samples, sample_rate, mode=mode)
-            samples = np.clip(samples, -1.0, 1.0)
+            samples, sr = sf.read(audio_file, dtype="float32")
         except Exception as e:
             _log_crash(e)
-            app.after(0, lambda m=_fmt_err(e): status_label.configure(
-                text=f"⚠️ Audio cleanup skipped: {m}"))
+            continue
 
+        entry = {
+            "samples":     samples,
+            "sample_rate": sr,
+            "text":        rec.get("text", ""),
+            "duration":    rec.get("duration") or len(samples) / sr,
+            "timestamp":   rec.get("timestamp", ""),
+            "voice":       rec.get("voice", ""),
+            "segments":    rec.get("segments"),  # lists after JSON; unpack as seq is fine
+            "enhancing":   False,
+            "_audio_file": audio_file,
+            "_orig_file":  None,
+        }
+
+        orig_file = rec.get("orig_file", "")
+        if orig_file and os.path.exists(orig_file):
+            try:
+                orig, orig_sr = sf.read(orig_file, dtype="float32")
+                entry["original_samples"] = orig
+                entry["original_sr"]      = orig_sr
+                entry["_orig_file"]       = orig_file
+            except Exception as e:
+                _log_crash(e)
+
+        loaded.append(entry)
+
+    audio_history = loaded[:MAX_HISTORY]
+    refresh_history_panel()
+
+
+def _history_audio_path(ts_tag: str, suffix: str = "") -> str:
+    """Return a unique WAV path in HISTORY_AUDIO for this entry."""
+    base = f"hist_{ts_tag}{suffix}"
+    path = os.path.join(HISTORY_AUDIO, base + ".wav")
+    n = 0
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(HISTORY_AUDIO, f"{base}_{n}.wav")
+    return path
+
+
+def _delete_history_audio(entry: dict) -> None:
+    """Delete WAV files associated with a history entry, if they exist."""
+    for key in ("_audio_file", "_orig_file"):
+        fpath = entry.get(key)
+        if fpath and os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+
+
+def add_to_history(samples, sample_rate, text, voice_name, segments=None):
     duration = len(samples) / sample_rate
+    ts = datetime.now()
+    ts_tag = ts.strftime("%Y%m%d_%H%M%S")
     entry = {
         "samples":     samples,
         "sample_rate": sample_rate,
         "text":        text,
         "duration":    duration,
-        "timestamp":   datetime.now().strftime("%H:%M:%S"),
+        "timestamp":   ts.strftime("%Y-%m-%d %H:%M:%S"),
         "voice":       voice_name,
         "segments":    segments,  # list of (start_sec, end_sec, text) for SRT export
+        "enhancing":   False,
+        "_audio_file": _history_audio_path(ts_tag),
+        "_orig_file":  None,
     }
     audio_history.insert(0, entry)
     if len(audio_history) > MAX_HISTORY:
-        audio_history.pop()
-    _prepend_history_card(entry)
+        _delete_history_audio(audio_history.pop())
+    # Schedule save on main thread (add_to_history is called from bg threads)
+    app.after(0, _save_history)
+
+    if enhance_var.get():
+        # ── Freemium gate: Resemble Enhance ───────────────────────────────────
+        if not _lic.can_use_enhance():
+            app.after(0, lambda: _show_upsell_modal("enhance"))
+            app.after(0, lambda e=entry: _prepend_history_card(e))
+            return
+
+        # Always show card immediately then enhance in background regardless of mode.
+        # CPU/GPU/Async only controls which device the enhance thread uses.
+        mode = enhance_mode.get()
+        if mode == "GPU":
+            device = "cuda"
+        elif mode == "CPU":
+            device = "cpu"
+        else:  # Async — auto-detect
+            try:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+        entry["enhancing"] = True
+        app.after(0, lambda e=entry: _prepend_history_card(e))
+        threading.Thread(target=_enhance_async, args=(entry, device), daemon=True).start()
+    else:
+        app.after(0, lambda e=entry: _prepend_history_card(e))
+
+
+def _enhance_async(entry, device="cpu"):
+    """Background thread: run Resemble Enhance, verify it worked, refresh the card."""
+    app.after(0, lambda: status_label.configure(
+        text="✨ Enhancing audio... (first run downloads ~450 MB of model weights)"))
+    try:
+        original_samples = entry["samples"].copy()
+        original_sr      = entry["sample_rate"]
+
+        enhanced, new_sr = enhance_audio(original_samples, original_sr, device=device)
+        enhanced_clipped = np.clip(enhanced, -1.0, 1.0)
+
+        # ── Verify enhancement actually changed the audio ─────────────────────
+        # Resample original to the output sr for a fair comparison
+        from scipy.signal import resample_poly
+        from math import gcd
+        g = gcd(original_sr, new_sr)
+        orig_resampled = resample_poly(original_samples, new_sr // g, original_sr // g).astype(np.float32)
+        min_len = min(len(orig_resampled), len(enhanced_clipped))
+        rms_orig     = float(np.sqrt(np.mean(orig_resampled[:min_len] ** 2)))
+        rms_enhanced = float(np.sqrt(np.mean(enhanced_clipped[:min_len] ** 2)))
+        mad = float(np.mean(np.abs(orig_resampled[:min_len] - enhanced_clipped[:min_len])))
+
+        if mad < 1e-6:
+            raise RuntimeError(
+                "Enhancement produced no change — the model output is identical to the input. "
+                "This usually means the model weights failed to load or the library isn't "
+                "working correctly. Try: pip install resemble-enhance --no-deps --force-reinstall  [E013]"
+            )
+
+        rms_delta_db = 20 * np.log10(rms_enhanced / rms_orig) if rms_orig > 1e-9 else 0.0
+
+        entry["original_samples"] = original_samples
+        entry["original_sr"]      = original_sr
+        entry["samples"]          = enhanced_clipped
+        entry["sample_rate"]      = new_sr
+        entry["duration"]         = len(enhanced_clipped) / new_sr
+
+        _lic.record_enhance_use()
+
+        app.after(0, lambda db=rms_delta_db: status_label.configure(
+            text=f"✅ Enhancement done  ({db:+.1f} dB RMS) — use Orig button to A/B compare"))
+
+    except Exception as e:
+        # Use the raw error string — enhance_audio now writes descriptive messages.
+        # _fmt_err would compress these into a generic E013 line, losing the detail.
+        _log_crash(e)
+        raw_msg = str(e)
+        # Strip the [E013] tag from the display — it's noise for the status bar
+        display_msg = raw_msg.replace("  [E013]", "").replace(" [E013]", "")
+        app.after(0, lambda m=display_msg: status_label.configure(
+            text=f"⚠️ Enhancement failed: {m}"))
+    finally:
+        entry["enhancing"] = False
+        app.after(0, refresh_history_panel)
+        app.after(0, _save_history)   # re-save with enhanced audio (or failed state)
 
 def _prepend_history_card(entry):
-    """Add one card at the top of the history panel — O(1) widget work."""
-    children = history_inner.winfo_children()
-    # Remove the "No audio yet." placeholder if present
-    if children and isinstance(children[0], ctk.CTkLabel):
-        children[0].destroy()
-        children = []
-    # Drop the oldest card widget if we're at the limit
-    if len(children) >= MAX_HISTORY:
-        children[-1].destroy()
-    # Build the new card and pack it above everything else
-    card = _make_history_card(history_inner, 0, entry)
-    card.pack(fill="x", padx=6, pady=(0, 3))
-    card.lift()  # move to top of stacking/pack order
+    """Add entry to the top of the history panel and rebuild."""
+    # Full rebuild is fast (max 10 cards) and guarantees correct ordering.
+    # audio_history already has the new entry at index 0.
+    refresh_history_panel()
 
 def refresh_history_panel():
     """Full rebuild — used after deletions."""
@@ -599,7 +905,7 @@ def refresh_history_panel():
         w.destroy()
     if not audio_history:
         ctk.CTkLabel(history_inner, text="No audio yet.",
-                     text_color=C_TXT3, font=ctk.CTkFont(family="Segoe UI", size=12)).pack(pady=30)
+                     text_color=C_TXT3, font=ctk.CTkFont(family="Segoe UI", size=12)).pack(pady=16)
         return
     for i, entry in enumerate(audio_history):
         _make_history_card(history_inner, i, entry)
@@ -608,65 +914,127 @@ def _make_history_card(parent, idx, entry):
     def _delete(e=entry):
         if e in audio_history:
             audio_history.remove(e)
+            _delete_history_audio(e)
         refresh_history_panel()
+        _save_history()
 
     outer = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=6,
                          border_width=1, border_color=C_BORDER)
-    outer.pack(fill="x", padx=6, pady=(0, 6))
+    outer.pack(fill="x", padx=6, pady=(0, 8))
     # NOTE: caller (_prepend_history_card) may call outer.lift() after this returns.
 
-    # place() ties relheight to outer's actual rendered size, not the pack allocation
-    # (fill="y" inside a CTkScrollableFrame expands to the full viewport height)
+    # Animated enhancing bar — packed FIRST so it sits at the bottom of outer
+    if entry.get("enhancing"):
+        bar = ctk.CTkProgressBar(
+            outer, mode="indeterminate", height=4, corner_radius=0,
+            progress_color=C_ACCENT, fg_color=C_BORDER,
+        )
+        bar.pack(fill="x", side="bottom", padx=0, pady=0)
+        bar.start()
+
+    # Amber accent stripe (placed so it doesn't affect pack layout)
     ctk.CTkFrame(outer, fg_color=C_ACCENT, width=3, corner_radius=0).place(
         x=0, y=0, relheight=1)
 
     content = ctk.CTkFrame(outer, fg_color="transparent")
-    content.pack(fill="both", expand=True, padx=(11, 8), pady=(8, 8))
+    content.pack(fill="both", expand=True, padx=(12, 10), pady=(9, 9))
 
-    # ── Row 1: timestamp · voice ──────────────────────────────────────────────
+    # ── Row 1: timestamp (left) · duration (right) ───────────────────────────
     row1 = ctk.CTkFrame(content, fg_color="transparent")
     row1.pack(fill="x")
-
-    ctk.CTkLabel(row1, text=entry["timestamp"],
+    _ts_raw = entry.get("timestamp", "")
+    try:
+        _ts_dt  = datetime.strptime(_ts_raw, "%Y-%m-%d %H:%M:%S")
+        _today  = datetime.now().date()
+        if _ts_dt.date() == _today:
+            _ts_str = _ts_dt.strftime("%-I:%M %p") if sys.platform != "win32" \
+                      else _ts_dt.strftime("%#I:%M %p")
+        else:
+            _ts_str = _ts_dt.strftime("%b %-d · %-I:%M %p") if sys.platform != "win32" \
+                      else _ts_dt.strftime("%b %#d · %#I:%M %p")
+    except Exception:
+        _ts_str = _ts_raw  # fallback: show raw string (handles old HH:MM:SS entries)
+    ctk.CTkLabel(row1, text=_ts_str,
                  font=ctk.CTkFont(family="Segoe UI", size=10),
                  text_color=C_TXT3).pack(side="left")
+    try:
+        dur_str = format_time(int(entry.get("duration", 0)))
+    except Exception:
+        dur_str = ""
+    ctk.CTkLabel(row1, text=dur_str,
+                 font=ctk.CTkFont(family="Segoe UI", size=10),
+                 text_color=C_TXT3).pack(side="right")
 
-    voice_short = entry["voice"].split(" - ")[-1].replace(" (Best)", "") if " - " in entry["voice"] else entry["voice"]
-    ctk.CTkLabel(row1, text=f"  {voice_short}",
+    # ── Row 2: voice label (left) · status badge (right) ─────────────────────
+    row2 = ctk.CTkFrame(content, fg_color="transparent")
+    row2.pack(fill="x", pady=(2, 0))
+
+    voice_label = history_card_voice_label(entry.get("voice", "Unknown"))
+    ctk.CTkLabel(row2, text=voice_label,
                  font=ctk.CTkFont(family="Segoe UI", size=10),
                  text_color=C_ACCENT).pack(side="left")
 
-    # ── Row 1b: text preview (own line, wraps up to 2 lines) ─────────────────
-    preview = entry["text"].replace("\n", " ")
+    if entry.get("enhancing"):
+        ctk.CTkLabel(row2, text="✦ enhancing",
+                     font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                     text_color=C_ACCENT).pack(side="right")
+    elif entry.get("original_samples") is not None:
+        ctk.CTkLabel(row2, text="✨ enhanced",
+                     font=ctk.CTkFont(family="Segoe UI", size=10),
+                     text_color=C_ACCENT).pack(side="right")
+
+    # ── Text preview ─────────────────────────────────────────────────────────
+    preview = history_card_preview(entry.get("text", ""))
     ctk.CTkLabel(content, text=preview,
                  font=ctk.CTkFont(family="Segoe UI", size=12),
                  text_color=C_TXT, anchor="w", justify="left",
-                 wraplength=220).pack(fill="x", pady=(3, 0))
+                 wraplength=230).pack(fill="x", pady=(5, 0))
 
-    # ── Row 2: Play · Save · SRT ─────────────────────────────────────────────
-    row2 = ctk.CTkFrame(content, fg_color="transparent")
-    row2.pack(fill="x", pady=(6, 0))
+    # ── Play controls ─────────────────────────────────────────────────────────
+    row_play = ctk.CTkFrame(content, fg_color="transparent")
+    row_play.pack(fill="x", pady=(7, 0))
 
     play_btn = ctk.CTkButton(
-        row2, text="▶  Play", width=70, height=24,
+        row_play, text="▶  Play", width=72, height=26,
         font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
         fg_color=C_ACCENT_D, hover_color=C_ACCENT, text_color=C_TXT, corner_radius=5,
     )
-    # pause_btn created but not packed — shown only during playback
     pause_btn = ctk.CTkButton(
-        row2, text="⏸ Pause", width=80, height=24,
-        font=ctk.CTkFont(family="Segoe UI", size=11),
-        **BTN_GHOST, corner_radius=5,
+        row_play, text="⏸", width=30, height=26,
+        font=ctk.CTkFont(family="Segoe UI", size=13),
+        state="disabled", **BTN_GHOST, corner_radius=5,
     )
-    play_btn.configure(command=lambda e=entry, b=play_btn, p=pause_btn:
-                       _toggle_history_playback(e, b, p))
+    stop_btn = ctk.CTkButton(
+        row_play, text="⏹", width=30, height=26,
+        font=ctk.CTkFont(family="Segoe UI", size=13),
+        state="disabled", **BTN_GHOST, corner_radius=5,
+    )
+    play_btn.configure(command=lambda e=entry, b=play_btn, p=pause_btn, s=stop_btn:
+                       _toggle_history_playback(e, b, p, s))
     pause_btn.configure(command=lambda e=entry, b=play_btn, p=pause_btn:
                         _toggle_history_pause(e, b, p))
+    stop_btn.configure(command=lambda b=play_btn: _history_stop(b))
     play_btn.pack(side="left", padx=(0, 4))
-    # pause_btn is intentionally not packed here; _toggle_history_playback shows it
+    pause_btn.pack(side="left", padx=(0, 4))
+    stop_btn.pack(side="left", padx=(0, 4))
+
+    # ── Action row ────────────────────────────────────────────────────────────
+    # Delete is packed RIGHT first so it always reserves its space. Then
+    # Save / SRT / Orig fill from the left. All widths are kept deliberately
+    # tight (no CTk default 140px) so buttons never overflow the card.
+    row_act = ctk.CTkFrame(content, fg_color="transparent")
+    row_act.pack(fill="x", pady=(6, 0))
 
     ctk.CTkButton(
-        row2, text="Save", width=46, height=24,
+        row_act, text="Delete", width=46, height=22,
+        font=ctk.CTkFont(family="Segoe UI", size=10),
+        fg_color="transparent", hover_color="#3d1515",
+        text_color=C_DANGER, border_width=1, border_color="#3d1515", corner_radius=5,
+        command=_delete
+    ).pack(side="right")
+
+    ctk.CTkButton(
+        row_act, text="Save", width=38, height=22,
         font=ctk.CTkFont(family="Segoe UI", size=10),
         **BTN_GHOST, corner_radius=5,
         command=lambda e=entry: download_history_entry(e)
@@ -674,96 +1042,155 @@ def _make_history_card(parent, idx, entry):
 
     if entry.get("segments"):
         ctk.CTkButton(
-            row2, text="SRT", width=38, height=24,
+            row_act, text="SRT", width=32, height=22,
             font=ctk.CTkFont(family="Segoe UI", size=10),
             **BTN_GHOST, corner_radius=5,
             command=lambda e=entry: export_srt_from_entry(e)
         ).pack(side="left", padx=(0, 4))
 
-    # ── Row 3: Delete · duration ──────────────────────────────────────────────
-    row3 = ctk.CTkFrame(content, fg_color="transparent")
-    row3.pack(fill="x", pady=(3, 0))
-
-    ctk.CTkButton(
-        row3, text="Delete", width=52, height=22,
-        font=ctk.CTkFont(family="Segoe UI", size=10),
-        fg_color="transparent", hover_color="#3d1515",
-        text_color=C_DANGER, border_width=1, border_color="#3d1515", corner_radius=5,
-        command=_delete
-    ).pack(side="left")
-
-    ctk.CTkLabel(row3, text=format_time(int(entry["duration"])),
-                 font=ctk.CTkFont(family="Segoe UI", size=10),
-                 text_color=C_TXT3).pack(side="right", padx=(0, 2))
+    if entry.get("original_samples") is not None:
+        # Build a synthetic entry so the original audio goes through the
+        # full playback system — same pause / stop / error handling.
+        _orig_entry = {
+            "samples":     entry["original_samples"],
+            "sample_rate": entry["original_sr"],
+            "text":        f"[Original] {entry.get('text', '')}",
+        }
+        orig_play_btn  = ctk.CTkButton(
+            row_act, text="Orig", width=46, height=22,
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            **BTN_GHOST, corner_radius=5,
+        )
+        orig_pause_btn = ctk.CTkButton(
+            row_act, text="⏸", width=26, height=22,
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            state="disabled", **BTN_GHOST, corner_radius=5,
+        )
+        orig_stop_btn  = ctk.CTkButton(
+            row_act, text="⏹", width=26, height=22,
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            state="disabled", **BTN_GHOST, corner_radius=5,
+        )
+        orig_play_btn.configure(
+            command=lambda e=_orig_entry, b=orig_play_btn, p=orig_pause_btn, s=orig_stop_btn:
+                _toggle_history_playback(e, b, p, s))
+        orig_pause_btn.configure(
+            command=lambda e=_orig_entry, b=orig_play_btn, p=orig_pause_btn:
+                _toggle_history_pause(e, b, p))
+        orig_stop_btn.configure(
+            command=lambda b=orig_play_btn: _history_stop(b))
+        orig_play_btn.pack(side="left",  padx=(0, 2))
+        orig_pause_btn.pack(side="left", padx=(0, 2))
+        orig_stop_btn.pack(side="left",  padx=(0, 4))
 
     return outer
 
 def _reset_play_btn():
-    """Reset the active play/pause buttons back to idle state (call from any thread)."""
-    btn = _active_play_btn[0]
-    if btn:
+    """Reset active play/pause/stop buttons to idle state. Call from main thread only."""
+    play_btn = _active_play_btn[0]
+    if play_btn:
         try:
-            btn.configure(text="▶  Play", fg_color=C_ACCENT_D, hover_color=C_ACCENT)
+            play_btn.configure(state="normal")
         except Exception:
             pass
     pause_btn = _active_pause_btn[0]
     if pause_btn:
         try:
-            pause_btn.pack_forget()
+            pause_btn.configure(text="⏸", state="disabled")
+        except Exception:
+            pass
+    stop_btn = _active_stop_btn[0]
+    if stop_btn:
+        try:
+            stop_btn.configure(state="disabled")
         except Exception:
             pass
     _active_play_btn[0]  = None
     _active_pause_btn[0] = None
+    _active_stop_btn[0]  = None
     _pause_pos[0]        = None
     _play_start_time[0]  = None
 
-def _toggle_history_playback(entry, btn, pause_btn=None):
-    """Play or stop a history entry. pause_btn is the paired pause widget."""
-    # If this button is already the active one, treat as Stop
-    if _active_play_btn[0] is btn:
+def _toggle_history_playback(entry, btn, pause_btn=None, stop_btn=None):
+    """Play a history entry. Stops any currently playing audio first."""
+    try:
         sd.stop()
-        app.after(0, _reset_play_btn)
-        app.after(0, lambda: status_label.configure(text="⏹ Stopped."))
+    except Exception as e:
+        _log_crash(e)
+
+    _reset_play_btn()
+
+    raw = entry.get("samples")
+    if raw is None or (hasattr(raw, "__len__") and len(raw) == 0):
+        status_label.configure(text="❌ Audio data missing — try re-generating this entry.")
         return
 
-    # Stop whatever is currently playing and reset its controls
-    sd.stop()
-    app.after(0, _reset_play_btn)
+    try:
+        samples = np.clip(np.nan_to_num(raw, nan=0.0), -1.0, 1.0)
+        sr      = entry["sample_rate"]
+    except Exception as e:
+        _log_crash(e)
+        status_label.configure(text=f"❌ Could not read audio: {_fmt_err(e)}")
+        return
 
-    samples = np.clip(np.nan_to_num(entry["samples"], nan=0.0), -1.0, 1.0)
-    sr      = entry["sample_rate"]
+    _play_id[0] += 1
+    my_id = _play_id[0]
 
-    # Mark this button as active, show Stop style + pause button
     _active_play_btn[0]  = btn
     _active_pause_btn[0] = pause_btn
+    _active_stop_btn[0]  = stop_btn
     _pause_pos[0]        = None
-    if btn:
-        btn.configure(text="■  Stop", fg_color="#3d1515", hover_color="#5a1f1f")
-    if pause_btn:
-        pause_btn.pack(side="left", padx=(0, 4))
+    _play_start_time[0]  = time.time()
 
-    def _start_playback(start_pos=0):
-        _play_start_time[0] = time.time()
-        sd.play(samples[start_pos:], sr)
+    if btn:
+        try:
+            btn.configure(state="disabled")
+        except Exception:
+            pass
+    if pause_btn:
+        try:
+            pause_btn.configure(state="normal")
+        except Exception:
+            pass
+    if stop_btn:
+        try:
+            stop_btn.configure(state="normal")
+        except Exception:
+            pass
 
     def run():
         try:
             app.after(0, lambda: status_label.configure(
                 text=f"🔊 Playing: {entry['text'][:40]}..."))
-            _start_playback(0)
+            sd.play(samples, sr)
             sd.wait()
-            if _active_play_btn[0] is btn:
+            if _play_id[0] == my_id:
                 app.after(0, lambda: status_label.configure(text="✅ Playback done."))
                 app.after(0, _reset_play_btn)
         except Exception as e:
             _log_crash(e)
-            app.after(0, lambda: status_label.configure(text=f"❌ {_fmt_err(e)}"))
-            app.after(0, _reset_play_btn)
+            app.after(0, lambda m=_fmt_err(e): status_label.configure(text=f"❌ {m}"))
+            if _play_id[0] == my_id:
+                app.after(0, _reset_play_btn)
 
     threading.Thread(target=run, daemon=True).start()
 
+def _history_stop(play_btn):
+    """Stop playback if this card's play button is the active one."""
+    if _active_play_btn[0] is not play_btn:
+        return
+    try:
+        _play_id[0] += 1   # invalidate any bg thread before stopping
+        sd.stop()
+        _reset_play_btn()
+        status_label.configure(text="⏹ Stopped.")
+    except Exception as e:
+        _log_crash(e)
+
 def _toggle_history_pause(entry, play_btn, pause_btn):
     """Pause or resume the currently playing history entry."""
+    if _active_play_btn[0] is not play_btn:
+        return  # not this card's audio
     sr = entry["sample_rate"]
     samples = np.clip(np.nan_to_num(entry["samples"], nan=0.0), -1.0, 1.0)
 
@@ -772,10 +1199,14 @@ def _toggle_history_pause(entry, play_btn, pause_btn):
         elapsed = time.time() - (_play_start_time[0] or time.time())
         pos = int(elapsed * sr)
         _pause_pos[0] = min(pos, len(samples) - 1)
-        sd.stop()
+        _play_id[0] += 1   # invalidate bg thread so it won't call _reset_play_btn
+        try:
+            sd.stop()
+        except Exception as e:
+            _log_crash(e)
         if pause_btn:
             try:
-                pause_btn.configure(text="▶  Resume")
+                pause_btn.configure(text="▶")
             except Exception:
                 pass
         status_label.configure(text="⏸ Paused.")
@@ -785,24 +1216,29 @@ def _toggle_history_pause(entry, play_btn, pause_btn):
         _pause_pos[0] = None
         if pause_btn:
             try:
-                pause_btn.configure(text="⏸ Pause")
+                pause_btn.configure(text="⏸")
             except Exception:
                 pass
+
+        _play_id[0] += 1
+        my_id = _play_id[0]
+        _active_play_btn[0] = play_btn   # re-assert ownership
+        _play_start_time[0] = time.time() - (resume_pos / sr)
 
         def run():
             try:
                 app.after(0, lambda: status_label.configure(
                     text=f"🔊 Playing: {entry['text'][:40]}..."))
-                _play_start_time[0] = time.time() - (resume_pos / sr)
                 sd.play(samples[resume_pos:], sr)
                 sd.wait()
-                if _active_play_btn[0] is play_btn:
+                if _play_id[0] == my_id:
                     app.after(0, lambda: status_label.configure(text="✅ Playback done."))
                     app.after(0, _reset_play_btn)
             except Exception as e:
                 _log_crash(e)
                 app.after(0, lambda: status_label.configure(text=f"❌ {_fmt_err(e)}"))
-                app.after(0, _reset_play_btn)
+                if _play_id[0] == my_id:
+                    app.after(0, _reset_play_btn)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -831,15 +1267,49 @@ def download_history_entry(entry):
             _log_crash(e)
             status_label.configure(text=f"❌ Save failed: {_fmt_err(e)}")
 
+def _write_id3v2(filepath, title="", artist="", album="", year="", comment=""):
+    """Prepend a minimal ID3v2.3 tag block to an MP3 file (no external deps)."""
+    import struct
+
+    def _syncsafe(n):
+        out = bytearray(4)
+        for i in range(3, -1, -1):
+            out[i] = n & 0x7F
+            n >>= 7
+        return bytes(out)
+
+    def _text_frame(fid, text):
+        if not text:
+            return b""
+        data = b"\x03" + text.encode("utf-8")   # encoding byte: UTF-8
+        return fid.encode() + struct.pack(">I", len(data)) + b"\x00\x00" + data
+
+    def _comm_frame(text, lang="eng"):
+        data = b"\x03" + lang.encode() + b"\x00" + text.encode("utf-8")
+        return b"COMM" + struct.pack(">I", len(data)) + b"\x00\x00" + data
+
+    frames = (
+        _text_frame("TIT2", title)
+        + _text_frame("TPE1", artist)
+        + _text_frame("TALB", album)
+        + _text_frame("TYER", year)
+        + (_comm_frame(comment) if comment else b"")
+    )
+    id3_tag = b"ID3\x03\x00\x00" + _syncsafe(len(frames)) + frames
+    with open(filepath, "r+b") as f:
+        mp3_data = f.read()
+        f.seek(0)
+        f.write(id3_tag + mp3_data)
+        f.truncate()
+
+
 def _save_as_mp3(entry, filepath):
     """Show MP3 metadata dialog then encode and save."""
     import lameenc
-    from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC, COMM, ID3NoHeaderError
-    from mutagen.mp3 import MP3
 
     win = ctk.CTkToplevel(app)
     win.title("Save as MP3")
-    win.geometry("420x340")
+    _center_window(win, 420, 460)
     win.resizable(False, False)
     win.grab_set()
     win.configure(fg_color=C_BG)
@@ -858,24 +1328,35 @@ def _save_as_mp3(entry, filepath):
                  text_color=C_TXT).pack(side="left")
     ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
 
+    # ── Footer (packed BEFORE body so expand=True on body doesn't push it off-screen) ──
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(side="bottom", fill="x")
+    foot = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=62)
+    foot.pack(side="bottom", fill="x")
+    foot.pack_propagate(False)
+    foot_inner = ctk.CTkFrame(foot, fg_color="transparent")
+    foot_inner.pack(expand=True, fill="both", padx=16)
+
+    # ── Body (fills remaining space between header and footer) ────────────────
     body = ctk.CTkFrame(win, fg_color="transparent")
     body.pack(fill="both", expand=True, padx=20, pady=10)
 
-    def _field(label, placeholder=""):
+    def _field(label, value="", placeholder=""):
         ctk.CTkLabel(body, text=label,
                      font=ctk.CTkFont(family="Segoe UI", size=11),
-                     text_color=C_TXT2, anchor="w").pack(fill="x", pady=(6, 1))
-        var = ctk.StringVar()
+                     text_color=C_TXT2, anchor="w").pack(fill="x", pady=(4, 1))
+        var = ctk.StringVar(value=value)
         ctk.CTkEntry(body, textvariable=var,
                      fg_color=C_CARD, border_color=C_BORDER, text_color=C_TXT,
                      placeholder_text=placeholder, placeholder_text_color=C_TXT3,
                      height=30).pack(fill="x")
         return var
 
-    title_var  = _field("Title",  entry["text"][:60].replace("\n", " "))
-    author_var = _field("Artist / Author", "")
-    album_var  = _field("Album / Series", "")
-    year_var   = _field("Year", datetime.now().strftime("%Y"))
+    _auto_title = entry.get("text", "")[:60].replace("\n", " ").strip()
+    _auto_voice = entry.get("voice", "")
+    title_var  = _field("Title",          value=_auto_title)
+    author_var = _field("Artist / Author", value=_auto_voice, placeholder="e.g. Cookie Studios")
+    album_var  = _field("Album / Series",  placeholder="optional")
+    year_var   = _field("Year",            value=datetime.now().strftime("%Y"))
 
     # Quality selector
     ctk.CTkLabel(body, text="Quality",
@@ -887,22 +1368,20 @@ def _save_as_mp3(entry, filepath):
                             font=ctk.CTkFont(family="Segoe UI", size=11),
                             width=380).pack(anchor="w")
 
-    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
-
-    foot = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
-    foot.pack(fill="x")
-    foot.pack_propagate(False)
-    foot_inner = ctk.CTkFrame(foot, fg_color="transparent")
-    foot_inner.pack(side="left", padx=16, pady=10)
-
     def _do_save():
+        # Capture all StringVar values BEFORE destroying the window
+        _title   = title_var.get().strip()
+        _artist  = author_var.get().strip()
+        _album   = album_var.get().strip()
+        _year    = year_var.get().strip()
+        _quality = quality_var.get()
         win.destroy()
         status_label.configure(text="⏳ Encoding MP3...")
         app.update_idletasks()
 
         try:
             bitrate_map = {"128 kbps": 128, "192 kbps": 192, "320 kbps": 320}
-            bitrate = bitrate_map.get(quality_var.get(), 192)
+            bitrate = bitrate_map.get(_quality, 192)
 
             samples = entry["samples"]
             sr      = entry["sample_rate"]
@@ -924,27 +1403,15 @@ def _save_as_mp3(entry, filepath):
             with open(filepath, "wb") as f:
                 f.write(mp3_data)
 
-            # Write ID3 tags
-            try:
-                tags = ID3(filepath)
-            except ID3NoHeaderError:
-                tags = ID3()
-
-            title = title_var.get().strip()
-            if title:
-                tags["TIT2"] = TIT2(encoding=3, text=title)
-            author = author_var.get().strip()
-            if author:
-                tags["TPE1"] = TPE1(encoding=3, text=author)
-            album = album_var.get().strip()
-            if album:
-                tags["TALB"] = TALB(encoding=3, text=album)
-            year = year_var.get().strip()
-            if year:
-                tags["TDRC"] = TDRC(encoding=3, text=year)
-            tags["COMM"] = COMM(encoding=3, lang="eng", desc="",
-                                text=f"Generated by AI TTS Studio v{VERSION}")
-            tags.save(filepath)
+            # Write ID3 tags (pure Python, no mutagen)
+            _write_id3v2(
+                filepath,
+                title=_title,
+                artist=_artist,
+                album=_album,
+                year=_year,
+                comment=f"Generated by TTS Studio v{VERSION}",
+            )
 
             status_label.configure(
                 text=f"✅ Saved MP3: {os.path.basename(filepath)}  ({bitrate} kbps)")
@@ -953,13 +1420,13 @@ def _save_as_mp3(entry, filepath):
             status_label.configure(text=f"❌ MP3 encode failed: {_fmt_err(e)}")
 
     ctk.CTkButton(foot_inner, text="Save MP3", command=_do_save,
-                  width=120, height=34,
+                  width=120, height=36,
                   font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
-                  ).pack(side="left", padx=(0, 10))
-    ctk.CTkButton(foot_inner, text="Cancel", command=win.destroy,
-                  width=88, height=34,
+                  ).pack(side="left", padx=(0, 10), pady=13)
+    ctk.CTkButton(foot_inner, text="Don't Save", command=win.destroy,
+                  width=110, height=36,
                   font=ctk.CTkFont(family="Segoe UI", size=12),
-                  **BTN_GHOST).pack(side="left")
+                  **BTN_GHOST).pack(side="left", pady=13)
 
 # ── SRT Export ────────────────────────────────────────────────────────────────
 # _srt_time, _wrap_for_subtitle, build_srt imported from tts_utils
@@ -1189,7 +1656,12 @@ def apply_enhancements(samples, sample_rate):
 
     return out
 
-def generate_audio(text, voice, speed, status_cb=None):
+def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95)):
+    """Generate audio for text.
+    progress_range: (lo, hi) — smooth bar target is scaled within this window.
+    Single generation passes (0.0, 0.95); queue passes (i/n, (i+1)/n * 0.95).
+    """
+    lo, hi = progress_range
     text = apply_pronunciation(text)
     use_chatterbox = engine_var.get() == "🎙️ Natural"
 
@@ -1220,7 +1692,7 @@ def generate_audio(text, voice, speed, status_cb=None):
             )
             all_samples.append(samples)
             sample_rate = sr
-            smooth.set_target((i + 1) / len(chunks) * 0.9)
+            smooth.set_target(lo + (hi - lo) * (i + 1) / len(chunks))
     else:
         # ── Kokoro path ────────────────────────────────────────────────────────
         chunks = chunk_text(text)
@@ -1232,6 +1704,7 @@ def generate_audio(text, voice, speed, status_cb=None):
             samples, sr = kokoro.create(chunk, voice=voice, speed=speed)
             all_samples.append(samples)
             sample_rate = sr
+            smooth.set_target(lo + (hi - lo) * (i + 1) / len(chunks))
 
     # Build per-chunk timings (before trim/enhance) for SRT
     chunk_timings = []
@@ -1269,48 +1742,70 @@ def generate_audio(text, voice, speed, status_cb=None):
 # ── Dialogue ──────────────────────────────────────────────────────────────────
 # parse_dialogue imported from tts_utils
 
-def generate_dialogue_audio(dialogue_lines, speaker_voices, speed, status_cb=None):
+def generate_dialogue_audio(dialogue_lines, speaker_voices, speed,
+                            status_cb=None, cancel_event=None):
     """
     Generate multi-voice audio from parsed dialogue lines.
     dialogue_lines: list of (speaker, text)
     speaker_voices: dict of speaker_name -> voice display name (key in VOICES)
-    Returns: (audio, sample_rate, segments)
+    cancel_event:   threading.Event — checked between lines; raises GenerationCancelled
+    Returns: (audio, sample_rate, segments, failed_lines)
+      failed_lines: list of (line_index, speaker, error_str) for skipped lines
     """
     PAUSE_SAME = 0.15   # s between consecutive lines from same speaker
     PAUSE_DIFF = 0.35   # s between different speakers
 
-    parts      = []
-    timings    = []
+    parts       = []
+    timings     = []
+    failed_lines = []
     sample_rate = None
-    offset     = 0.0
-    voice_keys = list(VOICES.keys())
+    offset      = 0.0
+    voice_keys  = list(VOICES.keys())
 
     for i, (speaker, text) in enumerate(dialogue_lines):
-        text = apply_pronunciation(text)
-        voice_name = speaker_voices.get(speaker, voice_keys[0])
-        voice_id   = VOICES.get(voice_name, list(VOICES.values())[0])
+        if cancel_event and cancel_event.is_set():
+            raise GenerationCancelled()
+
         if status_cb:
             status_cb(f"⏳ Line {i+1}/{len(dialogue_lines)} — {speaker}...")
 
-        line_chunks  = chunk_text(text)
-        line_samples = []
-        for chunk in line_chunks:
-            samp, sr = kokoro.create(chunk, voice=voice_id, speed=speed)
-            line_samples.append(samp)
-            sample_rate = sr
+        try:
+            proc_text  = apply_pronunciation(text)
+            voice_name = speaker_voices.get(speaker, voice_keys[0])
+            voice_id   = VOICES.get(voice_name, list(VOICES.values())[0])
 
-        seg_audio = np.concatenate(line_samples)
-        dur = len(seg_audio) / sample_rate
-        timings.append((offset, offset + dur, f"{speaker}: {text}"))
-        parts.append(seg_audio)
-        offset += dur
+            line_chunks  = chunk_text(proc_text)
+            line_samples = []
+            for chunk in line_chunks:
+                if cancel_event and cancel_event.is_set():
+                    raise GenerationCancelled()
+                samp, sr = kokoro.create(chunk, voice=voice_id, speed=speed)
+                line_samples.append(samp)
+                sample_rate = sr
 
-        # Pause between lines
-        if i < len(dialogue_lines) - 1:
-            next_speaker = dialogue_lines[i + 1][0]
-            pause = PAUSE_DIFF if next_speaker != speaker else PAUSE_SAME
-            parts.append(np.zeros(int(sample_rate * pause), dtype=np.float32))
-            offset += pause
+            seg_audio = np.concatenate(line_samples)
+            dur = len(seg_audio) / sample_rate
+            timings.append((offset, offset + dur, f"{speaker}: {text}"))
+            parts.append(seg_audio)
+            offset += dur
+
+            # Pause between lines
+            if i < len(dialogue_lines) - 1:
+                next_speaker = dialogue_lines[i + 1][0]
+                pause = PAUSE_DIFF if next_speaker != speaker else PAUSE_SAME
+                parts.append(np.zeros(int(sample_rate * pause), dtype=np.float32))
+                offset += pause
+
+        except GenerationCancelled:
+            raise
+        except Exception as e:
+            failed_lines.append((i + 1, speaker, str(e)))
+            if status_cb:
+                status_cb(f"⚠️ Skipped line {i+1} ({speaker}): {e}")
+            continue
+
+    if not parts:
+        raise RuntimeError("All dialogue lines failed to generate. Check your script and voices.")
 
     combined = np.concatenate(parts)
 
@@ -1325,7 +1820,7 @@ def generate_dialogue_audio(dialogue_lines, speaker_voices, speed, status_cb=Non
     scale    = post_dur / pre_dur if pre_dur > 0 else 1.0
     segments = [(s * scale, e * scale, t) for s, e, t in timings]
 
-    return enhanced, sample_rate, segments
+    return enhanced, sample_rate, segments, failed_lines
 
 # ── Profiles ──────────────────────────────────────────────────────────────────
 def get_current_settings():
@@ -1466,7 +1961,7 @@ def queue_add():
     # ── Name popup ────────────────────────────────────────────────────────────
     dlg = ctk.CTkToplevel(app)
     dlg.title("Name this queue item")
-    dlg.geometry("360x140")
+    _center_window(dlg, 360, 140)
     dlg.resizable(False, False)
     dlg.configure(fg_color=C_BG)
     dlg.grab_set()
@@ -1539,6 +2034,25 @@ def update_queue_estimate():
              f"Processing: ~{format_time(total_proc)}  |  Total audio: ~{format_time(total_audio)}"
     )
 
+def _encode_mp3_file(out_path, samples, sr, bitrate, title="", artist=""):
+    """Encode samples to MP3 and write ID3 tags. Runs on background thread."""
+    import lameenc
+    pcm = np.clip(samples, -1.0, 1.0)
+    pcm = (pcm * 32767).astype(np.int16)
+    if pcm.ndim > 1:
+        pcm = pcm.mean(axis=1).astype(np.int16)
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(bitrate)
+    encoder.set_in_sample_rate(sr)
+    encoder.set_channels(1)
+    encoder.set_quality(2)
+    mp3_data = encoder.encode(pcm.tobytes()) + encoder.flush()
+    with open(out_path, "wb") as f:
+        f.write(mp3_data)
+    _write_id3v2(out_path, title=title, artist=artist,
+                 comment=f"Generated by TTS Studio v{VERSION}")
+
+
 def queue_generate_all():
     if not queue_items:
         status_label.configure(text="⚠️ Queue is empty.")
@@ -1549,8 +2063,19 @@ def queue_generate_all():
     if not out_dir: return
     set_default_folder(out_dir)
 
+    use_mp3      = queue_fmt_var.get() == "MP3"
+    bitrate      = {"128 kbps": 128, "192 kbps": 192, "320 kbps": 320}.get(
+                       queue_mp3_quality_var.get(), 192)
+    ext          = ".mp3" if use_mp3 else ".wav"
+    queue_natural = engine_var.get() == "🎙️ Natural"
+
+    # ── Freemium gate: Natural mode — check before starting the batch ─────────
+    if queue_natural and not _lic.can_use_natural():
+        _show_upsell_modal("natural")
+        return
+
     voice       = VOICES[voice_var.get()]
-    if engine_var.get() == "🎙️ Natural":
+    if queue_natural:
         _sel = cb_clone_var.get()
         voice_name = _sel if _sel != _CLONE_DEFAULT else "Default"
     else:
@@ -1562,7 +2087,6 @@ def queue_generate_all():
 
     queue_gen_btn.configure(state="disabled")
     smooth.start(est_total)
-
     _cancel_event.clear()
 
     def run():
@@ -1570,22 +2094,43 @@ def queue_generate_all():
         is_generating = True
         words_done    = 0
         cancelled     = False
+        i = -1
         for i, item in enumerate(queue_items):
             if _cancel_event.is_set():
                 cancelled = True
                 break
-            def scb(msg): status_label.configure(text=f"[{i+1}/{total_items}] {msg}")
+            # Per-item Natural gate (uses can run out mid-batch for free users)
+            if queue_natural and not _lic.can_use_natural():
+                app.after(0, lambda _i=i: status_label.configure(
+                    text=f"⚠️ Natural mode limit reached after {_i} item(s). Upgrade to Pro for unlimited."))
+                app.after(0, lambda: _show_upsell_modal("natural"))
+                cancelled = True
+                break
+            def scb(msg, _i=i): app.after(0, lambda m=f"[{_i+1}/{total_items}] {msg}": status_label.configure(text=m))
             scb("Starting...")
             t0 = time.time()
             try:
-                samples, sr, segments = generate_audio(item["text"], voice, speed, status_cb=scb)
+                prog_lo = i / total_items
+                prog_hi = (i + 1) / total_items
+                samples, sr, segments = generate_audio(
+                    item["text"], voice, speed,
+                    status_cb=scb,
+                    progress_range=(prog_lo, prog_hi * 0.95),
+                )
+                if queue_natural:
+                    _lic.record_natural_use()
                 words_done += len(item["text"].split())
-                smooth.set_target(words_done / total_words)
-                out_path = os.path.join(out_dir, f"{i+1:02d}_{item['name'].replace(' ','_')}.wav")
-                sf.write(out_path, samples, sr)
+                safe_name = item['name'].replace(' ', '_')
+                out_path  = os.path.join(out_dir, f"{i+1:02d}_{safe_name}{ext}")
+                if use_mp3:
+                    scb(f"⏳ Encoding MP3...")
+                    _encode_mp3_file(out_path, samples, sr, bitrate,
+                                     title=item["name"], artist=voice_name)
+                else:
+                    sf.write(out_path, samples, sr)
                 record_calibration(len(item["text"].split()), time.time() - t0)
                 add_to_history(samples, sr, item["text"], voice_name, segments=segments)
-                scb(f"✅ Saved {item['name']}")
+                scb(f"✅ Saved {item['name']}{ext}")
             except GenerationCancelled:
                 cancelled = True
                 break
@@ -1595,11 +2140,15 @@ def queue_generate_all():
             time.sleep(0.05)
         smooth.finish()
         is_generating = False
+        completed = i + 1
+        fmt_str = "MP3" if use_mp3 else "WAV"
         if cancelled:
-            status_label.configure(text=f"⏹ Queue cancelled. {words_done and i or 0} of {total_items} items completed.")
+            app.after(0, lambda c=completed, t=total_items: status_label.configure(
+                text=f"⏹ Queue cancelled. {c} of {t} items completed."))
         else:
-            status_label.configure(text=f"✅ Queue complete! {total_items} files saved to {out_dir}")
-        queue_gen_btn.configure(state="normal")
+            app.after(0, lambda t=total_items, d=out_dir, f=fmt_str: status_label.configure(
+                text=f"✅ Queue complete! {t} {f} files saved to {d}"))
+        app.after(0, lambda: queue_gen_btn.configure(state="normal"))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -1644,8 +2193,16 @@ def generate_and_store():
     if not text:
         status_label.configure(text="⚠️ Please enter some text.")
         return
+
+    using_natural = engine_var.get() == "🎙️ Natural"
+
+    # ── Freemium gate: Natural mode ───────────────────────────────────────────
+    if using_natural and not _lic.can_use_natural():
+        _show_upsell_modal("natural")
+        return
+
     voice      = VOICES[voice_var.get()]
-    if engine_var.get() == "🎙️ Natural":
+    if using_natural:
         _sel = cb_clone_var.get()
         voice_name = _sel if _sel != _CLONE_DEFAULT else "Default"
     else:
@@ -1668,26 +2225,31 @@ def generate_and_store():
         try:
             samples, sr, segments = generate_audio(
                 text, voice, speed,
-                status_cb=lambda m: status_label.configure(text=m)
+                status_cb=lambda m: app.after(0, lambda m=m: status_label.configure(text=m))
             )
             elapsed = time.time() - t0
             record_calibration(words, elapsed)
+            if using_natural:
+                _lic.record_natural_use()
             smooth.finish()
             add_to_history(samples, sr, text, voice_name, segments=segments)
-            status_label.configure(text="✅ Audio ready! Click ▶ Play in the history panel.")
+            app.after(0, lambda: status_label.configure(
+                text="✅ Audio ready! Click ▶ Play in the history panel."))
         except GenerationCancelled:
             smooth.finish()
-            status_label.configure(text="⏹ Generation cancelled.")
+            app.after(0, lambda: status_label.configure(text="⏹ Generation cancelled."))
         except Exception as e:
             _log_crash(e)
             smooth.finish()
-            status_label.configure(text=f"❌ {_fmt_err(e)}")
+            _msg = _fmt_err(e)
+            app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
         finally:
             is_generating = False
-            play_button.configure(state="normal", text="▶  Generate")
-            stop_button.configure(state="disabled", text="Stop",
-                                  fg_color="transparent", hover_color=C_ELEVATED,
-                                  text_color=C_TXT2, border_width=1, border_color=C_BORDER)
+            app.after(0, lambda: play_button.configure(state="normal", text="▶  Generate"))
+            app.after(0, lambda: stop_button.configure(
+                state="disabled", text="Stop",
+                fg_color="transparent", hover_color=C_ELEVATED,
+                text_color=C_TXT2, border_width=1, border_color=C_BORDER))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -1715,12 +2277,13 @@ def preview_voice():
             enhanced = apply_enhancements(samples, sr)
             sd.play(enhanced, sr)
             sd.wait()
-            status_label.configure(text="✅ Preview done!")
+            app.after(0, lambda: status_label.configure(text="✅ Preview done!"))
         except Exception as e:
             _log_crash(e)
-            status_label.configure(text=f"❌ {_fmt_err(e)}")
+            _msg = _fmt_err(e)
+            app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
         finally:
-            preview_button.configure(state="normal")
+            app.after(0, lambda: preview_button.configure(state="normal"))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -1789,7 +2352,7 @@ def show_text_cleaner():
 
     win = ctk.CTkToplevel(app)
     win.title("Text Cleaner")
-    win.geometry("620x520")
+    _center_window(win, 620, 520)
     win.resizable(True, True)
     win.configure(fg_color=C_BG)
     win.grab_set()
@@ -1873,7 +2436,7 @@ def show_settings():
 def show_about():
     win = ctk.CTkToplevel(app)
     win.title("About TTS Studio")
-    win.geometry("460x620")
+    _center_window(win, 460, 660)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
@@ -1911,14 +2474,19 @@ def show_about():
     notice = ctk.CTkFrame(scroll, fg_color=C_ACCENT_D, corner_radius=8)
     notice.pack(fill="x", pady=(0, 10))
     ctk.CTkLabel(notice,
-                 text="Audio Watermarking Notice",
+                 text="⚠  AI Watermark Disclosure — Natural Mode",
                  font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-                 text_color=C_ACCENT, anchor="w").pack(anchor="w", padx=12, pady=(10, 2))
+                 text_color=C_ACCENT, anchor="w").pack(anchor="w", padx=12, pady=(10, 4))
     ctk.CTkLabel(notice,
-                 text="Audio generated in Natural mode contains an imperceptible\n"
-                      "neural watermark applied by Resemble AI's Perth library.\n"
-                      "This watermark is inaudible and does not affect quality.",
+                 text="Audio generated in Natural (Chatterbox) mode contains an\n"
+                      "inaudible AI watermark embedded by Resemble AI's Perth\n"
+                      "library. This watermark is present in all Natural mode output\n"
+                      "regardless of settings, and does not affect audio quality.",
                  font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT2, anchor="w", justify="left").pack(anchor="w", padx=12, pady=(0, 4))
+    ctk.CTkLabel(notice,
+                 text="Fast (Kokoro) mode output does not contain a watermark.",
+                 font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
                  text_color=C_TXT2, anchor="w", justify="left").pack(anchor="w", padx=12, pady=(0, 10))
 
     # ── Keyboard shortcuts ────────────────────────────────────────────────────
@@ -1970,6 +2538,15 @@ def show_about():
                      font=ctk.CTkFont(family="Consolas", size=10),
                      text_color=C_TXT3).pack(side="left")
 
+    # ── Support ───────────────────────────────────────────────────────────────
+    _section("SUPPORT")
+    ctk.CTkLabel(scroll, text="cookiestudios.dev@gmail.com",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT2, anchor="w").pack(anchor="w", pady=(0, 2))
+    ctk.CTkLabel(scroll, text="cookiestudios.gumroad.com",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT2, anchor="w").pack(anchor="w")
+
     ctk.CTkLabel(scroll, text=" ", text_color=C_BG).pack()  # bottom padding
 
     # ── Footer ────────────────────────────────────────────────────────────────
@@ -1988,6 +2565,7 @@ def on_close():
             "Audio is still being generated.\nAre you sure you want to quit? It will be cancelled."
         ):
             return
+    _save_fx_settings()
     sd.stop()
     chatterbox_engine.stop()
     app.destroy()
@@ -2026,7 +2604,66 @@ def _sep(parent, pady=0):
     ctk.CTkFrame(parent, fg_color=C_BORDER, height=1,
                  corner_radius=0).pack(fill="x", pady=pady)
 
-def _section_label(parent, text, padx=14, pady=(12, 6)):
+# ── Tooltip system ────────────────────────────────────────────────────────────
+class _Tooltip:
+    """Dark-themed hover tooltip. Appears 500 ms after mouse enters, hides on leave."""
+    def __init__(self, widget, text):
+        self._widget  = widget
+        self._text    = text
+        self._job     = None
+        self._win     = None
+        widget.bind("<Enter>",       self._on_enter, add="+")
+        widget.bind("<Leave>",       self._on_leave, add="+")
+        widget.bind("<ButtonPress>", self._on_leave, add="+")
+
+    def _on_enter(self, _event):
+        self._job = self._widget.after(500, self._show)
+
+    def _on_leave(self, _event):
+        if self._job:
+            self._widget.after_cancel(self._job)
+            self._job = None
+        self._hide()
+
+    def _show(self):
+        if self._win:
+            return
+        try:
+            wx = self._widget.winfo_rootx()
+            wy = self._widget.winfo_rooty()
+            wh = self._widget.winfo_height()
+        except Exception:
+            return
+        self._win = ctk.CTkToplevel(self._widget)
+        self._win.wm_overrideredirect(True)
+        self._win.wm_attributes("-topmost", True)
+        self._win.wm_geometry(f"+{wx + 4}+{wy + wh + 4}")
+        frame = ctk.CTkFrame(self._win, fg_color=C_ELEVATED,
+                             border_color=C_BORDER, border_width=1, corner_radius=7)
+        frame.pack()
+        ctk.CTkLabel(frame, text=self._text, wraplength=260, justify="left",
+                     font=ctk.CTkFont(family="Segoe UI", size=12),
+                     text_color=C_TXT2).pack(padx=12, pady=(8, 9))
+
+    def _hide(self):
+        if self._win:
+            try:
+                self._win.destroy()
+            except Exception:
+                pass
+            self._win = None
+
+
+def _info_btn(parent, tooltip_text):
+    """Small ⓘ label with hover tooltip. Pack it after calling this."""
+    lbl = ctk.CTkLabel(parent, text="ⓘ",
+                       font=ctk.CTkFont(family="Segoe UI", size=11),
+                       text_color=C_TXT3, cursor="question_arrow", width=16)
+    _Tooltip(lbl, tooltip_text)
+    return lbl
+
+
+def _section_label(parent, text, padx=14, pady=(12, 6), tooltip=None):
     row = ctk.CTkFrame(parent, fg_color="transparent")
     row.pack(anchor="w", padx=padx, pady=pady)
     ctk.CTkFrame(row, fg_color=C_ACCENT, width=3, height=10,
@@ -2034,6 +2671,8 @@ def _section_label(parent, text, padx=14, pady=(12, 6)):
     ctk.CTkLabel(row, text=text,
                  font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
                  text_color=C_TXT2, anchor="w").pack(side="left")
+    if tooltip:
+        _info_btn(row, tooltip).pack(side="left", padx=(5, 0))
 
 # ── Status Bar (packed first so it stays at bottom) ───────────────────────────
 status_bar = ctk.CTkFrame(app, fg_color=C_SURFACE, corner_radius=0, height=32)
@@ -2100,6 +2739,28 @@ if not _lic.load_license().get("activated"):
 
 _sep(app)
 
+# ── Update banner (hidden until _show_update_banner is called) ─────────────────
+_update_banner = ctk.CTkFrame(app, fg_color=C_ACCENT_D, corner_radius=0, height=34)
+_update_banner.pack_propagate(False)
+# Not packed here — _show_update_banner inserts it before prog_row when needed
+_update_banner_label = ctk.CTkLabel(
+    _update_banner, text="", anchor="w",
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    text_color=C_TXT)
+_update_banner_label.pack(side="left", padx=14)
+_update_banner_link = ctk.CTkButton(
+    _update_banner, text="Download ↗", width=94, height=22,
+    font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+    fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
+    corner_radius=4, command=lambda: None)
+_update_banner_link.pack(side="left", padx=(6, 0))
+ctk.CTkButton(
+    _update_banner, text="✕", width=28, height=22,
+    font=ctk.CTkFont(family="Segoe UI", size=11),
+    fg_color="transparent", hover_color=C_BORDER,
+    text_color=C_TXT3, corner_radius=4,
+    command=lambda: _update_banner.pack_forget()).pack(side="right", padx=(0, 8))
+
 # ── Progress row ──────────────────────────────────────────────────────────────
 prog_row = ctk.CTkFrame(app, fg_color=C_SURFACE, corner_radius=0, height=34)
 prog_row.pack(fill="x")
@@ -2130,9 +2791,9 @@ tabs.add("  Profiles  ")
 studio = tabs.tab("  Studio  ")
 studio.configure(fg_color=C_BG)
 studio.grid_columnconfigure(0, weight=3)
-studio.grid_columnconfigure(1, minsize=242)
-studio.grid_columnconfigure(2, minsize=248)
-studio.grid_columnconfigure(3, minsize=224)
+studio.grid_columnconfigure(1, minsize=248)
+studio.grid_columnconfigure(2, minsize=254)
+studio.grid_columnconfigure(3, minsize=268)
 studio.grid_rowconfigure(0, weight=1)
 
 # helper: make a panel card
@@ -2144,7 +2805,10 @@ def _panel(parent, col, padright=8):
 # ── Text panel ────────────────────────────────────────────────────────────────
 text_panel = _panel(studio, 0)
 
-_section_label(text_panel, "TEXT INPUT", padx=14, pady=(12, 4))
+_section_label(text_panel, "TEXT INPUT",
+    tooltip="Type or paste any text here. Use Ctrl+Enter to generate. "
+            "Long texts are automatically split into chunks and joined seamlessly. "
+            "Use the Dialogue tab for multi-speaker scripts.")
 
 text_input = ctk.CTkTextbox(
     text_panel,
@@ -2154,7 +2818,7 @@ text_input = ctk.CTkTextbox(
     text_color=C_TXT,
     scrollbar_button_color=C_BORDER,
     scrollbar_button_hover_color=C_ACCENT_D)
-text_input.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+text_input.pack(fill="both", expand=True, padx=14, pady=(0, 6))
 text_input.bind("<KeyRelease>", update_word_count)
 
 def _on_paste(e=None):
@@ -2202,7 +2866,9 @@ ctk.CTkButton(txt_btns, text="Clear", command=clear_text,
 # ── Voice + Engine panel ──────────────────────────────────────────────────────
 mid_panel = _panel(studio, 1)
 
-_section_label(mid_panel, "ENGINE")
+_section_label(mid_panel, "ENGINE",
+    tooltip="Choose between Fast mode (Kokoro — instant, offline) and Natural mode "
+            "(Chatterbox — slower, more human-sounding, supports voice cloning).")
 engine_var = ctk.StringVar(value="⚡ Fast")
 engine_toggle = ctk.CTkSegmentedButton(
     mid_panel, values=["⚡ Fast", "🎙️ Natural"],
@@ -2221,7 +2887,9 @@ voice_container.pack(fill="x")
 kokoro_frame = ctk.CTkFrame(voice_container, fg_color="transparent")
 kokoro_frame.pack(fill="x")
 
-_section_label(kokoro_frame, "VOICE", pady=(10, 4))
+_section_label(kokoro_frame, "VOICE",
+    tooltip="Select a built-in voice for Fast mode. Voices marked (Best) sound the most natural. "
+            "US and UK accents are available.")
 voice_var = ctk.StringVar(value="🇬🇧 Male - George (Best)")
 ctk.CTkOptionMenu(kokoro_frame, variable=voice_var, values=list(VOICES.keys()),
                   width=214, dynamic_resizing=False,
@@ -2235,7 +2903,10 @@ preview_button.pack(padx=14, pady=(0, 8))
 # ── Chatterbox section (hidden initially) ──
 cb_frame = ctk.CTkFrame(voice_container, fg_color="transparent")
 
-_section_label(cb_frame, "VOICE CLONE", pady=(10, 4))
+_section_label(cb_frame, "VOICE CLONE",
+    tooltip="Record or import a short audio sample (10–30 sec) to clone a voice. "
+            "Natural mode will match its tone, pace, and character. "
+            "Leave on Default for the built-in Chatterbox voice.")
 cb_clone_path_var = ctk.StringVar(value="")
 
 # ── Clone library dropdown ────────────────────────────────────────────────────
@@ -2308,7 +2979,7 @@ def _rename_clone():
 
     win = ctk.CTkToplevel(app)
     win.title("Rename Voice Clone")
-    win.geometry("340x130")
+    _center_window(win, 340, 130)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
@@ -2370,7 +3041,7 @@ def show_voice_recorder():
 
     win = ctk.CTkToplevel(app)
     win.title("Record Voice Clone")
-    win.geometry("560x520")
+    _center_window(win, 560, 520)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
@@ -2444,12 +3115,13 @@ def show_voice_recorder():
                                text_color=C_TXT3)
     rec_status.pack(pady=(4, 0))
 
-    _recording = threading.Event()
-    _chunks    = []
-    _samples   = [None]
-    _stream    = [None]
-    _start     = [0.0]
-    _tmp_path  = [None]
+    _recording   = threading.Event()
+    _chunks      = []
+    _chunks_lock = threading.Lock()
+    _samples     = [None]
+    _stream      = [None]
+    _start       = [0.0]
+    _tmp_path    = [None]
 
     def _tick():
         if _recording.is_set():
@@ -2459,7 +3131,8 @@ def show_voice_recorder():
             win.after(100, _tick)
 
     def _start_rec():
-        _chunks.clear()
+        with _chunks_lock:
+            _chunks.clear()
         _recording.set()
         _start[0] = time.time()
         record_btn.configure(text="⏹  Stop")
@@ -2469,7 +3142,8 @@ def show_voice_recorder():
         _tick()
         def _cb(indata, frames, time_info, st):
             if _recording.is_set():
-                _chunks.append(indata.copy())
+                with _chunks_lock:
+                    _chunks.append(indata.copy())
         s = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
                            dtype="float32", callback=_cb)
         s.start()
@@ -2481,10 +3155,12 @@ def show_voice_recorder():
             _stream[0].stop(); _stream[0].close(); _stream[0] = None
         timer_lbl.configure(text_color=C_TXT3)
         record_btn.configure(text="⏺  Record Again")
-        if not _chunks:
+        with _chunks_lock:
+            chunks_snap = list(_chunks)
+        if not chunks_snap:
             rec_status.configure(text="Nothing recorded.", text_color=C_WARN)
             return
-        _samples[0] = np.concatenate(_chunks).flatten()
+        _samples[0] = np.concatenate(chunks_snap).flatten()
         dur = len(_samples[0]) / SAMPLE_RATE
         peak = float(np.abs(_samples[0]).max()) if len(_samples[0]) else 0.0
         if dur < 3:
@@ -2500,7 +3176,14 @@ def show_voice_recorder():
             import tempfile
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
-            sf.write(tmp.name, _samples[0], SAMPLE_RATE)
+            try:
+                sf.write(tmp.name, _samples[0], SAMPLE_RATE)
+            except Exception as e:
+                _log_crash(e)
+                rec_status.configure(text=f"❌ Could not save recording: {_fmt_err(e)}",
+                                     text_color=C_WARN)
+                play_btn.configure(state="normal")
+                return
             _tmp_path[0] = tmp.name
             rec_status.configure(text=f"{dur:.1f}s recorded — name it and save to library.",
                                   text_color=C_SUCCESS)
@@ -2513,9 +3196,15 @@ def show_voice_recorder():
 
     def _preview():
         if _samples[0] is not None:
-            threading.Thread(
-                target=lambda: (sd.stop(), sd.play(_samples[0], SAMPLE_RATE), sd.wait()),
-                daemon=True).start()
+            def _do():
+                try:
+                    sd.stop()
+                    sd.play(_samples[0], SAMPLE_RATE)
+                    sd.wait()
+                except Exception as e:
+                    app.after(0, lambda m=_fmt_err(e): rec_status.configure(
+                        text=f"❌ Playback failed: {m}", text_color=C_WARN))
+            threading.Thread(target=_do, daemon=True).start()
 
     def _save_to_library():
         if _tmp_path[0] is None or not os.path.exists(_tmp_path[0]):
@@ -2562,7 +3251,7 @@ def _browse_and_add_clone():
     # Ask for a name via a simple dialog
     name_win = ctk.CTkToplevel(app)
     name_win.title("Name this voice clone")
-    name_win.geometry("340x130")
+    _center_window(name_win, 340, 130)
     name_win.resizable(False, False)
     name_win.configure(fg_color=C_BG)
     name_win.grab_set()
@@ -2605,12 +3294,14 @@ ctk.CTkButton(cb_clone_btns, text="Delete", command=_delete_clone,
               fg_color="transparent", hover_color="#3d1515",
               text_color=C_DANGER, border_width=1, border_color="#3d1515").pack(side="left")
 
-def make_slider(parent, label, from_, to, steps, default, width=214):
+def make_slider(parent, label, from_, to, steps, default, width=214, tooltip=None):
     row = ctk.CTkFrame(parent, fg_color="transparent")
     row.pack(fill="x", padx=14, pady=(4, 2))
     ctk.CTkLabel(row, text=label,
                  font=ctk.CTkFont(family="Segoe UI", size=11),
                  text_color=C_TXT2, anchor="w").pack(side="left")
+    if tooltip:
+        _info_btn(row, tooltip).pack(side="left", padx=(4, 0))
     val = ctk.CTkLabel(row, text="",
                        font=ctk.CTkFont(family="Segoe UI", size=11),
                        text_color=C_ACCENT, width=58, anchor="e")
@@ -2622,13 +3313,22 @@ def make_slider(parent, label, from_, to, steps, default, width=214):
     s.pack(padx=14, pady=(0, 8))
     return s, val
 
-_section_label(cb_frame, "PARAMETERS", pady=(10, 4))
-cb_exag_slider, cb_exag_label = make_slider(cb_frame, "Exaggeration", 0.0, 1.0, 20, 0.5)
-cb_cfg_slider,  cb_cfg_label  = make_slider(cb_frame, "CFG Weight",   0.0, 1.0, 20, 0.0)
+_section_label(cb_frame, "PARAMETERS",
+    tooltip="Fine-tune how Natural mode generates audio. "
+            "Default values work well for most voices.")
+cb_exag_slider, cb_exag_label = make_slider(cb_frame, "Exaggeration", 0.0, 1.0, 20, 0.5,
+    tooltip="Controls emotional intensity. Higher = more expressive and dramatic. "
+            "Lower = flatter, more neutral. 0.5 is a good starting point.")
+cb_cfg_slider,  cb_cfg_label  = make_slider(cb_frame, "CFG Weight",   0.0, 1.0, 20, 0.0,
+    tooltip="Classifier-Free Guidance — how closely the output follows the voice clone sample. "
+            "Higher values sound more like the clone but can reduce naturalness. "
+            "0 uses the model's own judgment.")
 
 # Speed (shared)
 _sep(mid_panel)
-_section_label(mid_panel, "SPEED", pady=(8, 4))
+_section_label(mid_panel, "SPEED",
+    tooltip="Adjusts how fast the voice speaks. 1.0 is normal speed. "
+            "0.85 sounds natural for most narration. Above 1.3 may sound rushed.")
 speed_slider, speed_label = make_slider(mid_panel, "Playback Speed", 0.5, 2.0, 30, 0.85)
 
 # Engine switch logic
@@ -2637,17 +3337,27 @@ def _on_engine_change(*_):
         kokoro_frame.pack_forget()
         cb_frame.pack(fill="x")
         if not chatterbox_engine.is_ready:
-            try:
-                update_modal, close_modal = _make_chatterbox_loading_modal()
-            except Exception:
-                # Modal failed to create — fall back to silent load with status bar only
-                def update_modal(msg): pass
-                def close_modal(): pass
-            threading.Thread(
-                target=_load_chatterbox_bg,
-                args=(update_modal, close_modal),
-                daemon=True,
-            ).start()
+            def _start_load():
+                try:
+                    update_modal, close_modal = _make_chatterbox_loading_modal()
+                except Exception:
+                    # Modal failed to create — fall back to silent load with status bar only
+                    def update_modal(msg): pass
+                    def close_modal(): pass
+                threading.Thread(
+                    target=_load_chatterbox_bg,
+                    args=(update_modal, close_modal),
+                    daemon=True,
+                ).start()
+
+            def _revert_to_fast():
+                engine_var.set("⚡ Fast")
+
+            free_gb = _get_free_ram_gb()
+            if free_gb < 6.0:
+                app.after(0, lambda: _show_low_ram_warning(free_gb, _start_load, _revert_to_fast))
+            else:
+                _start_load()
     else:
         cb_frame.pack_forget()
         kokoro_frame.pack(fill="x")
@@ -2674,7 +3384,7 @@ stop_button = ctk.CTkButton(
     width=214, height=30,
     font=ctk.CTkFont(family="Segoe UI", size=12),
     state="disabled", **BTN_GHOST, corner_radius=8)
-stop_button.pack()
+stop_button.pack(pady=(0, 4))
 
 ctk.CTkLabel(mid_panel, text="Ctrl+Enter  ·  Esc to stop",
              font=ctk.CTkFont(family="Segoe UI", size=10),
@@ -2683,7 +3393,10 @@ ctk.CTkLabel(mid_panel, text="Ctrl+Enter  ·  Esc to stop",
 # ── Enhancement panel ─────────────────────────────────────────────────────────
 enh_panel = _panel(studio, 2)
 
-_section_label(enh_panel, "AUDIO FX")
+_section_label(enh_panel, "AUDIO FX",
+    tooltip="Post-processing chain applied to every generated clip. "
+            "Runs in order: Trim → High-pass → Low-pass → Noise Gate → Compressor → Reverb → Gain. "
+            "All sliders save automatically with your profile.")
 
 eq_preset_var = ctk.StringVar(value="Custom")
 eq_preset_menu = ctk.CTkOptionMenu(
@@ -2694,23 +3407,43 @@ eq_preset_menu = ctk.CTkOptionMenu(
 eq_preset_menu.pack(padx=14, pady=(0, 8))
 eq_preset_var.trace_add("write", lambda *_: apply_eq_preset())
 
+def _checkbox_row(parent, text, var, tooltip):
+    row = ctk.CTkFrame(parent, fg_color="transparent")
+    row.pack(anchor="w", fill="x", pady=5)
+    ctk.CTkCheckBox(row, text=text, variable=var,
+                    font=ctk.CTkFont(family="Segoe UI", size=12)).pack(side="left")
+    _info_btn(row, tooltip).pack(side="left", padx=(6, 0))
+
 checks = ctk.CTkFrame(enh_panel, fg_color="transparent")
 checks.pack(fill="x", padx=14, pady=(0, 8))
 noise_gate_var = ctk.BooleanVar(value=False)
-ctk.CTkCheckBox(checks, text="Noise Gate", variable=noise_gate_var,
-                font=ctk.CTkFont(family="Segoe UI", size=12)).pack(anchor="w", pady=5)
+_checkbox_row(checks, "Noise Gate", noise_gate_var,
+    "Silences audio that falls below -40 dB. Removes breath noise and soft hiss "
+    "between words without affecting speech.")
 trim_var = ctk.BooleanVar(value=True)
-ctk.CTkCheckBox(checks, text="Trim Silence", variable=trim_var,
-                font=ctk.CTkFont(family="Segoe UI", size=12)).pack(anchor="w", pady=5)
+_checkbox_row(checks, "Trim Silence", trim_var,
+    "Cuts leading and trailing silence from the clip. Keeps a short tail so the "
+    "audio doesn't feel clipped.")
 compressor_var = ctk.BooleanVar(value=True)
-ctk.CTkCheckBox(checks, text="Compressor", variable=compressor_var,
-                font=ctk.CTkFont(family="Segoe UI", size=12)).pack(anchor="w", pady=5)
+_checkbox_row(checks, "Compressor", compressor_var,
+    "Evens out volume differences between loud and quiet parts. "
+    "Makes speech sound more consistent and professional.")
 
-compressor_slider, comp_label   = make_slider(enh_panel, "Comp Ratio", 1.0,   8.0,  14, 2.0)
-highpass_slider,   hp_label     = make_slider(enh_panel, "High Pass",   20,   500,  48,  20)
-lowpass_slider,    lp_label     = make_slider(enh_panel, "Low Pass",  4000, 18000,  56, 18000)
-reverb_slider,     reverb_label = make_slider(enh_panel, "Reverb",    0.0,   1.0,  20, 0.0)
-gain_slider,       gain_label   = make_slider(enh_panel, "Gain",       -12,    12,  24,   0)
+compressor_slider, comp_label   = make_slider(enh_panel, "Comp Ratio", 1.0, 8.0,  14, 2.0,
+    tooltip="How aggressively to compress dynamics. 2:1 is gentle, 6:1+ is heavily compressed. "
+            "2–4 is ideal for most TTS.")
+highpass_slider,   hp_label     = make_slider(enh_panel, "High Pass",   20, 500,  48,  20,
+    tooltip="Cuts frequencies below this value (Hz). Removes low-end rumble and mic noise. "
+            "20 Hz = off. Try 80–120 Hz for cleaner speech.")
+lowpass_slider,    lp_label     = make_slider(enh_panel, "Low Pass",  4000, 18000, 56, 18000,
+    tooltip="Cuts frequencies above this value (Hz). Softens harsh highs. "
+            "18000 Hz = off. Try 12000–15000 Hz for a warmer sound.")
+reverb_slider,     reverb_label = make_slider(enh_panel, "Reverb",    0.0,  1.0,  20, 0.0,
+    tooltip="Adds a room/space effect. 0 = dry (no reverb). Keep below 0.2 for narration — "
+            "high values make speech hard to understand.")
+gain_slider,       gain_label   = make_slider(enh_panel, "Gain",       -12,   12,  24,   0,
+    tooltip="Boosts or reduces the overall volume in dB. "
+            "0 = unchanged. Use +3 to +6 dB if the audio feels too quiet.")
 
 def _on_eq_manual_change(_=None):
     if not _applying_eq_preset:
@@ -2725,48 +3458,215 @@ trim_var.trace_add("write",        lambda *_: eq_preset_var.set("Custom") if not
 compressor_var.trace_add("write",  lambda *_: eq_preset_var.set("Custom") if not _applying_eq_preset else None)
 
 ctk.CTkButton(enh_panel, text="Reset to defaults", command=reset_enhancements,
-              width=214, height=28,
+              width=214, height=30,
               font=ctk.CTkFont(family="Segoe UI", size=11),
-              **BTN_GHOST).pack(padx=14, pady=(0, 6))
+              **BTN_GHOST).pack(padx=14, pady=(0, 8))
 
-# ── Audio Cleanup ─────────────────────────────────────────────────────────────
+# ── AI Enhancement ────────────────────────────────────────────────────────────
 _sep(enh_panel)
-_section_label(enh_panel, "AUDIO CLEANUP", pady=(8, 4))
+_section_label(enh_panel, "AI ENHANCEMENT",
+    tooltip="Uses Resemble AI's enhancement model to improve audio quality — removes noise, "
+            "adds presence, and makes TTS sound more natural. "
+            "First use downloads ~450 MB of model weights. "
+            "Async mode runs in the background after generation.")
 
-cleanup_var  = ctk.BooleanVar(value=False)
-cleanup_mode = ctk.StringVar(value="Pedalboard")
+enhance_var  = ctk.BooleanVar(value=False)
+enhance_mode = ctk.StringVar(value="Async")
 
-_cleanup_row = ctk.CTkFrame(enh_panel, fg_color="transparent")
-_cleanup_row.pack(fill="x", padx=14, pady=(0, 4))
-ctk.CTkCheckBox(_cleanup_row, text="Enable cleanup", variable=cleanup_var,
-                font=ctk.CTkFont(family="Segoe UI", size=11),
-                text_color=C_TXT2, checkmark_color=C_ACCENT,
-                fg_color=C_ACCENT_D, hover_color=C_ACCENT_D,
-                border_color=C_BORDER).pack(side="left")
+_enhance_row = ctk.CTkFrame(enh_panel, fg_color="transparent")
+_enhance_row.pack(fill="x", padx=14, pady=(0, 4))
+_enhance_cb = ctk.CTkCheckBox(_enhance_row, text="Resemble Enhance", variable=enhance_var,
+                              font=ctk.CTkFont(family="Segoe UI", size=11),
+                              text_color=C_TXT2, checkmark_color=C_ACCENT,
+                              fg_color=C_ACCENT_D, hover_color=C_ACCENT_D,
+                              border_color=C_BORDER)
+_enhance_cb.pack(side="left")
 
-# Check if noisereduce is available
-try:
-    import noisereduce as _nr_check; del _nr_check
-    _nr_available = True
-except ImportError:
-    _nr_available = False
-
-_cleanup_mode_btn = ctk.CTkSegmentedButton(
+_enhance_mode_btn = ctk.CTkSegmentedButton(
     enh_panel,
-    values=["Pedalboard", "AI (noisereduce)"],
-    variable=cleanup_mode,
+    values=["CPU", "GPU", "Async"],
+    variable=enhance_mode,
     font=ctk.CTkFont(family="Segoe UI", size=11),
     width=214,
 )
-_cleanup_mode_btn.pack(padx=14, pady=(0, 6))
-if not _nr_available:
-    _cleanup_mode_btn.set("Pedalboard")
-    _cleanup_mode_btn.configure(state="disabled")
-    ctk.CTkLabel(enh_panel,
-                 text="pip install noisereduce to enable AI mode",
-                 font=ctk.CTkFont(family="Segoe UI", size=9),
-                 text_color=C_TXT3).pack(padx=14, anchor="w")
+_enhance_mode_btn.pack(padx=14, pady=(0, 4))
 
+# GPU hint (shown if CUDA not available)
+try:
+    import torch as _torch_check
+    if not _torch_check.cuda.is_available():
+        ctk.CTkLabel(enh_panel,
+                     text="GPU: no CUDA detected — use CPU or Async",
+                     font=ctk.CTkFont(family="Segoe UI", size=9),
+                     text_color=C_TXT3).pack(padx=14, anchor="w", pady=(0, 2))
+    del _torch_check
+except ImportError:
+    pass
+
+
+def _resemble_deps_without_deepspeed():
+    """Return resemble-enhance's declared deps with deepspeed and training extras removed.
+
+    Uses importlib.metadata (stdlib, no text parsing) so it works regardless
+    of pip show line-wrapping or format changes across pip versions.
+    Returns [] if the package isn't installed yet.
+    """
+    import re
+    try:
+        from importlib.metadata import requires as _meta_requires, PackageNotFoundError
+        raw = _meta_requires("resemble-enhance") or []
+    except Exception:
+        return []
+
+    result = []
+    for req in raw:
+        # Skip training-only / optional extras: 'pkg; extra == "train"'
+        if "extra ==" in req or 'extra==' in req:
+            continue
+        # Extract bare package name (everything before whitespace or version specifier)
+        name = re.split(r"[\s;><=!]", req.strip())[0]
+        if not name or name.lower().startswith("deepspeed"):
+            continue
+        result.append(name)
+    return result
+
+
+def _install_resemble_enhance():
+    """Background thread: install resemble-enhance without deepspeed.
+
+    Strategy
+    --------
+    1. pip install resemble-enhance --no-deps  (avoids deepspeed build failure)
+    2. Stub deepspeed via sys.meta_path so it never causes an ImportError
+    3. Iteratively: try to import resemble_enhance, catch the exact missing
+       module name from the ImportError, pip install just that package, repeat.
+       This installs only what inference actually needs — not demo deps like
+       gradio or profiling deps like ptflops.
+    4. Once the import succeeds, declare done.
+    """
+    # Packages that are demo/training-only — skip installing them if they come up
+    _SKIP_PKGS = {"deepspeed", "gradio", "celluloid", "ptflops", "tabulate"}
+
+    app.after(0, lambda: _enhance_cb.configure(state="disabled"))
+    app.after(0, lambda: _enhance_mode_btn.configure(state="disabled"))
+
+    def _pip(*args):
+        return subprocess.run(
+            [sys.executable, "-m", "pip", "install", *args],
+            capture_output=True, text=True
+        )
+
+    def _pip_error(r):
+        lines = (r.stderr or r.stdout or "pip failed").strip().splitlines()
+        return lines[-1] if lines else "pip failed"
+
+    def _clear_resemble_cache():
+        for key in list(sys.modules.keys()):
+            if key == "resemble_enhance" or key.startswith("resemble_enhance."):
+                del sys.modules[key]
+
+    try:
+        # ── Step 1: install the package itself + numpy pin ────────────────────
+        # resemble-enhance 0.0.1 is incompatible with numpy 2.x (scalar API
+        # changed). Pin to numpy<2 before anything else so subsequent dep
+        # installs don't pull in a newer numpy.
+        app.after(0, lambda: status_label.configure(
+            text="📦 Installing Resemble Enhance..."))
+        r = _pip("numpy<2", "--upgrade")
+        if r.returncode != 0:
+            raise RuntimeError(f"Could not pin numpy: {_pip_error(r)}")
+        r = _pip("resemble-enhance", "--no-deps")
+        if r.returncode != 0:
+            raise RuntimeError(f"Could not install resemble-enhance: {_pip_error(r)}")
+
+        # ── Step 2: stub deepspeed ────────────────────────────────────────────
+        from audio_utils import _stub_deepspeed
+        _stub_deepspeed()
+
+        # ── Step 3: iteratively resolve missing deps ──────────────────────────
+        import importlib
+        skipped = []
+        for attempt in range(20):   # safety cap — should never need more than ~10
+            _clear_resemble_cache()
+            try:
+                importlib.import_module("resemble_enhance")
+                from resemble_enhance.enhancer.inference import enhance  # noqa: F401
+                break   # import clean — done
+            except ImportError as exc:
+                raw = str(exc)
+                # Extract the top-level missing package name
+                # e.g. "No module named 'pandas'" → "pandas"
+                #      "No module named 'torchvision.transforms'" → "torchvision"
+                missing = raw.replace("No module named", "").strip(" '\"")
+                pkg = missing.split(".")[0].strip()
+
+                if not pkg:
+                    raise RuntimeError(f"Unrecognised ImportError: {raw}")
+
+                if pkg.lower() in _SKIP_PKGS:
+                    # Demo/training dep — skip installing, stub if deepspeed
+                    if pkg.lower() == "deepspeed":
+                        _stub_deepspeed()
+                    else:
+                        skipped.append(pkg)
+                        # Stub this package too so the import can proceed
+                        import types
+                        if pkg not in sys.modules:
+                            stub = types.ModuleType(pkg)
+                            stub.__path__ = []
+                            stub.__getattr__ = lambda n: type("_S", (), {
+                                "__call__": lambda s, *a, **k: s,
+                                "__getattr__": lambda s, n: type("_S", (), {})()
+                            })()
+                            sys.modules[pkg] = stub
+                    continue
+
+                app.after(0, lambda p=pkg: status_label.configure(
+                    text=f"📦 Installing missing dep: {p}..."))
+                r = _pip(pkg)
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        f"Failed to install '{pkg}': {_pip_error(r)}"
+                    )
+        else:
+            raise RuntimeError("Dependency resolution did not converge after 20 attempts.")
+
+        note = f" (skipped: {', '.join(skipped)})" if skipped else ""
+        app.after(0, lambda n=note: status_label.configure(
+            text=f"✅ Resemble Enhance ready{n}. First use downloads ~450 MB of model weights."))
+        app.after(0, lambda: enhance_var.set(True))
+
+    except Exception as e:
+        app.after(0, lambda m=str(e): status_label.configure(
+            text=f"❌ Install failed: {m}"))
+        app.after(0, lambda: enhance_var.set(False))
+    finally:
+        app.after(0, lambda: _enhance_cb.configure(state="normal"))
+        app.after(0, lambda: _enhance_mode_btn.configure(state="normal"))
+
+
+def _on_enhance_toggle(*_):
+    if not enhance_var.get():
+        return
+    from audio_utils import _stub_deepspeed
+    _stub_deepspeed()
+    try:
+        import resemble_enhance  # noqa: F401
+        # Import succeeded — check for missing transitive deps by doing a deeper probe
+        from resemble_enhance.enhancer.inference import enhance  # noqa: F401
+    except ImportError as exc:
+        missing = str(exc)
+        # Always trigger install — covers both "not installed" and "dep missing"
+        enhance_var.set(False)
+        app.after(0, lambda m=missing: status_label.configure(
+            text=f"📦 Missing dependency ({m}) — auto-installing..."))
+        threading.Thread(target=_install_resemble_enhance, daemon=True).start()
+
+
+enhance_var.trace_add("write", _on_enhance_toggle)
+
+# Restore persisted FX settings (all FX vars are now defined)
+app.after(50, _restore_fx_settings)
 
 # ── Audio History panel ───────────────────────────────────────────────────────
 hist_panel = _panel(studio, 3, padright=0)
@@ -2790,7 +3690,7 @@ history_scroll = ctk.CTkScrollableFrame(
     hist_panel, fg_color=C_CARD,
     scrollbar_button_color=C_BORDER,
     scrollbar_button_hover_color=C_ACCENT_D)
-history_scroll.pack(fill="both", expand=True, padx=4, pady=(4, 6))
+history_scroll.pack(fill="both", expand=True, padx=8, pady=(6, 8))
 history_inner = history_scroll
 
 ctk.CTkLabel(history_inner, text="No audio yet.",
@@ -2833,8 +3733,35 @@ queue_listbox.pack(fill="both", expand=True, padx=12, pady=(8, 4))
 
 _sep(q_card)
 
+# ── Format selector ───────────────────────────────────────────────────────────
+q_fmt_row = ctk.CTkFrame(q_card, fg_color="transparent")
+q_fmt_row.pack(fill="x", padx=14, pady=(8, 2))
+ctk.CTkLabel(q_fmt_row, text="Output format:",
+             font=ctk.CTkFont(family="Segoe UI", size=11),
+             text_color=C_TXT2).pack(side="left", padx=(0, 8))
+queue_fmt_var = ctk.StringVar(value="WAV")
+_q_fmt_seg = ctk.CTkSegmentedButton(q_fmt_row, values=["WAV", "MP3"],
+                                     variable=queue_fmt_var,
+                                     font=ctk.CTkFont(family="Segoe UI", size=11),
+                                     width=120)
+_q_fmt_seg.pack(side="left", padx=(0, 16))
+ctk.CTkLabel(q_fmt_row, text="Quality:",
+             font=ctk.CTkFont(family="Segoe UI", size=11),
+             text_color=C_TXT2).pack(side="left", padx=(0, 8))
+queue_mp3_quality_var = ctk.StringVar(value="192 kbps")
+_q_quality_seg = ctk.CTkSegmentedButton(q_fmt_row, values=["128 kbps", "192 kbps", "320 kbps"],
+                                         variable=queue_mp3_quality_var,
+                                         font=ctk.CTkFont(family="Segoe UI", size=11),
+                                         width=240)
+_q_quality_seg.pack(side="left")
+
+def _q_fmt_toggle(val):
+    _q_quality_seg.configure(state="normal" if val == "MP3" else "disabled")
+_q_fmt_seg.configure(command=_q_fmt_toggle)
+_q_fmt_toggle("WAV")  # start disabled
+
 q_btns = ctk.CTkFrame(q_card, fg_color="transparent")
-q_btns.pack(fill="x", padx=12, pady=10)
+q_btns.pack(fill="x", padx=12, pady=(6, 10))
 queue_gen_btn = ctk.CTkButton(
     q_btns, text="Generate All & Save",
     command=queue_generate_all, width=200, height=36,
@@ -2935,7 +3862,7 @@ dlg_text = ctk.CTkTextbox(
     wrap="word",
     fg_color=C_ELEVATED, border_width=0, corner_radius=8,
     text_color=C_TXT)
-dlg_text.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+dlg_text.pack(fill="both", expand=True, padx=14, pady=(0, 6))
 dlg_text.insert("1.0",
     "NARRATOR: In the beginning, there was silence.\n"
     "ALICE: But silence never lasts forever.\n"
@@ -2984,7 +3911,12 @@ dlg_detect_btn = ctk.CTkButton(dlg_right, text="Detect Speakers",
               width=256, height=30,
               font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_GHOST)
-dlg_detect_btn.pack(padx=16, pady=(0, 8))
+dlg_detect_btn.pack(padx=16, pady=(0, 4))
+
+dlg_stats_label = ctk.CTkLabel(dlg_right, text="",
+    font=ctk.CTkFont(family="Segoe UI", size=10),
+    text_color=C_TXT3)
+dlg_stats_label.pack(pady=(0, 6))
 
 _sep(dlg_right)
 
@@ -3004,7 +3936,14 @@ dlg_gen_btn = ctk.CTkButton(
     width=256, height=46,
     font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
     corner_radius=10)
-dlg_gen_btn.pack(pady=(0, 6))
+dlg_gen_btn.pack(pady=(0, 4))
+
+dlg_cancel_btn = ctk.CTkButton(
+    dlg_gen_frame, text="Cancel",
+    width=256, height=30,
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    **BTN_DARK)
+# shown only during generation (packed dynamically)
 
 ctk.CTkLabel(dlg_right,
              text="Fast mode (Kokoro) · output appears in Studio history",
@@ -3013,14 +3952,12 @@ ctk.CTkLabel(dlg_right,
 
 # ── Dialogue logic ────────────────────────────────────────────────────────────
 dlg_speaker_vars = {}   # speaker_name → StringVar (voice display name)
+_dlg_cancel_event = threading.Event()
 
 def dlg_detect_speakers():
-    text    = dlg_text.get("1.0", "end").strip()
-    d_lines = parse_dialogue(text)
-    speakers = []
-    for sp, _ in d_lines:
-        if sp not in speakers:
-            speakers.append(sp)
+    text     = dlg_text.get("1.0", "end").strip()
+    d_lines  = parse_dialogue(text)
+    speakers = list(dict.fromkeys(sp for sp, _ in d_lines))  # ordered unique
 
     for w in dlg_speakers_scroll.winfo_children():
         w.destroy()
@@ -3032,63 +3969,137 @@ def dlg_detect_speakers():
                      text_color=C_TXT3,
                      font=ctk.CTkFont(family="Segoe UI", size=11),
                      justify="center").pack(pady=24)
+        dlg_stats_label.configure(text="")
         return
 
-    voice_list = list(VOICES.keys())
+    dlg_stats_label.configure(text=f"{len(d_lines)} line(s) · {len(speakers)} speaker(s)")
+
+    voice_list   = list(VOICES.keys())
+    # Smart defaults: alternate female/male pools so 2-speaker scripts sound distinct
+    _female_keys = [v for v in voice_list if "Female" in v]
+    _male_keys   = [v for v in voice_list if "Male" in v]
+    def _default_voice(idx):
+        if idx % 2 == 0:
+            return _female_keys[idx // 2 % len(_female_keys)]
+        else:
+            return _male_keys[idx // 2 % len(_male_keys)]
+
     for i, speaker in enumerate(speakers):
         row = ctk.CTkFrame(dlg_speakers_scroll, fg_color=C_ELEVATED, corner_radius=8)
         row.pack(fill="x", padx=2, pady=(0, 6))
-        ctk.CTkLabel(row, text=speaker, width=88, anchor="w",
-                     font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-                     text_color=C_TXT).pack(side="left", padx=(10, 4), pady=8)
-        var = ctk.StringVar(value=voice_list[i % len(voice_list)])
-        ctk.CTkOptionMenu(row, variable=var, values=voice_list,
-                          width=150, dynamic_resizing=False,
-                          font=ctk.CTkFont(family="Segoe UI", size=11)
-                          ).pack(side="left", padx=(0, 8), pady=8)
-        dlg_speaker_vars[speaker] = var
 
-    status_label.configure(text=f"✅ {len(speakers)} speaker(s) detected. Assign voices, then Generate.")
+        # Editable speaker name
+        name_var = ctk.StringVar(value=speaker)
+        name_entry = ctk.CTkEntry(row, textvariable=name_var, width=90,
+                                  font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                                  fg_color=C_BG, border_width=1, border_color=C_BORDER,
+                                  text_color=C_TXT)
+        name_entry.pack(side="left", padx=(10, 4), pady=8)
+
+        # Voice dropdown — use explicit command to guarantee the selection is stored
+        # (CTkOptionMenu variable binding is unreliable without a command callback)
+        default_voice = _default_voice(i)
+        dlg_speaker_vars[speaker] = default_voice  # store display-name string, not StringVar
+
+        def _make_voice_cmd(sp):
+            def _on_select(choice):
+                dlg_speaker_vars[sp] = choice
+            return _on_select
+
+        menu = ctk.CTkOptionMenu(row, values=voice_list,
+                                 command=_make_voice_cmd(speaker),
+                                 width=140, dynamic_resizing=False,
+                                 font=ctk.CTkFont(family="Segoe UI", size=11))
+        menu.set(default_voice)
+        menu.pack(side="left", padx=(0, 4), pady=8)
+
+        # Rename-in-script button
+        def _make_rename(old, nv):
+            def _do():
+                new = nv.get().strip().upper()
+                if not new or new == old:
+                    return
+                content = dlg_text.get("1.0", "end")
+                updated = re.sub(rf'^{re.escape(old)}\s*:', f'{new}:', content, flags=re.MULTILINE)
+                dlg_text.delete("1.0", "end")
+                dlg_text.insert("1.0", updated.rstrip('\n'))
+                dlg_detect_speakers()
+            return _do
+
+        ctk.CTkButton(row, text="↺", width=28, height=28,
+                      font=ctk.CTkFont(family="Segoe UI", size=12),
+                      command=_make_rename(speaker, name_var),
+                      **BTN_GHOST).pack(side="left", padx=(0, 6), pady=8)
+
+    status_label.configure(text=f"✅ {len(speakers)} detected — speaker 1 female, speaker 2 male by default.")
 
 def dlg_generate():
     text    = dlg_text.get("1.0", "end").strip()
-    d_lines = parse_dialogue(text)
-    if not d_lines:
-        status_label.configure(text="⚠️ No dialogue lines detected. Format: SPEAKER: text")
+    if not text:
+        status_label.configure(text="⚠️ Script is empty. Write some dialogue first.")
         return
 
-    # Auto-detect if speaker vars not populated
+    d_lines = parse_dialogue(text)
+    if not d_lines:
+        status_label.configure(text="⚠️ No dialogue detected. Format: SPEAKER: text  (SPEAKER must be ALL CAPS)")
+        return
+
+    # Auto-detect if speaker panel is empty
     if not dlg_speaker_vars:
         dlg_detect_speakers()
 
-    speaker_voices = {sp: var.get() for sp, var in dlg_speaker_vars.items()}
+    # Warn if script has speakers that aren't in the panel
+    script_speakers = set(sp for sp, _ in d_lines)
+    panel_speakers  = set(dlg_speaker_vars.keys())
+    missing = script_speakers - panel_speakers
+    if missing:
+        status_label.configure(text=f"⚠️ Speakers not in panel: {', '.join(sorted(missing))}. Re-detect speakers.")
+        return
+
+    speaker_voices = dict(dlg_speaker_vars)  # sp → voice display name (plain string)
     speed          = round(speed_slider.get(), 2)
     est            = estimate_processing_time(" ".join(t for _, t in d_lines))
 
+    _dlg_cancel_event.clear()
     dlg_gen_btn.configure(state="disabled", text="⏳ Generating...")
     dlg_detect_btn.configure(state="disabled")
+    dlg_cancel_btn.configure(command=lambda: _dlg_cancel_event.set())
+    dlg_cancel_btn.pack(pady=(0, 4))
     smooth.start(est)
 
     def run():
         global is_generating
         is_generating = True
         try:
-            samples, sr, segments = generate_dialogue_audio(
+            samples, sr, segments, failed = generate_dialogue_audio(
                 d_lines, speaker_voices, speed,
-                status_cb=lambda m: status_label.configure(text=m)
+                status_cb=lambda m: app.after(0, lambda m=m: status_label.configure(text=m)),
+                cancel_event=_dlg_cancel_event,
             )
             smooth.finish()
-            label = "Dialogue: " + " · ".join(dlg_speaker_vars.keys())
+            n_lines = len(d_lines)
+            label   = f"Dialogue ({n_lines} lines): " + " · ".join(dlg_speaker_vars.keys())
             add_to_history(samples, sr, text, label, segments=segments)
-            status_label.configure(text="✅ Dialogue ready! View in Studio → History panel.")
+            if failed:
+                skipped = ", ".join(f"#{ln}" for ln, _, _ in failed)
+                app.after(0, lambda: status_label.configure(
+                    text=f"⚠️ Done with {len(failed)} skipped line(s): {skipped}. Check Studio history."))
+            else:
+                app.after(0, lambda: status_label.configure(
+                    text="✅ Dialogue ready! View in Studio → History panel."))
+        except GenerationCancelled:
+            smooth.finish()
+            app.after(0, lambda: status_label.configure(text="🚫 Dialogue generation cancelled."))
         except Exception as e:
             _log_crash(e)
-            status_label.configure(text=f"❌ {_fmt_err(e)}")
+            _msg = _fmt_err(e)
+            app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
             smooth.finish()
         finally:
             is_generating = False
-            dlg_gen_btn.configure(state="normal", text="Generate Dialogue")
-            dlg_detect_btn.configure(state="normal")
+            app.after(0, lambda: dlg_gen_btn.configure(state="normal", text="Generate Dialogue"))
+            app.after(0, lambda: dlg_detect_btn.configure(state="normal"))
+            app.after(0, lambda: dlg_cancel_btn.pack_forget())
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -3121,7 +4132,7 @@ def _make_chatterbox_loading_modal():
     """Create and return the Natural mode loading modal. Non-dismissible while loading."""
     win = ctk.CTkToplevel(app)
     win.title("Loading Natural Mode")
-    win.geometry("500x260")
+    _center_window(win, 500, 260)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.transient(app)
@@ -3182,6 +4193,138 @@ def _make_chatterbox_loading_modal():
     return update_status, close_modal
 
 
+def _get_free_ram_gb() -> float:
+    """Return available physical RAM in GB (Windows only)."""
+    try:
+        class _MEMSTATEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength",                ctypes.c_ulong),
+                ("dwMemoryLoad",            ctypes.c_ulong),
+                ("ullTotalPhys",            ctypes.c_ulonglong),
+                ("ullAvailPhys",            ctypes.c_ulonglong),
+                ("ullTotalPageFile",        ctypes.c_ulonglong),
+                ("ullAvailPageFile",        ctypes.c_ulonglong),
+                ("ullTotalVirtual",         ctypes.c_ulonglong),
+                ("ullAvailVirtual",         ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual",ctypes.c_ulonglong),
+            ]
+        stat = _MEMSTATEX()
+        stat.dwLength = ctypes.sizeof(stat)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        return stat.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        return 999.0   # if we can't check, don't block the user
+
+
+def _show_low_ram_warning(free_gb: float, on_proceed, on_cancel):
+    """Warn the user that free RAM is below 6 GB before loading Natural mode."""
+    win = ctk.CTkToplevel(app)
+    win.title("Low Memory Warning")
+    _center_window(win, 420, 310)
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+    win.attributes("-topmost", True)
+    win.lift()
+    _fade_in(win)
+
+    # Header
+    top = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=72)
+    top.pack(fill="x")
+    top.pack_propagate(False)
+    ctk.CTkLabel(top, text="⚠", font=ctk.CTkFont(family="Segoe UI", size=28),
+                 text_color="#FFA500").pack(side="left", padx=(20, 10), pady=16)
+    ctk.CTkLabel(top, text="Low memory detected",
+                 font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                 text_color=C_TXT, anchor="w").pack(side="left", pady=16)
+
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=24, pady=16)
+
+    ctk.CTkLabel(body,
+                 text=f"Natural mode needs at least 6 GB of free RAM.\n"
+                      f"You currently have {free_gb:.1f} GB available.\n\n"
+                      "Loading may fail or cause your system to slow down significantly.",
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT2, wraplength=368, justify="left", anchor="w",
+                 ).pack(anchor="w", pady=(0, 16))
+
+    btns = ctk.CTkFrame(body, fg_color="transparent")
+    btns.pack(anchor="w")
+
+    def _proceed():
+        win.destroy()
+        on_proceed()
+
+    def _cancel():
+        win.destroy()
+        on_cancel()
+
+    ctk.CTkButton(btns, text="Load Anyway", width=140, command=_proceed,
+                  fg_color=C_ACCENT, hover_color=C_ACCENT_H,
+                  font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold")
+                  ).pack(side="left", padx=(0, 10))
+    ctk.CTkButton(btns, text="Cancel", width=100, command=_cancel,
+                  fg_color=C_SURFACE,
+                  font=ctk.CTkFont(family="Segoe UI", size=12)
+                  ).pack(side="left")
+
+
+def _show_oom_modal():
+    """Plain-English dialog shown when Natural mode fails to load due to low RAM."""
+    win = ctk.CTkToplevel(app)
+    win.title("Not Enough Memory")
+    _center_window(win, 420, 300)
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+    win.attributes("-topmost", True)
+    win.lift()
+    _fade_in(win)
+
+    # Icon + title
+    top = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=72)
+    top.pack(fill="x")
+    top.pack_propagate(False)
+    ctk.CTkLabel(top, text="⚠", font=ctk.CTkFont(family="Segoe UI", size=28),
+                 text_color=C_ACCENT).pack(side="left", padx=(20, 10), pady=16)
+    ctk.CTkLabel(top, text="Natural mode requires more RAM",
+                 font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                 text_color=C_TXT, anchor="w").pack(side="left", pady=16)
+
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=24, pady=18)
+
+    ctk.CTkLabel(body,
+                 text="The Chatterbox model needs at least 6 GB of free RAM to load.\n"
+                      "Your system didn't have enough available memory.",
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT2, wraplength=368, justify="left", anchor="w"
+                 ).pack(anchor="w", pady=(0, 12))
+
+    ctk.CTkLabel(body, text="To free up memory:",
+                 font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                 text_color=C_TXT, anchor="w").pack(anchor="w")
+    for tip in ("• Close browser tabs and other open applications",
+                "• Restart your PC to clear background processes",
+                "• Use Fast mode — it runs with under 1 GB of RAM"):
+        ctk.CTkLabel(body, text=tip,
+                     font=ctk.CTkFont(family="Segoe UI", size=12),
+                     text_color=C_TXT2, anchor="w").pack(anchor="w")
+
+    ctk.CTkButton(win, text="OK — Use Fast Mode", width=160, height=34,
+                  font=ctk.CTkFont(family="Segoe UI", size=12),
+                  fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
+                  corner_radius=6,
+                  command=lambda: _fade_out(win, win.destroy)).pack(pady=(0, 20))
+
+
 def _load_chatterbox_bg(update_modal, close_modal):
     """Load Chatterbox in a background thread; called when user switches to Natural mode."""
     def _st(msg):
@@ -3204,20 +4347,29 @@ def _load_chatterbox_bg(update_modal, close_modal):
         app.after(0, lambda: engine_var.set("⚡ Fast"))   # revert the toggle
         app.after(0, lambda: engine_toggle.configure(state="normal"))
         app.after(0, lambda: play_button.configure(state="normal"))
-        app.after(0, lambda m=err: status_label.configure(
-            text=f"❌ Natural mode failed: {m}"))
+        _raw = str(e).lower()
+        _is_oom = isinstance(e, MemoryError) or any(
+            k in _raw for k in ("not enough ram", "not enough memory",
+                                "out of memory", "paging file", "winerror 1455"))
+        if _is_oom:
+            app.after(0, _show_oom_modal)
+        else:
+            app.after(0, lambda m=err: status_label.configure(
+                text=f"❌ Natural mode failed: {m}"))
 
 # ── License activation modal ──────────────────────────────────────────────────
+_activation_modal_open = [False]   # singleton guard — never open two at once
+
+
 def _show_activation_modal(can_skip=True, remaining=0):
-    """
-    Show the license key activation dialog.
-    can_skip  → whether the user can dismiss without activating.
-    remaining → launches left in grace period (for the countdown message).
-    """
+    """Show the license key activation dialog."""
+    if _activation_modal_open[0]:
+        return
+    _activation_modal_open[0] = True
 
     win = ctk.CTkToplevel(app)
     win.title("Activate TTS Studio")
-    win.geometry("460x310")
+    _center_window(win, 460, 290)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
@@ -3232,7 +4384,7 @@ def _show_activation_modal(can_skip=True, remaining=0):
     hdr_inner.pack(side="left", padx=16, pady=10)
     ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=4, height=20,
                  corner_radius=2).pack(side="left", padx=(0, 10))
-    ctk.CTkLabel(hdr_inner, text="Activate TTS Studio",
+    ctk.CTkLabel(hdr_inner, text="Activate Pro",
                  font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
                  text_color=C_TXT).pack(side="left")
     ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
@@ -3241,15 +4393,9 @@ def _show_activation_modal(can_skip=True, remaining=0):
     body = ctk.CTkFrame(win, fg_color="transparent")
     body.pack(fill="both", expand=True, padx=24, pady=(16, 8))
 
-    if can_skip and remaining > 0:
-        note = f"{remaining} free launch{'es' if remaining != 1 else ''} left after this one."
-        ctk.CTkLabel(body, text=note,
-                     font=ctk.CTkFont(family="Segoe UI", size=11),
-                     text_color=C_WARN).pack(anchor="w", pady=(0, 10))
-    elif not can_skip:
-        ctk.CTkLabel(body, text="Your free trial has ended. Enter your license key to continue.",
-                     font=ctk.CTkFont(family="Segoe UI", size=11),
-                     text_color=C_WARN).pack(anchor="w", pady=(0, 10))
+    ctk.CTkLabel(body, text="Enter your license key to unlock unlimited Natural mode and AI Enhancement.",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT2, wraplength=400, justify="left").pack(anchor="w", pady=(0, 10))
 
     ctk.CTkLabel(body, text="License Key",
                  font=ctk.CTkFont(family="Segoe UI", size=12),
@@ -3289,7 +4435,7 @@ def _show_activation_modal(can_skip=True, remaining=0):
                     msg_label.configure(text=f"✅ {msg}", text_color=C_SUCCESS)
                     activate_btn.configure(text="Activate")
                     _activate_btn.pack_forget()   # hide header button
-                    app.after(900, win.destroy)
+                    app.after(900, _close_activation)
                 else:
                     msg_label.configure(text=f"❌ {msg}", text_color=C_DANGER)
                     activate_btn.configure(state="normal", text="Activate")
@@ -3314,54 +4460,141 @@ def _show_activation_modal(can_skip=True, remaining=0):
         **BTN_GHOST, command=_open_store
     ).pack(side="left", padx=(0, 6), pady=9)
 
-    if can_skip:
-        ctk.CTkButton(
-            btn_row, text="Later", width=72, height=34,
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            **BTN_GHOST, command=win.destroy
-        ).pack(side="right", padx=14, pady=9)
-    else:
-        ctk.CTkButton(
-            btn_row, text="Exit App", width=80, height=34,
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            fg_color="transparent", hover_color="#3d1515",
-            text_color=C_DANGER, border_width=1, border_color="#3d1515",
-            command=app.destroy
-        ).pack(side="right", padx=14, pady=9)
+    def _close_activation():
+        _activation_modal_open[0] = False
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", _close_activation)
+
+    ctk.CTkButton(
+        btn_row, text="Later", width=72, height=34,
+        font=ctk.CTkFont(family="Segoe UI", size=12),
+        **BTN_GHOST, command=_close_activation
+    ).pack(side="right", padx=14, pady=9)
+
+
+_UPSELL_FEATURE_TEXT = {
+    "natural": (
+        "🎙️ Natural Mode — free trial used up",
+        "You've used your 3 free Natural mode generations.\n\n"
+        "Upgrade to Pro for unlimited Natural mode, unlimited\n"
+        "AI Enhancement, and priority support.",
+    ),
+    "enhance": (
+        "✨ AI Enhancement — free trial used up",
+        "You've used your 3 free Resemble Enhance sessions.\n\n"
+        "Upgrade to Pro for unlimited AI Enhancement, unlimited\n"
+        "Natural mode generations, and priority support.",
+    ),
+}
+
+def _show_upsell_modal(feature):
+    """
+    Upsell modal shown when a freemium limit is hit.
+    feature: "natural" | "enhance"
+    """
+    title_text, body_text = _UPSELL_FEATURE_TEXT.get(
+        feature, ("Upgrade to Pro", "Upgrade to unlock this feature."))
+
+    win = ctk.CTkToplevel(app)
+    win.title("Upgrade to Pro")
+    _center_window(win, 520, 270)
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+    _fade_in(win)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
+    hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    hdr_inner = ctk.CTkFrame(hdr, fg_color="transparent")
+    hdr_inner.pack(side="left", padx=16, pady=10)
+    ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=4, height=20,
+                 corner_radius=2).pack(side="left", padx=(0, 10))
+    ctk.CTkLabel(hdr_inner, text=title_text,
+                 font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                 text_color=C_TXT).pack(side="left")
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+
+    # ── Body ──────────────────────────────────────────────────────────────────
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=24, pady=(18, 8))
+
+    ctk.CTkLabel(body, text=body_text,
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT2, justify="left").pack(anchor="w")
+
+    # ── Buttons ───────────────────────────────────────────────────────────────
+    btn_row = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=52)
+    btn_row.pack(fill="x", side="bottom")
+    btn_row.pack_propagate(False)
+    ctk.CTkFrame(btn_row, fg_color=C_BORDER, height=1,
+                 corner_radius=0).pack(fill="x", side="top")
+
+    ctk.CTkButton(
+        btn_row, text="Monthly — $5/mo", width=130, height=34,
+        font=ctk.CTkFont(family="Segoe UI", size=13),
+        fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
+        command=lambda: webbrowser.open(_lic.STORE_URL_MONTHLY),
+    ).pack(side="left", padx=(14, 4), pady=9)
+
+    ctk.CTkButton(
+        btn_row, text="Lifetime — $45", width=120, height=34,
+        font=ctk.CTkFont(family="Segoe UI", size=13),
+        fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
+        command=lambda: webbrowser.open(_lic.STORE_URL_LIFETIME),
+    ).pack(side="left", padx=(0, 4), pady=9)
+
+    ctk.CTkButton(
+        btn_row, text="Fast mode only", width=110, height=34,
+        font=ctk.CTkFont(family="Segoe UI", size=12),
+        **BTN_GHOST,
+        command=win.destroy,
+    ).pack(side="left", padx=(0, 4), pady=9)
+
+    def _activate():
+        win.destroy()
+        _show_activation_modal(can_skip=True)
+
+    ctk.CTkButton(
+        btn_row, text="I have a key", width=100, height=34,
+        font=ctk.CTkFont(family="Segoe UI", size=12),
+        **BTN_GHOST,
+        command=_activate,
+    ).pack(side="right", padx=14, pady=9)
+
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
 
 
 def _on_splash_done():
     app.deiconify()
     app.state("zoomed")   # maximize (fullscreen with taskbar visible)
-    _handle_license_on_startup()
+    # Onboarding must fully complete before the license modal can appear.
+    # Passing _handle_license_on_startup as on_done ensures they never overlap.
+    _show_onboarding(on_done=_handle_license_on_startup)
 
 
 def _handle_license_on_startup():
-    """Check license state and show banner or blocking modal as appropriate."""
+    """Check license state on startup.
+
+    Freemium model: Fast mode is free forever — no blocking modal, no forced exit.
+    Activated Pro users get silent background re-validation.
+    Free users see the 🔑 Activate button in the toolbar (already packed at startup).
+    """
     lic = _lic.load_license()
 
-    # Already activated — silently re-validate in background once per session
     if lic.get("activated"):
+        # Pro user — silently re-validate in background once per session
         def _revalidate():
-            valid = _lic.validate_license_silent(lic.get("key"), lic.get("instance_id"))
+            valid = _lic.validate_license_silent(lic.get("key"))
             if not valid:
                 app.after(0, lambda: status_label.configure(
                     text="⚠️ License validation failed. Please re-activate via the 🔑 Activate button."))
                 app.after(0, lambda: _activate_btn.pack(side="right", padx=(0, 6), pady=14))
         threading.Thread(target=_revalidate, daemon=True).start()
-        return
-
-    state, remaining = _lic.check_startup()
-
-    if state == "grace":
-        pl = "launch" if remaining == 1 else "launches"
-        status_label.configure(
-            text=f"🔑 {remaining} free {pl} remaining — click 🔑 Activate in the toolbar to unlock.")
-        # Also allow opening the modal from the status bar message click (optional)
-        # The header button already handles this.
-    elif state == "required":
-        # Slight delay so the window is fully rendered before the modal appears
-        app.after(300, lambda: _show_activation_modal(can_skip=False, remaining=0))
+    # Free users: Activate button already visible in header — nothing else to do.
 
 # Seed Kokoro calibration on first-ever launch using a quick inference.
 # Skipped if calibration data already exists. Takes ~150-250ms — imperceptible.
@@ -3376,14 +4609,58 @@ def _run_kokoro_benchmark():
     except Exception:
         pass  # non-critical; never block startup
 
-def _show_onboarding():
-    """Welcome card shown once on first launch. Saved to settings so it never repeats."""
+def _show_update_banner(latest_tag: str):
+    """Show the amber update banner below the header. Called from main thread only."""
+    _update_banner_label.configure(text=f"🔔 Update available: {latest_tag}")
+    url = f"https://github.com/{GITHUB_REPO}/releases/latest"
+    _update_banner_link.configure(command=lambda: webbrowser.open(url))
+    _update_banner.pack(fill="x", before=prog_row)
+
+
+def _check_for_update():
+    """Background thread: check GitHub releases API once per day.
+    Never raises — update check is best-effort and must not affect startup."""
+    try:
+        import urllib.request
+        import json as _json
+        s = _get_settings()
+        today = datetime.now().strftime("%Y-%m-%d")
+        if s.get("last_update_check") == today:
+            return
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(
+            api_url, headers={"User-Agent": f"TTS-Studio/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read())
+        tag = data.get("tag_name", "").lstrip("v")
+        if not tag:
+            return
+        current = tuple(int(x) for x in VERSION.split(".") if x.isdigit())
+        latest  = tuple(int(x) for x in tag.split(".")  if x.isdigit())
+        s["last_update_check"] = today
+        _save_settings(s)
+        if latest > current:
+            v = data["tag_name"]
+            app.after(0, lambda: _show_update_banner(v))
+    except Exception:
+        pass  # non-critical; never block or crash on failure
+
+
+def _show_onboarding(on_done=None):
+    """Welcome card shown once on first launch. Saved to settings so it never repeats.
+
+    on_done — optional callable invoked after the card is dismissed (or immediately
+              if onboarding has already been seen). Use this to chain startup steps
+              that must not overlap with the welcome modal (e.g. license check).
+    """
     if _get_settings().get("seen_onboarding", False):
+        if on_done:
+            on_done()
         return
 
     win = ctk.CTkToplevel(app)
     win.title("Welcome to TTS Studio")
-    win.geometry("500x430")
+    _center_window(win, 500, 430)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
@@ -3426,7 +4703,7 @@ def _show_onboarding():
     ctk.CTkLabel(fast_inner,
                  text="Uses the Kokoro ONNX engine — generates in seconds with no\n"
                       "internet required. Great for scripts, bulk work, and previews.\n"
-                      "Choose from 20+ voices in the Voice dropdown.",
+                      "Choose from 13 voices in the Voice dropdown.",
                  font=ctk.CTkFont(family="Segoe UI", size=11),
                  text_color=C_TXT2, justify="left", wraplength=430).pack(anchor="w", pady=(4, 0))
 
@@ -3469,7 +4746,11 @@ def _show_onboarding():
             s = _get_settings()
             s["seen_onboarding"] = True
             _save_settings(s)
-        _fade_out(win, win.destroy)
+        def _after_close():
+            win.destroy()
+            if on_done:
+                on_done()
+        _fade_out(win, _after_close)
 
     ctk.CTkButton(footer, text="Get Started  →", command=_dismiss,
                   width=130, height=34,
@@ -3481,10 +4762,13 @@ def _show_onboarding():
 
 _run_kokoro_benchmark()
 
+# Load persisted history before splash so cards are ready when UI appears
+app.after(0, _load_history)
+
 _splash = _run_splash(_on_splash_done)
 # Kokoro is already loaded at this point — complete the splash bar
 app.after(100, _splash._finish)
-# Show onboarding after splash finishes (800 ms gives splash time to complete)
-app.after(800, _show_onboarding)
+# Check for updates in the background — 2 s delay so the UI is fully settled first
+app.after(2000, lambda: threading.Thread(target=_check_for_update, daemon=True).start())
 
 app.mainloop()

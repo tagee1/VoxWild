@@ -1,0 +1,70 @@
+TTS Studio — Privacy Policy
+============================
+Cookie Studios | Last updated: April 2026
+
+────────────────────────────────────────────────────────────────────────────
+THE SHORT VERSION
+────────────────────────────────────────────────────────────────────────────
+
+TTS Studio collects no personal data. All audio generation runs entirely on
+your computer. Nothing you type or record ever leaves your machine.
+
+────────────────────────────────────────────────────────────────────────────
+WHAT WE COLLECT
+────────────────────────────────────────────────────────────────────────────
+
+We collect nothing. Specifically:
+
+  - No text you enter into TTS Studio is transmitted anywhere.
+  - No audio you generate or record is transmitted anywhere.
+  - No voice clone samples are uploaded to any server.
+  - No usage statistics, telemetry, or crash reports are sent to us.
+  - No analytics or tracking of any kind is present in the software.
+
+────────────────────────────────────────────────────────────────────────────
+LICENSE ACTIVATION
+────────────────────────────────────────────────────────────────────────────
+
+When you activate your license key, TTS Studio makes a single HTTPS request
+to the Gumroad API to validate your key. This request includes:
+
+  - Your license key (so it can be verified)
+This is the only network request the software ever makes. No other data is
+sent. Gumroad's privacy policy governs how they handle this data:
+https://gumroad.com/privacy
+
+If you have not activated a license key, no network requests are made at all.
+
+────────────────────────────────────────────────────────────────────────────
+LOCAL DATA STORAGE
+────────────────────────────────────────────────────────────────────────────
+
+TTS Studio stores the following files on your computer only:
+
+  %APPDATA%\TTS Studio\settings.json   — your app preferences
+  %APPDATA%\TTS Studio\tts_profiles.json — saved EQ/voice presets
+  %APPDATA%\TTS Studio\calibration.json — audio calibration data
+  %APPDATA%\TTS Studio\license.json    — your activated license key
+  %APPDATA%\TTS Studio\voice_clones\   — voice clone audio samples you add
+  %APPDATA%\TTS Studio\crashes.log     — local crash log (never transmitted)
+
+These files never leave your machine unless you choose to copy them yourself.
+
+────────────────────────────────────────────────────────────────────────────
+AI MODELS
+────────────────────────────────────────────────────────────────────────────
+
+All AI models (Kokoro TTS, Chatterbox TTS) run locally on your hardware.
+No audio or text is sent to any AI cloud service. The models are downloaded
+once at setup and then used entirely offline.
+
+────────────────────────────────────────────────────────────────────────────
+CONTACT
+────────────────────────────────────────────────────────────────────────────
+
+Questions about this policy? Contact Cookie Studios through the store page
+where you purchased TTS Studio.
+
+────────────────────────────────────────────────────────────────────────────
+Cookie Studios is an individual software developer, not a corporation.
+This policy applies to TTS Studio version 1.0 and later.
