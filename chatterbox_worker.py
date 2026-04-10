@@ -124,53 +124,86 @@ def load_model_from_local(local_dir):
 
 def _scan_missing_dlls(pyd_path):
     """
-    Read the PE import table of a .pyd/.dll and return a list of
-    (dll_name, found: bool) for every DLL it depends on.
-    Requires torch to already be imported so torch DLLs are in the process.
+    Read the PE import table of a .pyd/.dll and check each dependency.
+    Returns list of (dll_name, found) tuples, plus error info if parsing fails.
+
+    PE optional header import directory offsets (from start of optional header):
+      PE32  (x86, magic 0x10B): data directories start at offset 96  → import at 96+8  = 104
+      PE32+ (x64, magic 0x20B): data directories start at offset 112 → import at 112+8 = 120
     """
     import struct, ctypes
+    results = []
     try:
-        d = open(pyd_path, "rb").read()
+        with open(pyd_path, "rb") as f:
+            d = f.read()
+
+        # MZ header → PE offset
+        if d[0:2] != b"MZ":
+            return [("(not a valid PE file)", False)]
         pe = struct.unpack_from("<I", d, 0x3C)[0]
         if d[pe:pe+4] != b"PE\x00\x00":
-            return []
-        machine = struct.unpack_from("<H", d, pe+4)[0]
-        ns  = struct.unpack_from("<H", d, pe+6)[0]
-        osz = struct.unpack_from("<H", d, pe+20)[0]
-        opt = pe + 24
-        irva = struct.unpack_from("<I", d, opt + (104 if machine == 0x8664 else 96))[0]
-        sects = opt + osz
+            return [("(PE signature not found)", False)]
 
-        def r2o(r):
+        machine = struct.unpack_from("<H", d, pe + 4)[0]
+        ns      = struct.unpack_from("<H", d, pe + 6)[0]   # number of sections
+        osz     = struct.unpack_from("<H", d, pe + 20)[0]  # optional header size
+        opt     = pe + 24                                   # start of optional header
+        magic   = struct.unpack_from("<H", d, opt)[0]
+
+        # Correct import directory RVA offset per architecture
+        if magic == 0x20B:   # PE32+ (64-bit)
+            import_rva_off = opt + 120
+        elif magic == 0x10B: # PE32  (32-bit)
+            import_rva_off = opt + 104
+        else:
+            return [(f"(unknown PE magic: 0x{magic:X})", False)]
+
+        irva = struct.unpack_from("<I", d, import_rva_off)[0]
+        if irva == 0:
+            return [("(no import directory)", True)]  # technically fine
+
+        sects = opt + osz  # section table immediately follows optional header
+
+        def r2o(rva):
+            """Convert RVA to file offset using the section table."""
             for i in range(ns):
                 s = sects + i * 40
-                va, vs, ro = struct.unpack_from("<III", d, s + 12)
-                if va <= r < va + vs:
-                    return ro + (r - va)
+                va = struct.unpack_from("<I", d, s + 12)[0]
+                vs = struct.unpack_from("<I", d, s + 16)[0]
+                ro = struct.unpack_from("<I", d, s + 20)[0]
+                if va <= rva < va + vs:
+                    return ro + (rva - va)
             return None
 
         off = r2o(irva)
         if off is None:
-            return []
+            return [(f"(import RVA 0x{irva:X} not in any section)", False)]
+
         k32 = ctypes.windll.kernel32
-        results = []
         while True:
-            nr = struct.unpack_from("<I", d, off + 12)[0]
-            if not nr:
+            name_rva = struct.unpack_from("<I", d, off + 12)[0]
+            if name_rva == 0:
                 break
-            no = r2o(nr)
-            end = d.index(b"\x00", no)
-            dll_name = d[no:end].decode("ascii", errors="replace")
+            name_off = r2o(name_rva)
+            if name_off is None:
+                break
+            end = d.index(b"\x00", name_off)
+            dll_name = d[name_off:end].decode("ascii", errors="replace")
+
             h = k32.LoadLibraryW(dll_name)
             if h:
                 k32.FreeLibrary(h)
                 results.append((dll_name, True))
             else:
+                err = ctypes.GetLastError()
                 results.append((dll_name, False))
-            off += 20
-        return results
+
+            off += 20  # each import directory entry is 20 bytes
+
     except Exception as ex:
-        return [("(scan error)", False, str(ex))]
+        results.append((f"(parser exception: {ex})", False))
+
+    return results
 
 
 def _preload_torch_dlls():
