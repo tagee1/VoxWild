@@ -489,7 +489,17 @@ def main():
                 emit({"type": "done"})
             except Exception as e:
                 import traceback as _tb
-                print(_tb.format_exc(), file=sys.stderr, flush=True)
+                _full_tb = _tb.format_exc()
+                print(_full_tb, file=sys.stderr, flush=True)
+                try:
+                    _gen_log = os.path.join(
+                        os.environ.get("APPDATA", ""), "TTS Studio", "natural_mode_error.log"
+                    )
+                    with open(_gen_log, "w", encoding="utf-8") as _glf:
+                        _glf.write(f"Generation error: {type(e).__name__}: {e}\n\n")
+                        _glf.write(_full_tb)
+                except Exception:
+                    pass
                 emit({"type": "error", "msg": str(e)})
             finally:
                 if _tmp_prompt:
