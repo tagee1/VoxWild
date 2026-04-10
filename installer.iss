@@ -13,8 +13,10 @@
 
 #define MyAppName      "TTS Studio"
 #define MyAppVersion   "1.0.0"
-#define MyAppPublisher "tagee1"
-#define MyAppURL       "https://yourstore.lemonsqueezy.com"
+#define MyAppPublisher "Cookie Studios"
+#define MyAppURL       "https://cookiestudios.gumroad.com/l/TTSStudioPro"
+#define MyAppSupportURL "mailto:cookiestudios.dev@gmail.com"
+#define MyAppUpdatesURL "https://github.com/tagee1/tts-studio/releases/latest"
 #define MyAppExeName   "TTS Studio.exe"
 #define MyBuildDir     "dist\TTS Studio"
 
@@ -25,8 +27,8 @@ AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
-AppSupportURL={#MyAppURL}
-AppUpdatesURL={#MyAppURL}
+AppSupportURL={#MyAppSupportURL}
+AppUpdatesURL={#MyAppUpdatesURL}
 
 ; Install to Program Files by default (requires UAC elevation)
 DefaultDirName={autopf}\{#MyAppName}
@@ -50,8 +52,8 @@ MinVersion=10.0
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
-; Show a license page (create EULA.rtf or change to .txt)
-; LicenseFile=EULA.rtf
+; Show a license page during installation
+LicenseFile=EULA.rtf
 
 ; Require admin for install (so it goes into Program Files)
 PrivilegesRequired=admin
@@ -76,6 +78,10 @@ Name: "startmenuicon"; Description: "Create a Start Menu shortcut"; GroupDescrip
 [Files]
 ; ── Main application (PyInstaller one-dir build) ────────────────────────────
 Source: "{#MyBuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; ── Legal docs ──────────────────────────────────────────────────────────────
+Source: "CREDITS.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "PRIVACY.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 ; ── chatterbox_worker.py (alongside the exe, found via _res()) ───────────────
 ; Already included above via recursesubdirs since it's in the PyInstaller output.
@@ -107,7 +113,6 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 // Warn if existing install found (offer to uninstall first)
 function InitializeSetup(): Boolean;
 var
-  UninstPath: String;
   UninstExe:  String;
   MsgResult:  Integer;
 begin

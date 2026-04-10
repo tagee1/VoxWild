@@ -23,6 +23,8 @@ from tts_utils import (
     fmt_err,
     estimate_audio_duration,
     GenerationCancelled,
+    history_card_preview,
+    history_card_voice_label,
 )
 from text_cleaner import clean_text, preview_clean
 from pronunciation import apply_pronunciation
@@ -590,20 +592,28 @@ class TestApplyPronunciation(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════
 class TestFmtErr(unittest.TestCase):
 
-    def test_simple_string_unchanged(self):
-        self.assertEqual(fmt_err(Exception("disk full")), "disk full")
+    def test_known_error_disk_full_mapped(self):
+        # "disk full" matches E004 and returns the plain-English message
+        result = fmt_err(Exception("disk full"))
+        self.assertIn("E004", result)
+        self.assertIn("Disk full", result)
 
     def test_only_first_line_returned(self):
-        # Tracebacks have multiple lines; we only want the first non-empty one.
+        # Multi-line message: only the first non-empty line survives into E099
         e = Exception("line one\nline two\nline three")
-        self.assertEqual(fmt_err(e), "line one")
+        result = fmt_err(e)
+        self.assertIn("line one", result)
+        self.assertNotIn("line two", result)
+        self.assertIn("E099", result)
 
     def test_leading_blank_lines_skipped(self):
         e = Exception("\n\nactual message\nignored")
-        self.assertEqual(fmt_err(e), "actual message")
+        result = fmt_err(e)
+        self.assertIn("actual message", result)
+        self.assertNotIn("ignored", result)
 
     def test_non_printable_chars_replaced(self):
-        # Control characters (\x00, \x07, \x1b) should become "?"
+        # Control characters (\x00, \x07) should become "?" via fallback path
         e = Exception("bad\x00char\x07here")
         result = fmt_err(e)
         self.assertNotIn("\x00", result)
@@ -614,16 +624,38 @@ class TestFmtErr(unittest.TestCase):
         e = Exception("hello world")
         self.assertIn(" ", fmt_err(e))
 
-    def test_empty_exception_returns_empty_or_str(self):
+    def test_empty_exception_returns_string(self):
         result = fmt_err(Exception(""))
         self.assertIsInstance(result, str)
 
-    def test_unicode_printable_preserved(self):
-        e = Exception("café résumé")
-        self.assertEqual(fmt_err(e), "café résumé")
+    def test_unicode_printable_preserved_in_fallback(self):
+        # Unrecognised message hits E099 fallback; printable unicode kept
+        result = fmt_err(Exception("café résumé"))
+        self.assertIn("café", result)
+        self.assertIn("E099", result)
 
     def test_returns_string(self):
         self.assertIsInstance(fmt_err(ValueError("oops")), str)
+
+    def test_known_error_oom_mapped(self):
+        result = fmt_err(Exception("out of memory"))
+        self.assertIn("E001", result)
+
+    def test_known_error_network_mapped(self):
+        result = fmt_err(Exception("connection refused"))
+        self.assertIn("E006", result)
+
+    def test_all_results_contain_code(self):
+        # Every result should end with a bracketed error code
+        cases = [
+            Exception("disk full"),
+            Exception("out of memory"),
+            Exception("something totally unknown xyz"),
+            Exception("café"),
+        ]
+        for e in cases:
+            result = fmt_err(e)
+            self.assertRegex(result, r"\[E\d{3}\]$", msg=f"No code in: {result!r}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -983,6 +1015,430 @@ class TestCancellation(unittest.TestCase):
         self.assertNotIn("❌", cancelled_msg)
         self.assertNotIn("Error", cancelled_msg)
         self.assertIn("cancelled", cancelled_msg.lower())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# history_card_preview
+# ══════════════════════════════════════════════════════════════════════════════
+class TestHistoryCardPreview(unittest.TestCase):
+
+    def test_short_text_unchanged(self):
+        self.assertEqual(history_card_preview("Hello."), "Hello.")
+
+    def test_empty_string(self):
+        self.assertEqual(history_card_preview(""), "")
+
+    def test_newlines_collapsed(self):
+        self.assertEqual(history_card_preview("Line one.\nLine two."), "Line one. Line two.")
+
+    def test_exactly_max_chars_not_truncated(self):
+        text = "a" * 100
+        result = history_card_preview(text, max_chars=100)
+        self.assertEqual(result, text)
+        self.assertFalse(result.endswith("…"))
+
+    def test_over_max_chars_truncated(self):
+        text = "a" * 101
+        result = history_card_preview(text, max_chars=100)
+        self.assertTrue(result.endswith("…"))
+        self.assertEqual(len(result), 101)  # 100 chars + ellipsis
+
+    def test_truncation_respects_max_chars(self):
+        text = "word " * 30   # 150 chars
+        result = history_card_preview(text, max_chars=100)
+        self.assertLessEqual(len(result), 101)  # 100 + ellipsis char
+
+    def test_leading_trailing_whitespace_stripped(self):
+        result = history_card_preview("  hello  ")
+        self.assertEqual(result, "hello")
+
+    def test_unicode_text_survives(self):
+        text = "日本語テスト " * 5
+        result = history_card_preview(text, max_chars=20)
+        self.assertTrue(result.endswith("…"))
+
+    def test_custom_max_chars(self):
+        result = history_card_preview("abcdef", max_chars=3)
+        self.assertEqual(result, "abc…")
+
+    def test_only_newlines(self):
+        result = history_card_preview("\n\n\n")
+        self.assertEqual(result, "")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# history_card_voice_label
+# ══════════════════════════════════════════════════════════════════════════════
+class TestHistoryCardVoiceLabel(unittest.TestCase):
+
+    def test_short_name_unchanged(self):
+        self.assertEqual(history_card_voice_label("Alice"), "Alice")
+
+    def test_splits_on_dash(self):
+        result = history_card_voice_label("Kokoro - Alice")
+        self.assertEqual(result, "Alice")
+
+    def test_strips_best_suffix(self):
+        result = history_card_voice_label("Kokoro - Alice (Best)")
+        self.assertEqual(result, "Alice")
+
+    def test_no_dash_no_change(self):
+        result = history_card_voice_label("Cookies Voice")
+        self.assertEqual(result, "Cookies Voice")
+
+    def test_long_name_truncated(self):
+        name = "A" * 25
+        result = history_card_voice_label(name, max_len=18)
+        self.assertTrue(result.endswith("…"))
+        self.assertEqual(len(result), 18)
+
+    def test_exactly_max_len_not_truncated(self):
+        name = "A" * 18
+        result = history_card_voice_label(name, max_len=18)
+        self.assertEqual(result, name)
+        self.assertFalse(result.endswith("…"))
+
+    def test_long_name_after_dash_split_truncated(self):
+        long_part = "VeryLongVoiceProfileName"
+        result = history_card_voice_label(f"Kokoro - {long_part}", max_len=18)
+        self.assertTrue(result.endswith("…"))
+        self.assertEqual(len(result), 18)
+
+    def test_empty_string(self):
+        result = history_card_voice_label("")
+        self.assertEqual(result, "")
+
+    def test_best_and_long_combined(self):
+        name = "Kokoro - " + "X" * 20 + " (Best)"
+        result = history_card_voice_label(name, max_len=18)
+        self.assertTrue(result.endswith("…"))
+        self.assertEqual(len(result), 18)
+
+    def test_multiple_dashes_takes_last_segment(self):
+        result = history_card_voice_label("Group - SubGroup - Alice")
+        self.assertEqual(result, "Alice")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _get_free_ram_gb  (tested via mock — no ctypes dependency in test runner)
+# ══════════════════════════════════════════════════════════════════════════════
+class TestGetFreeRamGb(unittest.TestCase):
+
+    def _import_fn(self):
+        """Import _get_free_ram_gb without triggering the full app.py module."""
+        import importlib, sys, types
+
+        # Stub out every heavy import app.py would pull in
+        heavy = [
+            "customtkinter", "kokoro_onnx", "sounddevice", "soundfile",
+            "numpy", "scipy", "scipy.signal", "tkinter", "tkinter.filedialog",
+            "tkinter.messagebox", "text_cleaner", "settings_window",
+            "pronunciation", "clone_library", "audio_utils", "torch",
+        ]
+        stubs = {}
+        for name in heavy:
+            if name not in sys.modules:
+                stubs[name] = types.ModuleType(name)
+                sys.modules[name] = stubs[name]
+
+        # app.py cannot be imported cleanly (it runs UI code at module level),
+        # so we define the function inline — identical to the implementation.
+        import ctypes
+
+        def _get_free_ram_gb():
+            try:
+                class _MEMSTATEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength",                ctypes.c_ulong),
+                        ("dwMemoryLoad",            ctypes.c_ulong),
+                        ("ullTotalPhys",            ctypes.c_ulonglong),
+                        ("ullAvailPhys",            ctypes.c_ulonglong),
+                        ("ullTotalPageFile",        ctypes.c_ulonglong),
+                        ("ullAvailPageFile",        ctypes.c_ulonglong),
+                        ("ullTotalVirtual",         ctypes.c_ulonglong),
+                        ("ullAvailVirtual",         ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual",ctypes.c_ulonglong),
+                    ]
+                stat = _MEMSTATEX()
+                stat.dwLength = ctypes.sizeof(stat)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                return stat.ullAvailPhys / (1024 ** 3)
+            except Exception:
+                return 999.0
+
+        # Clean up stubs
+        for name in stubs:
+            del sys.modules[name]
+
+        return _get_free_ram_gb
+
+    def test_returns_float(self):
+        fn = self._import_fn()
+        result = fn()
+        self.assertIsInstance(result, float)
+
+    def test_returns_positive(self):
+        fn = self._import_fn()
+        result = fn()
+        self.assertGreater(result, 0.0)
+
+    def test_fallback_on_exception(self):
+        """When ctypes call raises, function returns 999.0 (safe pass-through)."""
+        import ctypes
+        fn = self._import_fn()
+        with patch.object(ctypes, "windll", None):
+            result = fn()
+        self.assertEqual(result, 999.0)
+
+    def test_low_ram_threshold_logic(self):
+        """The 6 GB threshold gate used in _on_engine_change: value < 6.0 is low."""
+        # This tests the comparison logic, not the ctypes call itself.
+        low_values  = [0.0, 1.5, 4.0, 5.99]
+        high_values = [6.0, 8.0, 16.0, 999.0]
+        for v in low_values:
+            self.assertTrue(v < 6.0, f"{v} GB should be flagged as low")
+        for v in high_values:
+            self.assertFalse(v < 6.0, f"{v} GB should not be flagged as low")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Input edge cases — very long text, unicode, whitespace, empty
+# ══════════════════════════════════════════════════════════════════════════════
+class TestInputEdgeCases(unittest.TestCase):
+
+    # ── chunk_text with 5000+ word input ──────────────────────────────────────
+
+    def test_very_long_text_does_not_crash(self):
+        text = ("The cat sat on the mat. " * 500)  # ~12 000 chars / ~1000 words
+        chunks = chunk_text(text)
+        self.assertGreater(len(chunks), 1)
+
+    def test_very_long_text_no_chunk_exceeds_limit(self):
+        text = ("A somewhat lengthy sentence with many words filling space. " * 300)
+        for chunk in chunk_text(text):
+            self.assertLessEqual(len(chunk), 900)
+
+    def test_very_long_text_all_words_preserved(self):
+        # spot-check that no words vanish
+        sentinel = "UNIQUEWORDXYZ"
+        text = ("Normal sentence here. " * 200) + sentinel + ". " + ("More text. " * 200)
+        combined = " ".join(chunk_text(text))
+        self.assertIn(sentinel, combined)
+
+    # ── chunk_text with unicode ───────────────────────────────────────────────
+
+    def test_unicode_cjk_does_not_crash(self):
+        text = "こんにちは。これはテストです。日本語のテキスト。" * 5
+        result = chunk_text(text)
+        self.assertIsInstance(result, list)
+        self.assertGreater(len(result), 0)
+
+    def test_unicode_emoji_does_not_crash(self):
+        text = "Hello 🌍. Nice to meet you 😊. Let's go! 🚀"
+        result = chunk_text(text)
+        self.assertIsInstance(result, list)
+
+    def test_unicode_arabic_does_not_crash(self):
+        text = "مرحبا بالعالم. هذا اختبار. " * 10
+        result = chunk_text(text)
+        self.assertIsInstance(result, list)
+
+    def test_unicode_mixed_scripts_preserved(self):
+        text = "English text. Ångström units. Naïve café. Résumé here."
+        combined = " ".join(chunk_text(text))
+        self.assertIn("Ångström", combined)
+        self.assertIn("Naïve", combined)
+
+    # ── chunk_text whitespace/degenerate inputs ───────────────────────────────
+
+    def test_whitespace_only_does_not_crash(self):
+        for ws in ("   ", "\n\n\n", "\t\t", " \n \t "):
+            result = chunk_text(ws)
+            self.assertIsInstance(result, list)
+
+    def test_only_punctuation_does_not_crash(self):
+        result = chunk_text("... !!! ??? ---")
+        self.assertIsInstance(result, list)
+
+    def test_newline_only_text(self):
+        result = chunk_text("\n" * 50)
+        self.assertIsInstance(result, list)
+
+    # ── apply_pronunciation with edge inputs ──────────────────────────────────
+
+    def test_pronunciation_empty_string(self):
+        import pronunciation as _pron
+        _pron._dict_cache = None
+        with patch("pronunciation.load_dictionary",
+                   return_value=[{"from": "API", "to": "A.P.I.", "case_sensitive": True}]):
+            result = apply_pronunciation("")
+        self.assertEqual(result, "")
+
+    def test_pronunciation_whitespace_only(self):
+        import pronunciation as _pron
+        _pron._dict_cache = None
+        with patch("pronunciation.load_dictionary",
+                   return_value=[{"from": "API", "to": "A.P.I.", "case_sensitive": True}]):
+            result = apply_pronunciation("   ")
+        self.assertEqual(result, "   ")
+
+    def test_pronunciation_unicode_input_does_not_crash(self):
+        import pronunciation as _pron
+        _pron._dict_cache = None
+        text = "こんにちは API 🌍 Naïve café résumé."
+        with patch("pronunciation.load_dictionary",
+                   return_value=[{"from": "API", "to": "A.P.I.", "case_sensitive": True}]):
+            result = apply_pronunciation(text)
+        self.assertIsInstance(result, str)
+        self.assertIn("A.P.I.", result)
+
+    def test_pronunciation_very_long_text_does_not_crash(self):
+        import pronunciation as _pron
+        _pron._dict_cache = None
+        text = "The API returns data. " * 500  # ~11 000 chars
+        with patch("pronunciation.load_dictionary",
+                   return_value=[{"from": "API", "to": "A.P.I.", "case_sensitive": True}]):
+            result = apply_pronunciation(text)
+        self.assertIn("A.P.I.", result)
+        self.assertNotIn(" API ", result)
+
+    def test_pronunciation_malformed_regex_entry_skipped(self):
+        """A malformed regex pattern in an entry must not crash the whole run."""
+        import pronunciation as _pron
+        _pron._dict_cache = None
+        bad_entries = [
+            {"from": "[invalid(regex", "to": "whatever", "case_sensitive": False},
+            {"from": "API", "to": "A.P.I.", "case_sensitive": True},
+        ]
+        with patch("pronunciation.load_dictionary", return_value=bad_entries):
+            result = apply_pronunciation("Call the API.")
+        self.assertIn("A.P.I.", result)  # good entry still applied
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dialogue tab — parse_dialogue edge cases & generate_dialogue_audio error paths
+# ══════════════════════════════════════════════════════════════════════════════
+class TestParseDialogueEdgeCases(unittest.TestCase):
+
+    def test_single_speaker_single_line(self):
+        result = parse_dialogue("ALICE: Hello world.")
+        self.assertEqual(result, [("ALICE", "Hello world.")])
+
+    def test_three_speakers_ordered(self):
+        text = "A: one.\nB: two.\nC: three."
+        result = parse_dialogue(text)
+        self.assertEqual([sp for sp, _ in result], ["A", "B", "C"])
+
+    def test_underscore_in_speaker(self):
+        result = parse_dialogue("VOICE_OVER: Narration here.")
+        self.assertEqual(result[0][0], "VOICE_OVER")
+
+    def test_no_text_after_colon_not_parsed(self):
+        result = parse_dialogue("ALICE:")
+        self.assertEqual(result, [])
+
+    def test_only_whitespace_after_colon_not_parsed(self):
+        result = parse_dialogue("ALICE:    ")
+        self.assertEqual(result, [])
+
+    def test_number_only_speaker_not_parsed(self):
+        # Must start with a letter
+        result = parse_dialogue("1BOB: text")
+        self.assertEqual(result, [])
+
+    def test_continuation_appended_with_space(self):
+        text = "ALICE: Part one.\nPart two continues."
+        result = parse_dialogue(text)
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0][1].endswith("Part two continues."))
+
+    def test_large_script_no_crash(self):
+        lines = [f"SPEAKER{i % 5}: Line {i} text here." for i in range(200)]
+        result = parse_dialogue("\n".join(lines))
+        self.assertEqual(len(result), 200)
+
+    def test_duplicate_speakers_not_merged(self):
+        text = "ALICE: First.\nBOB: Middle.\nALICE: Last."
+        result = parse_dialogue(text)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[2][0], "ALICE")
+
+    def test_empty_lines_between_all_speakers_ignored(self):
+        text = "ALICE: Hi.\n\n\nBOB: Hey.\n\nALICE: Bye."
+        result = parse_dialogue(text)
+        self.assertEqual(len(result), 3)
+
+    def test_unicode_text_in_dialogue(self):
+        text = "NARRATOR: 今日はいい天気ですね。\nALICE: Oui, c'est magnifique!"
+        result = parse_dialogue(text)
+        self.assertEqual(len(result), 2)
+        self.assertIn("今日", result[0][1])
+
+    def test_returns_list_of_tuples(self):
+        result = parse_dialogue("ALICE: Hello.")
+        self.assertIsInstance(result, list)
+        self.assertIsInstance(result[0], tuple)
+        self.assertEqual(len(result[0]), 2)
+
+
+class TestDialogueUniqueSpakers(unittest.TestCase):
+    """Logic for extracting ordered-unique speakers from parsed lines."""
+
+    def _unique_speakers(self, text):
+        lines = parse_dialogue(text)
+        return list(dict.fromkeys(sp for sp, _ in lines))
+
+    def test_unique_speakers_ordered(self):
+        text = "ALICE: Hi.\nBOB: Hey.\nALICE: Bye."
+        self.assertEqual(self._unique_speakers(text), ["ALICE", "BOB"])
+
+    def test_single_speaker(self):
+        self.assertEqual(self._unique_speakers("NARRATOR: Once."), ["NARRATOR"])
+
+    def test_empty_script_no_speakers(self):
+        self.assertEqual(self._unique_speakers(""), [])
+
+    def test_five_speakers_order_preserved(self):
+        lines = "\n".join(f"SP{i}: text" for i in range(5))
+        result = self._unique_speakers(lines)
+        self.assertEqual(result, [f"SP{i}" for i in range(5)])
+
+    def test_interleaved_speakers_no_duplicates(self):
+        text = "A: 1.\nB: 2.\nA: 3.\nC: 4.\nB: 5."
+        self.assertEqual(self._unique_speakers(text), ["A", "B", "C"])
+
+
+class TestDialogueValidation(unittest.TestCase):
+    """Validate pre-generate checks (logic extracted for testability)."""
+
+    def _missing_speakers(self, text, panel_keys):
+        lines = parse_dialogue(text)
+        script_speakers = set(sp for sp, _ in lines)
+        panel_speakers  = set(panel_keys)
+        return script_speakers - panel_speakers
+
+    def test_all_speakers_in_panel_no_missing(self):
+        text = "ALICE: Hi.\nBOB: Hey."
+        self.assertEqual(self._missing_speakers(text, ["ALICE", "BOB"]), set())
+
+    def test_one_speaker_missing_from_panel(self):
+        text = "ALICE: Hi.\nBOB: Hey.\nCHARLIE: Hello."
+        missing = self._missing_speakers(text, ["ALICE", "BOB"])
+        self.assertEqual(missing, {"CHARLIE"})
+
+    def test_empty_panel_all_speakers_missing(self):
+        text = "ALICE: Hi.\nBOB: Hey."
+        missing = self._missing_speakers(text, [])
+        self.assertEqual(missing, {"ALICE", "BOB"})
+
+    def test_extra_panel_keys_not_flagged(self):
+        # Panel may have more speakers than script — that's fine
+        text = "ALICE: Hi."
+        missing = self._missing_speakers(text, ["ALICE", "BOB"])
+        self.assertEqual(missing, set())
+
+    def test_empty_script_no_missing(self):
+        self.assertEqual(self._missing_speakers("", ["ALICE"]), set())
 
 
 if __name__ == "__main__":

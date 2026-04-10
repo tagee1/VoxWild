@@ -55,6 +55,9 @@ _datas = [
     *_glob_datas(os.path.join(SP, "onnxruntime", "capi", "*.dll"),
                  os.path.join("onnxruntime", "capi")),
 
+    # ── language_tags JSON data (required by csvw → segments → phonemizer → kokoro) ─
+    (os.path.join(SP, "language_tags", "data"), os.path.join("language_tags", "data")),
+
     # ── scipy OpenBLAS ─────────────────────────────────────────────────────
     (os.path.join(SP, "scipy.libs"), "scipy.libs"),
 
@@ -134,7 +137,7 @@ _excludes = [
 
 a = Analysis(
     ["app.py"],
-    pathex=["C:\\tts-app"],
+    pathex=[os.path.dirname(os.path.abspath(SPEC))],
     binaries=[],
     datas=_datas,
     hiddenimports=_hidden,

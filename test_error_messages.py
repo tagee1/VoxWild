@@ -15,6 +15,7 @@ def test_fmt_err():
         (MemoryError("CUDA out of memory"),                        "RAM",            "E001"),
         (OSError("paging file is too small"),                      "RAM",            "E001"),
         (Exception("WinError 1455"),                               "RAM",            "E001"),
+        (RuntimeError("Not enough RAM to load model: "),           "RAM",            "E001"),
         (Exception("PortAudio: No Default Output Device"),         "Audio device",   "E002"),
         (PermissionError("Access is denied: 'C:\\foo.wav'"),       "Permission",     "E003"),
         (FileNotFoundError("No such file: 'voice.wav'"),           "not found",      "E005"),

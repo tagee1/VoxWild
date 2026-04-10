@@ -1,7 +1,26 @@
+import ctypes
 import customtkinter as ctk
 import json
 import os
+import sys
 from tkinter import filedialog
+
+
+def _center_window(win, w: int, h: int, parent=None) -> None:
+    win.update_idletasks()
+    try:
+        p = parent or win.master
+        x = p.winfo_x() + (p.winfo_width()  - w) // 2
+        y = p.winfo_y() + (p.winfo_height() - h) // 2
+    except Exception:
+        try:
+            sw = ctypes.windll.user32.GetSystemMetrics(0)
+            sh = ctypes.windll.user32.GetSystemMetrics(1)
+        except Exception:
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+        x, y = (sw - w) // 2, (sh - h) // 2
+    win.geometry(f"{w}x{h}+{x}+{y}")
 
 SETTINGS_FILE = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio", "settings.json"
@@ -43,23 +62,23 @@ def load_settings():
                 if k not in data:
                     data[k] = v
             return data
-        except (OSError, json.JSONDecodeError):
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[settings] Failed to load settings: {e}", file=sys.stderr)
     return DEFAULT_SETTINGS.copy()
 
 def save_settings(data):
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"[settings] Failed to save settings: {e}", file=sys.stderr)
 
 def open_settings_window(parent, voices: list, profiles: list, on_save_callback=None):
     """Open the settings window."""
 
     win = ctk.CTkToplevel(parent)
     win.title("Settings")
-    win.geometry("520x640")
+    _center_window(win, 520, 640)
     win.resizable(False, False)
     win.grab_set()
     win.configure(fg_color=C_BG)
