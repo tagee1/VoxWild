@@ -110,24 +110,18 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 
 
 [Code]
-// Warn if existing install found (offer to uninstall first)
+// Silently remove any existing installation before installing the new version.
+// /VERYSILENT + SW_HIDE means no uninstaller window appears — user only sees
+// the new installer, making upgrades feel like a single seamless install.
 function InitializeSetup(): Boolean;
 var
-  UninstExe:  String;
-  MsgResult:  Integer;
+  UninstExe: String;
+  ResultCode: Integer;
 begin
   Result := True;
   if RegQueryStringValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B3F2A1C4-7D8E-4F0A-9B2C-5E6D3A1F8C90}_is1',
                          'UninstallString', UninstExe) then
   begin
-    MsgResult := MsgBox(
-      'A previous version of TTS Studio is already installed.'#13#10 +
-      'It is recommended to uninstall it first.'#13#10#13#10 +
-      'Uninstall the previous version now?',
-      mbConfirmation, MB_YESNO);
-    if MsgResult = IDYES then
-    begin
-      Exec(RemoveQuotes(UninstExe), '/SILENT /NORESTART', '', SW_SHOW, ewWaitUntilTerminated, MsgResult);
-    end;
+    Exec(RemoveQuotes(UninstExe), '/VERYSILENT /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
