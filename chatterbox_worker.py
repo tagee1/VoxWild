@@ -122,6 +122,57 @@ def load_model_from_local(local_dir):
     model.watermarker = watermarker
     return model
 
+def _scan_missing_dlls(pyd_path):
+    """
+    Read the PE import table of a .pyd/.dll and return a list of
+    (dll_name, found: bool) for every DLL it depends on.
+    Requires torch to already be imported so torch DLLs are in the process.
+    """
+    import struct, ctypes
+    try:
+        d = open(pyd_path, "rb").read()
+        pe = struct.unpack_from("<I", d, 0x3C)[0]
+        if d[pe:pe+4] != b"PE\x00\x00":
+            return []
+        machine = struct.unpack_from("<H", d, pe+4)[0]
+        ns  = struct.unpack_from("<H", d, pe+6)[0]
+        osz = struct.unpack_from("<H", d, pe+20)[0]
+        opt = pe + 24
+        irva = struct.unpack_from("<I", d, opt + (104 if machine == 0x8664 else 96))[0]
+        sects = opt + osz
+
+        def r2o(r):
+            for i in range(ns):
+                s = sects + i * 40
+                va, vs, ro = struct.unpack_from("<III", d, s + 12)
+                if va <= r < va + vs:
+                    return ro + (r - va)
+            return None
+
+        off = r2o(irva)
+        if off is None:
+            return []
+        k32 = ctypes.windll.kernel32
+        results = []
+        while True:
+            nr = struct.unpack_from("<I", d, off + 12)[0]
+            if not nr:
+                break
+            no = r2o(nr)
+            end = d.index(b"\x00", no)
+            dll_name = d[no:end].decode("ascii", errors="replace")
+            h = k32.LoadLibraryW(dll_name)
+            if h:
+                k32.FreeLibrary(h)
+                results.append((dll_name, True))
+            else:
+                results.append((dll_name, False))
+            off += 20
+        return results
+    except Exception as ex:
+        return [("(scan error)", False, str(ex))]
+
+
 def _preload_torch_dlls():
     """
     Pre-load every torch DLL in dependency order BEFORE importing torchaudio.
@@ -169,6 +220,24 @@ def _preload_torch_dlls():
 def main():
     emit({"type": "status", "msg": "Starting Natural mode — loading 3 GB model on CPU..."})
     _preload_torch_dlls()
+
+    # Scan libtorchaudio.pyd's DLL imports BEFORE attempting to load it.
+    # torch must be imported first so its DLLs are in the process table.
+    try:
+        import torch as _torch_for_scan
+        _py_dir   = os.path.dirname(os.path.abspath(sys.executable))
+        _pyd_path = os.path.join(_py_dir, "Lib", "site-packages",
+                                 "torchaudio", "lib", "libtorchaudio.pyd")
+        _scan     = _scan_missing_dlls(_pyd_path)
+        _log_path = os.path.join(os.path.dirname(_py_dir), "dll_diagnostic.log")
+        with open(_log_path, "w", encoding="utf-8") as _lf:
+            _lf.write(f"libtorchaudio.pyd dependency scan:\n")
+            for entry in _scan:
+                dll, found = entry[0], entry[1]
+                _lf.write(f"  {'OK     ' if found else 'MISSING'}  {dll}\n")
+    except Exception as _se:
+        pass
+
     try:
         import torchaudio
         from chatterbox.tts import ChatterboxTTS
