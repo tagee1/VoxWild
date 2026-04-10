@@ -122,8 +122,53 @@ def load_model_from_local(local_dir):
     model.watermarker = watermarker
     return model
 
+def _preload_torch_dlls():
+    """
+    Pre-load every torch DLL in dependency order BEFORE importing torchaudio.
+
+    Why: ctypes.CDLL(libtorchaudio.pyd) fails with "Could not find module …
+    (or one of its dependencies)" because Windows can't resolve the torch DLLs
+    that libtorchaudio depends on, even when those dirs are in PATH/add_dll_directory.
+
+    The guaranteed fix: load each torch DLL explicitly first (leaf deps first).
+    Once a DLL is loaded into the process, Windows returns the existing handle
+    for any subsequent request — no search path needed.
+    """
+    if os.name != "nt":
+        return
+    import ctypes
+    _py_dir    = os.path.dirname(os.path.abspath(sys.executable))
+    _torch_lib = os.path.join(_py_dir, "Lib", "site-packages", "torch", "lib")
+    if not os.path.isdir(_torch_lib):
+        return
+    # Load in dependency order: leaves first, dependents after.
+    # Any DLL that fails to load is silently skipped — if it's truly
+    # missing we'll get a proper error when torchaudio imports.
+    _load_order = [
+        "libiomp5md",       # Intel OpenMP — system deps only
+        "libiompstubs5md",  # OpenMP stubs
+        "uv",               # libuv — system deps only
+        "asmjit",           # JIT assembler — system deps only
+        "c10",              # depends on libiomp5md, uv
+        "fbgemm",           # depends on c10, asmjit, libiomp5md
+        "shm",              # shared memory — depends on c10
+        "torch_cpu",        # depends on c10, fbgemm, libiomp5md, asmjit
+        "torch_global_deps",
+        "torch_python",     # depends on torch_cpu, c10, python3xx
+        "torch",            # main lib
+    ]
+    for _name in _load_order:
+        _path = os.path.join(_torch_lib, f"{_name}.dll")
+        if os.path.isfile(_path):
+            try:
+                ctypes.CDLL(_path)
+            except OSError:
+                pass  # missing dep at this stage → try anyway; torchaudio will surface the real error
+
+
 def main():
     emit({"type": "status", "msg": "Starting Natural mode — loading 3 GB model on CPU..."})
+    _preload_torch_dlls()
     try:
         import torchaudio
         from chatterbox.tts import ChatterboxTTS
