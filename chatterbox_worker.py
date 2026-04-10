@@ -38,34 +38,12 @@ if os.name == "nt":
     # 1. PATH — for ctypes.CDLL / LoadLibraryW dependency resolution
     os.environ["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + os.environ.get("PATH", "")
 
-    # 2. add_dll_directory — for Python C-extension / LoadLibraryExW resolution
+    # 2. add_dll_directory — for Python C-extension / LoadLibraryExW resolution.
+    # IMPORTANT: os.add_dll_directory() returns a handle. If the handle is
+    # garbage collected the directory is removed from the search path. Store
+    # handles in a module-level list so they live for the process lifetime.
     if hasattr(os, "add_dll_directory"):
-        for _d in _dll_dirs:
-            os.add_dll_directory(_d)
-
-    # Diagnostic log — separate file so error handler doesn't overwrite it
-    try:
-        _log_path = os.path.join(os.path.dirname(_py_dir), "dll_diagnostic.log")
-        with open(_log_path, "w", encoding="utf-8") as _lf:
-            _lf.write(f"sys.executable: {sys.executable}\n")
-            _lf.write(f"py_dir:         {_py_dir}\n")
-            _lf.write(f"torch_lib:      {_torch_lib} — exists={os.path.isdir(_torch_lib)}\n")
-            _lf.write(f"taudio_lib:     {_taudio_lib} — exists={os.path.isdir(_taudio_lib)}\n")
-            _lf.write(f"dll_dirs added: {_dll_dirs}\n\n")
-            if os.path.isdir(_torch_lib):
-                _lf.write("torch/lib contents:\n")
-                for _f in sorted(os.listdir(_torch_lib)):
-                    _lf.write(f"  {_f}\n")
-            else:
-                _lf.write("torch/lib does NOT exist — install incomplete!\n")
-            if os.path.isdir(_taudio_lib):
-                _lf.write("\ntorchaudio/lib contents:\n")
-                for _f in sorted(os.listdir(_taudio_lib)):
-                    _lf.write(f"  {_f}\n")
-            else:
-                _lf.write("\ntorchaudio/lib does NOT exist — install incomplete!\n")
-    except Exception:
-        pass
+        _dll_handles = [os.add_dll_directory(_d) for _d in _dll_dirs]
 
     del _py_dir, _torch_lib, _taudio_lib, _scripts_dir, _dll_dirs
 # ──────────────────────────────────────────────────────────────────────────────
