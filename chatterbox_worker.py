@@ -43,9 +43,9 @@ if os.name == "nt":
         for _d in _dll_dirs:
             os.add_dll_directory(_d)
 
-    # Diagnostic log — helps identify missing DLLs
+    # Diagnostic log — separate file so error handler doesn't overwrite it
     try:
-        _log_path = os.path.join(os.path.dirname(_py_dir), "natural_mode_error.log")
+        _log_path = os.path.join(os.path.dirname(_py_dir), "dll_diagnostic.log")
         with open(_log_path, "w", encoding="utf-8") as _lf:
             _lf.write(f"sys.executable: {sys.executable}\n")
             _lf.write(f"py_dir:         {_py_dir}\n")
