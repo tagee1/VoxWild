@@ -97,7 +97,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.0.0"
+VERSION          = "1.0.1"
 GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
@@ -414,13 +414,27 @@ _fmt_err = fmt_err  # local alias kept so existing call sites are unchanged
 class ChatterboxEngine:
     """Manages a persistent chatterbox_worker.py subprocess."""
 
-    WORKER  = _res("chatterbox_worker.py")
-    PYTHON  = _res(os.path.join("chatterbox_env", "Scripts", "python.exe"))
+    WORKER = _res("chatterbox_worker.py")
+
+    # Dev env (running from source) — sibling of app.py
+    _PYTHON_DEV  = _res(os.path.join("chatterbox_env", "Scripts", "python.exe"))
+    # Installed env — created by auto-setup, lives in APPDATA (always user-writable)
+    _CB_ENV_DIR  = os.path.join(
+        os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio", "chatterbox_env"
+    )
+    _PYTHON_USER = os.path.join(_CB_ENV_DIR, "Scripts", "python.exe")
 
     def __init__(self):
         self._proc   = None
         self._sr     = 24000   # default; updated on ready
         self._lock   = threading.Lock()
+
+    @property
+    def PYTHON(self):
+        """Dev env takes priority (running from source); falls back to APPDATA install."""
+        if os.path.exists(self._PYTHON_DEV):
+            return self._PYTHON_DEV
+        return self._PYTHON_USER
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
     def start(self, status_cb=None):
@@ -523,6 +537,161 @@ class ChatterboxEngine:
         raise RuntimeError("Chatterbox worker closed unexpectedly.")
 
 chatterbox_engine = ChatterboxEngine()
+
+# ── Chatterbox auto-setup helpers ─────────────────────────────────────────────
+
+def _cb_env_exists():
+    """Return True if a usable chatterbox_env Python is already installed."""
+    return os.path.exists(chatterbox_engine.PYTHON)
+
+
+def _find_system_python():
+    """
+    Find Python 3.10+ on the system.
+    Tries the Windows py launcher with specific versions first, then generic names.
+    Returns the executable path string, or None if not found.
+    """
+    import shutil
+
+    # Windows Python Launcher — most reliable (tries 3.11 first to match our env)
+    if shutil.which("py"):
+        for ver in ("3.11", "3.12", "3.10", "3.13"):
+            try:
+                r = subprocess.run(
+                    ["py", f"-{ver}", "-c", "import sys; print(sys.executable)"],
+                    capture_output=True, text=True, timeout=8,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip()
+            except Exception:
+                pass
+
+    # Fall back to generic interpreter names
+    for name in ("python3", "python"):
+        path = shutil.which(name)
+        if not path:
+            continue
+        try:
+            r = subprocess.run(
+                [path, "-c",
+                 "import sys; v=sys.version_info; "
+                 "print(v.major, v.minor); print(sys.executable)"],
+                capture_output=True, text=True, timeout=8,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if r.returncode == 0:
+                lines = r.stdout.strip().splitlines()
+                if len(lines) >= 2:
+                    major, minor = map(int, lines[0].split())
+                    if (major, minor) >= (3, 10):
+                        return lines[1]
+        except Exception:
+            pass
+
+    return None
+
+
+def _run_chatterbox_setup(update_status, on_success, on_failure):
+    """
+    Background thread: find Python → create venv → install packages.
+    Calls on_success() or on_failure(error_message) when done.
+    """
+    env_dir     = ChatterboxEngine._CB_ENV_DIR
+    python_user = ChatterboxEngine._PYTHON_USER
+
+    # Step 1 — find Python
+    update_status("Looking for Python 3.10+ on your system…")
+    py = _find_system_python()
+    if not py:
+        on_failure(
+            "Python 3.10 or later was not found on your system.\n\n"
+            "Please install Python from python.org (3.10, 3.11, 3.12, or 3.13),\n"
+            "then switch to Natural mode again."
+        )
+        return
+
+    # Step 2 — create venv
+    update_status("Creating Natural mode environment…")
+    try:
+        os.makedirs(os.path.dirname(env_dir), exist_ok=True)
+        r = subprocess.run(
+            [py, "-m", "venv", env_dir],
+            capture_output=True, text=True, timeout=120,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            on_failure(
+                "Failed to create Python environment:\n"
+                + (r.stderr or r.stdout or "Unknown error").strip()[-400:]
+            )
+            return
+    except Exception as e:
+        on_failure(f"Failed to create Python environment: {e}")
+        return
+
+    # Step 3 — upgrade pip (non-fatal if it fails)
+    update_status("Upgrading pip…")
+    try:
+        subprocess.run(
+            [python_user, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
+            capture_output=True, timeout=120,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        pass
+
+    # Step 4 — install PyTorch CPU (~800 MB)
+    update_status("Downloading PyTorch (CPU) — ~800 MB, this may take a few minutes…")
+    try:
+        r = subprocess.run(
+            [python_user, "-m", "pip", "install",
+             "torch==2.6.0", "torchaudio==2.6.0",
+             "--index-url", "https://download.pytorch.org/whl/cpu",
+             "--quiet"],
+            capture_output=True, text=True, timeout=1800,   # 30 min
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            on_failure(
+                "Failed to install PyTorch:\n"
+                + (r.stderr or r.stdout or "Unknown error").strip()[-400:]
+            )
+            return
+    except subprocess.TimeoutExpired:
+        on_failure("PyTorch download timed out. Check your internet connection and try again.")
+        return
+    except Exception as e:
+        on_failure(f"Failed to install PyTorch: {e}")
+        return
+
+    # Step 5 — install chatterbox-tts (~200 MB)
+    update_status("Installing Chatterbox TTS and dependencies…")
+    try:
+        r = subprocess.run(
+            [python_user, "-m", "pip", "install", "chatterbox-tts==0.1.7", "--quiet"],
+            capture_output=True, text=True, timeout=600,    # 10 min
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            on_failure(
+                "Failed to install Chatterbox:\n"
+                + (r.stderr or r.stdout or "Unknown error").strip()[-400:]
+            )
+            return
+    except subprocess.TimeoutExpired:
+        on_failure("Chatterbox install timed out. Check your internet connection and try again.")
+        return
+    except Exception as e:
+        on_failure(f"Failed to install Chatterbox: {e}")
+        return
+
+    # Verify
+    if not os.path.exists(python_user):
+        on_failure("Setup finished but environment not found — please try again.")
+        return
+
+    on_success()
 
 # ── Voices ────────────────────────────────────────────────────────────────────
 VOICES = {
@@ -3353,11 +3522,23 @@ def _on_engine_change(*_):
             def _revert_to_fast():
                 engine_var.set("⚡ Fast")
 
-            free_gb = _get_free_ram_gb()
-            if free_gb < 6.0:
-                app.after(0, lambda: _show_low_ram_warning(free_gb, _start_load, _revert_to_fast))
+            def _after_setup():
+                """Called when auto-setup completes successfully — proceed with normal load."""
+                free_gb = _get_free_ram_gb()
+                if free_gb < 6.0:
+                    app.after(0, lambda: _show_low_ram_warning(free_gb, _start_load, _revert_to_fast))
+                else:
+                    app.after(0, _start_load)
+
+            if not _cb_env_exists():
+                # First time — need to install chatterbox_env before loading
+                app.after(0, lambda: _show_chatterbox_setup_modal(_after_setup, _revert_to_fast))
             else:
-                _start_load()
+                free_gb = _get_free_ram_gb()
+                if free_gb < 6.0:
+                    app.after(0, lambda: _show_low_ram_warning(free_gb, _start_load, _revert_to_fast))
+                else:
+                    _start_load()
     else:
         cb_frame.pack_forget()
         kokoro_frame.pack(fill="x")
@@ -3391,7 +3572,15 @@ ctk.CTkLabel(mid_panel, text="Ctrl+Enter  ·  Esc to stop",
              text_color=C_TXT3).pack(pady=(4, 8))
 
 # ── Enhancement panel ─────────────────────────────────────────────────────────
-enh_panel = _panel(studio, 2)
+# Outer card sits in the grid; inner scrollable frame holds all controls so
+# the tall FX + AI Enhancement content is accessible at any window height.
+_enh_card = ctk.CTkFrame(studio, fg_color=C_CARD, corner_radius=12)
+_enh_card.grid(row=0, column=2, sticky="nsew", padx=(0, 8), pady=6)
+enh_panel = ctk.CTkScrollableFrame(
+    _enh_card, fg_color="transparent",
+    scrollbar_button_color=C_BORDER,
+    scrollbar_button_hover_color=C_ACCENT_D)
+enh_panel.pack(fill="both", expand=True)
 
 _section_label(enh_panel, "AUDIO FX",
     tooltip="Post-processing chain applied to every generated clip. "
@@ -4127,6 +4316,101 @@ if _saved_clone and _saved_clone != _CLONE_DEFAULT:
         cb_clone_var.set(_saved_clone)
         status_label.configure(text="Ready  ·  Ctrl+Enter to generate  ·  Ctrl+P to play  ·  Esc to stop")
     # if not found (deleted), dropdown stays at Default
+
+def _show_chatterbox_setup_modal(on_complete, on_cancel):
+    """
+    Show a setup modal and install chatterbox_env in the background.
+    Calls on_complete() on success, on_cancel() if the user dismisses after failure.
+    """
+    win = ctk.CTkToplevel(app)
+    win.title("Natural Mode Setup")
+    _center_window(win, 500, 310)
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.transient(app)
+    win.protocol("WM_DELETE_WINDOW", lambda: None)   # blocked until success/failure
+    win.attributes("-topmost", True)
+    win.lift()
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
+    hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    hdr_inner = ctk.CTkFrame(hdr, fg_color="transparent")
+    hdr_inner.pack(side="left", padx=16, pady=10)
+    ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=4, height=20,
+                 corner_radius=2).pack(side="left", padx=(0, 10))
+    ctk.CTkLabel(hdr_inner, text="Setting Up Natural Mode",
+                 font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                 text_color=C_TXT).pack(side="left")
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+
+    # ── Info callout ──────────────────────────────────────────────────────────
+    callout = ctk.CTkFrame(win, fg_color=C_ACCENT_D, corner_radius=8)
+    callout.pack(fill="x", padx=20, pady=(16, 0))
+    ctk.CTkLabel(
+        callout,
+        text="Downloading PyTorch + Chatterbox (~1 GB). Keep the app open.\n"
+             "The 3 GB model files are downloaded on your first generation.",
+        font=ctk.CTkFont(family="Segoe UI", size=11),
+        text_color=C_WARN,
+        justify="left",
+    ).pack(anchor="w", padx=12, pady=8)
+
+    # ── Progress bar ──────────────────────────────────────────────────────────
+    bar = ctk.CTkProgressBar(win, mode="indeterminate",
+                             progress_color=C_ACCENT, fg_color=C_ACCENT_D)
+    bar.pack(fill="x", padx=20, pady=(14, 6))
+    bar.start()
+
+    # ── Status text ───────────────────────────────────────────────────────────
+    status_var = ctk.StringVar(value="Initializing…")
+    ctk.CTkLabel(win, textvariable=status_var,
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT2, wraplength=460, anchor="w", justify="left",
+                 ).pack(padx=20, anchor="w")
+
+    # ── Dismiss button (hidden until failure) ─────────────────────────────────
+    dismiss_btn = ctk.CTkButton(win, text="Cancel — Use Fast Mode",
+                                width=180, height=32,
+                                font=ctk.CTkFont(family="Segoe UI", size=12),
+                                fg_color=C_SURFACE, hover_color=C_ELEVATED,
+                                border_width=1, border_color=C_BORDER, text_color=C_TXT2)
+    # not packed yet — only shown on failure
+
+    win.update()
+    _fade_in(win)
+
+    def update_status(msg):
+        app.after(0, lambda m=msg: status_var.set(m))
+
+    def _on_success():
+        def _ui():
+            bar.stop()
+            _fade_out(win, win.destroy)
+            on_complete()
+        app.after(0, _ui)
+
+    def _on_failure(msg):
+        def _ui():
+            bar.stop()
+            status_var.set(f"Setup failed: {msg}")
+
+            def _dismiss():
+                _fade_out(win, win.destroy)
+                on_cancel()
+
+            dismiss_btn.configure(command=_dismiss)
+            dismiss_btn.pack(pady=(10, 4))
+            win.protocol("WM_DELETE_WINDOW", _dismiss)
+        app.after(0, _ui)
+
+    threading.Thread(
+        target=_run_chatterbox_setup,
+        args=(update_status, _on_success, _on_failure),
+        daemon=True,
+    ).start()
+
 
 def _make_chatterbox_loading_modal():
     """Create and return the Natural mode loading modal. Non-dismissible while loading."""
