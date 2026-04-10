@@ -448,6 +448,20 @@ class ChatterboxEngine:
                     "chatterbox_env not found.\n"
                     f"Expected: {self.PYTHON}"
                 )
+
+            # Prepend the Python directory (and Scripts/) to PATH so Windows
+            # can find python3xx.dll and torch C-extension DLLs when the
+            # worker subprocess loads them. Without this, the frozen app's
+            # stripped PATH causes "Could not find module" OSErrors.
+            python_dir  = os.path.dirname(self.PYTHON)
+            scripts_dir = os.path.join(python_dir, "Scripts")
+            env = os.environ.copy()
+            env["PATH"] = (
+                python_dir + os.pathsep +
+                scripts_dir + os.pathsep +
+                env.get("PATH", "")
+            )
+
             proc = subprocess.Popen(
                 [self.PYTHON, self.WORKER],
                 stdin=subprocess.PIPE,
@@ -457,6 +471,7 @@ class ChatterboxEngine:
                 encoding="utf-8",
                 bufsize=1,
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                env=env,
             )
             for raw in proc.stdout:
                 raw = raw.strip()
