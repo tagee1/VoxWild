@@ -2,11 +2,33 @@
 Pronunciation dictionary — word/phrase substitutions applied before TTS generation.
 Entries are stored as a JSON list of {"from": str, "to": str, "case_sensitive": bool}.
 """
+import ctypes
 import json
 import os
 import re
+import sys
 
-PRONUNCIATION_FILE = "pronunciation.json"
+
+def _center_window(win, w: int, h: int, parent=None) -> None:
+    win.update_idletasks()
+    try:
+        p = parent or win.master
+        x = p.winfo_x() + (p.winfo_width()  - w) // 2
+        y = p.winfo_y() + (p.winfo_height() - h) // 2
+    except Exception:
+        try:
+            sw = ctypes.windll.user32.GetSystemMetrics(0)
+            sh = ctypes.windll.user32.GetSystemMetrics(1)
+        except Exception:
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+        x, y = (sw - w) // 2, (sh - h) // 2
+    win.geometry(f"{w}x{h}+{x}+{y}")
+
+PRONUNCIATION_FILE = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")),
+    "TTS Studio", "pronunciation.json"
+)
 
 # ── Studio Gold palette (must match app.py) ───────────────────────────────────
 C_BG        = "#0d0d0d"
@@ -33,18 +55,19 @@ def load_dictionary():
         try:
             with open(PRONUNCIATION_FILE, encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[pronunciation] Failed to load dictionary: {e}", file=sys.stderr)
     return _default_entries()
 
 def save_dictionary(entries):
     global _dict_cache
     _dict_cache = None  # invalidate cache so next generation re-reads the new entries
     try:
+        os.makedirs(os.path.dirname(PRONUNCIATION_FILE), exist_ok=True)
         with open(PRONUNCIATION_FILE, "w", encoding="utf-8") as f:
             json.dump(entries, f, indent=2, ensure_ascii=False)
-    except OSError:
-        pass  # non-critical; silently skip on disk errors
+    except OSError as e:
+        print(f"[pronunciation] Failed to save dictionary: {e}", file=sys.stderr)
 
 def _default_entries():
     return [
@@ -92,7 +115,7 @@ def open_pronunciation_window(parent):
 
     win = ctk.CTkToplevel(parent)
     win.title("Pronunciation Dictionary")
-    win.geometry("560x580")
+    _center_window(win, 560, 580)
     win.resizable(False, False)
     win.grab_set()
     win.configure(fg_color=C_BG)

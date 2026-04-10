@@ -1,18 +1,18 @@
 """
-license.py — Lemon Squeezy license key validation for TTS Studio.
+license.py — Gumroad license key validation for TTS Studio.
 
 Flow:
   - First GRACE_LAUNCHES launches: app runs freely, status bar shows a countdown.
-  - After grace period: blocking activation dialog shown before app is usable.
-  - On activation: calls Lemon Squeezy /activate, stores key + instance_id locally.
+  - Freemium: Fast mode free forever. Natural: 3 free generations. Enhancement: 3 free uses.
+  - On activation: calls Gumroad /v2/licenses/verify (increment_uses_count=true),
+    stores key locally.
   - Subsequent launches: validated locally; silent background re-validation once
     per session to catch revoked keys.
 
-Grace period math (GRACE_LAUNCHES = 3):
-  Launch 1 → grace, 2 remaining
-  Launch 2 → grace, 1 remaining
-  Launch 3 → grace, 0 remaining  (last free launch)
-  Launch 4 → required            (blocked)
+Gumroad license API:
+  POST https://api.gumroad.com/v2/licenses/verify
+  Body: product_permalink=<id>&license_key=<key>&increment_uses_count=<true|false>
+  Response: { success: true/false, purchase: {...}, uses: N }
 """
 import os
 import json
@@ -28,23 +28,31 @@ _USER_DIR    = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), 
 LICENSE_FILE = os.path.join(_USER_DIR, "license.json")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-GRACE_LAUNCHES = 3
+GRACE_LAUNCHES    = 3
+FREE_NATURAL_USES = 3   # lifetime free Natural (Chatterbox) generations
+FREE_ENHANCE_USES = 3   # lifetime free Resemble Enhance uses
 
-# Replace with your real Lemon Squeezy store URL once the product is live.
-STORE_URL = "https://yourstore.lemonsqueezy.com"
+# Gumroad product permalinks — one per product (monthly vs lifetime)
+PRODUCT_PERMALINK          = "TTSStudioPro"          # monthly
+PRODUCT_PERMALINK_LIFETIME = "TTSStudioProLifetime"  # lifetime
+_ALL_PERMALINKS = (PRODUCT_PERMALINK, PRODUCT_PERMALINK_LIFETIME)
 
-_LS_ACTIVATE   = "https://api.lemonsqueezy.com/v1/licenses/activate"
-_LS_VALIDATE   = "https://api.lemonsqueezy.com/v1/licenses/validate"
-_LS_DEACTIVATE = "https://api.lemonsqueezy.com/v1/licenses/deactivate"
+# Store URLs
+STORE_URL          = "https://cookiestudios.gumroad.com"
+STORE_URL_MONTHLY  = "https://cookiestudios.gumroad.com/l/TTSStudioPro"
+STORE_URL_LIFETIME = "https://cookiestudios.gumroad.com/l/TTSStudioProLifetime"
+
+_GR_VERIFY = "https://api.gumroad.com/v2/licenses/verify"
 
 _TIMEOUT = 10  # seconds for all API calls
 
 _DEFAULT_LICENSE = {
     "key":             None,
-    "instance_id":     None,
     "activated":       False,
     "activation_date": None,
     "launch_count":    0,
+    "natural_uses":    0,
+    "enhance_uses":    0,
 }
 
 
@@ -60,10 +68,8 @@ def load_license(path=None):
         try:
             with open(target, encoding="utf-8") as f:
                 data = json.load(f)
-            # Reject non-dict values (e.g. a list or null from corrupt writes)
             if not isinstance(data, dict):
                 return _DEFAULT_LICENSE.copy()
-            # Forward-compatible: add missing keys introduced in later versions
             for k, v in _DEFAULT_LICENSE.items():
                 if k not in data:
                     data[k] = v
@@ -76,14 +82,14 @@ def load_license(path=None):
 def save_license(data, path=None):
     """
     Persist license data to disk.
-    Returns True on success, False if the write failed (disk full, read-only, etc.).
+    Returns True on success, False if the write failed.
     Never raises.
     """
     target = path or LICENSE_FILE
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
     except OSError:
-        pass  # attempt the write anyway; open() will fail if dir truly missing
+        pass
 
     try:
         with open(target, "w", encoding="utf-8") as f:
@@ -95,60 +101,40 @@ def save_license(data, path=None):
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 def _extract_error(resp):
-    """
-    Pull the most useful error string from a Lemon Squeezy error response.
-    Handles several LS response shapes and maps HTTP status codes to plain
-    English when no message is present.
-    """
-    # Network / transport errors added by _ls_post
+    """Pull the most useful error string from a Gumroad error response."""
     if resp.get("_network_error"):
         return resp.get("error", "Network error. Check your internet connection.")
 
-    # Plain string fields
-    for field in ("error", "message"):
-        val = resp.get(field)
-        if val and isinstance(val, str):
-            return val.strip()
+    # Gumroad returns {"success": false, "message": "..."} on failure
+    msg = resp.get("message")
+    if msg and isinstance(msg, str):
+        return msg.strip()
 
-    # JSON:API errors array  {"errors": [{"detail": "..."}]}
-    errors = resp.get("errors")
-    if isinstance(errors, list) and errors:
-        item = errors[0]
-        for key in ("detail", "title"):
-            if item.get(key):
-                return str(item[key])
-
-    # Fall back to HTTP status code hints
     code = resp.get("_status_code")
-    if code == 400:
-        return "Invalid license key format."
     if code == 404:
-        return "License key not found."
-    if code == 422:
-        return "This license key has reached its activation limit or is invalid."
+        return "License key not found. Check that you entered it correctly."
     if code == 403:
-        return "This license key has been disabled or revoked."
+        return "This license key has been disabled or refunded."
     if code == 429:
-        return "Too many activation attempts. Please wait a moment and try again."
+        return "Too many attempts. Please wait a moment and try again."
 
     return "Activation failed. Check your key and try again."
 
 
-def _ls_post(url, params):
+def _gr_post(params):
     """
-    POST form data to a Lemon Squeezy endpoint.
-    Returns (ok: bool, response: dict).
-    Never raises — all exceptions are caught and returned as error dicts.
+    POST to Gumroad /v2/licenses/verify.
+    Returns (ok: bool, response: dict). Never raises.
     """
     try:
         data = urllib.parse.urlencode(params).encode()
-        req  = urllib.request.Request(url, data=data, method="POST")
+        req  = urllib.request.Request(_GR_VERIFY, data=data, method="POST")
         req.add_header("Accept", "application/json")
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
             try:
                 return True, json.loads(resp.read())
             except (json.JSONDecodeError, ValueError):
-                return False, {"error": "Server returned an unreadable response."}
+                return False, {"message": "Server returned an unreadable response."}
 
     except urllib.error.HTTPError as e:
         try:
@@ -189,12 +175,9 @@ def _ls_post(url, params):
 # ── Public API ────────────────────────────────────────────────────────────────
 def activate_license(key, path=None):
     """
-    Activate a license key on this machine via Lemon Squeezy.
+    Activate a license key via Gumroad (increments use count).
+    Tries monthly permalink first, then lifetime — covers both products.
     Saves the result to license.json on success.
-
-    Args:
-        key:  The license key string entered by the user.
-        path: Override for the license file path (used in tests).
 
     Returns:
         (success: bool, message: str)
@@ -203,24 +186,20 @@ def activate_license(key, path=None):
     if not key:
         return False, "Please enter a license key."
 
-    instance_name = socket.gethostname() or "TTS Studio"
-    ok, resp = _ls_post(_LS_ACTIVATE, {
-        "license_key":   key,
-        "instance_name": instance_name,
-    })
+    ok, resp = False, {}
+    for permalink in _ALL_PERMALINKS:
+        ok, resp = _gr_post({
+            "product_permalink":    permalink,
+            "license_key":          key,
+            "increment_uses_count": "true",
+        })
+        if ok and resp.get("success") is True:
+            break  # found the right product
 
-    if ok and resp.get("activated") is True:
-        instance_id = (resp.get("instance") or {}).get("id")
-        if not instance_id:
-            return False, (
-                "Server confirmed activation but did not return an instance ID. "
-                "Please try again or contact support."
-            )
-
+    if ok and resp.get("success") is True:
         lic = load_license(path)
         lic.update({
             "key":             key,
-            "instance_id":     instance_id,
             "activated":       True,
             "activation_date": datetime.now().isoformat(),
         })
@@ -228,11 +207,10 @@ def activate_license(key, path=None):
         saved = save_license(lic, path)
         if not saved:
             return False, (
-                "License was activated on the server but could not be saved locally. "
+                "License was activated but could not be saved locally. "
                 "Check that your disk is not full or write-protected."
             )
 
-        # Double-check the file actually persisted
         verify = load_license(path)
         if not verify.get("activated") or verify.get("key") != key:
             return False, (
@@ -245,67 +223,123 @@ def activate_license(key, path=None):
     return False, _extract_error(resp)
 
 
-def validate_license_silent(key, instance_id):
+def validate_license_silent(key):
     """
-    Re-validate against Lemon Squeezy (call from a background thread).
-    Returns True if confirmed valid, False if revoked OR if network is down.
-    The caller should treat False as "could not confirm" rather than "definitely revoked"
-    when network errors are possible — check `_network_error` if you need the distinction.
+    Re-validate against Gumroad (call from a background thread).
+    Tries monthly permalink first, then lifetime — covers both products.
+    Returns True if confirmed valid, False if revoked.
+    Network errors return True (benefit of the doubt — don't punish offline users).
     """
-    key         = (key or "").strip()
-    instance_id = (instance_id or "").strip()
-    if not key or not instance_id:
+    key = (key or "").strip()
+    if not key:
         return False
 
-    ok, resp = _ls_post(_LS_VALIDATE, {
-        "license_key": key,
-        "instance_id": instance_id,
-    })
-    # Network errors are not revocations — treat them as "unable to confirm"
-    # (caller should decide whether to penalise the user)
-    if resp.get("_network_error"):
-        return True   # benefit of the doubt; don't punish offline users
+    for permalink in _ALL_PERMALINKS:
+        ok, resp = _gr_post({
+            "product_permalink":    permalink,
+            "license_key":          key,
+            "increment_uses_count": "false",
+        })
+        if resp.get("_network_error"):
+            return True  # can't reach server — assume valid, check again next session
+        if ok and resp.get("success") is True:
+            return True
 
-    return ok and resp.get("valid") is True
+    return False
 
 
 def deactivate_license(path=None):
     """
-    Deactivate this machine's license (e.g. before moving to a new PC).
-    Clears the local license file on success.
+    Deactivate (forget) the license on this machine.
+    Gumroad has no server-side deactivation endpoint, so we clear locally.
+    The key's use count on Gumroad is not decremented — user should contact
+    support if they need a seat freed.
 
     Returns:
         (success: bool, message: str)
     """
     lic = load_license(path)
-    key         = (lic.get("key") or "").strip()
-    instance_id = (lic.get("instance_id") or "").strip()
-
-    if not key or not instance_id:
+    if not lic.get("activated"):
         return False, "No active license found on this machine."
 
-    ok, resp = _ls_post(_LS_DEACTIVATE, {
-        "license_key": key,
-        "instance_id": instance_id,
-    })
+    cleared = {
+        "key":             None,
+        "activated":       False,
+        "activation_date": None,
+        "launch_count":    lic.get("launch_count", 0),
+        "natural_uses":    lic.get("natural_uses", 0),
+        "enhance_uses":    lic.get("enhance_uses", 0),
+    }
+    saved = save_license(cleared, path)
+    if not saved:
+        return False, (
+            "Could not clear license file locally. "
+            "Check that your disk is not full or write-protected."
+        )
+    return True, (
+        "License removed from this machine. "
+        "To move to a new PC, contact support to reset your seat."
+    )
 
-    if ok and resp.get("deactivated") is True:
-        cleared = {
-            "key":             None,
-            "instance_id":     None,
-            "activated":       False,
-            "activation_date": None,
-            "launch_count":    lic.get("launch_count", 0),
-        }
-        saved = save_license(cleared, path)
-        if not saved:
-            return False, (
-                "License was deactivated on the server but could not be saved locally. "
-                "Check that your disk is not full or write-protected."
-            )
-        return True, "License deactivated. You can now activate on another machine."
 
-    return False, _extract_error(resp)
+# ── Freemium usage helpers ────────────────────────────────────────────────────
+def is_pro(path=None):
+    """Return True if this machine has an activated Pro license."""
+    return load_license(path).get("activated", False)
+
+
+def can_use_natural(path=None):
+    """Return True if the user may start a Natural mode generation."""
+    lic = load_license(path)
+    if lic.get("activated"):
+        return True
+    return lic.get("natural_uses", 0) < FREE_NATURAL_USES
+
+
+def natural_uses_remaining(path=None):
+    """Return how many free Natural uses remain, or None if Pro (unlimited)."""
+    lic = load_license(path)
+    if lic.get("activated"):
+        return None
+    return max(0, FREE_NATURAL_USES - lic.get("natural_uses", 0))
+
+
+def record_natural_use(path=None):
+    """Increment the Natural use counter. No-op for Pro users. Never raises."""
+    try:
+        lic = load_license(path)
+        if not lic.get("activated"):
+            lic["natural_uses"] = lic.get("natural_uses", 0) + 1
+            save_license(lic, path)
+    except Exception:
+        pass
+
+
+def can_use_enhance(path=None):
+    """Return True if the user may run Resemble Enhance."""
+    lic = load_license(path)
+    if lic.get("activated"):
+        return True
+    return lic.get("enhance_uses", 0) < FREE_ENHANCE_USES
+
+
+def enhance_uses_remaining(path=None):
+    """Return how many free Enhance uses remain, or None if Pro (unlimited)."""
+    lic = load_license(path)
+    if lic.get("activated"):
+        return None
+    return max(0, FREE_ENHANCE_USES - lic.get("enhance_uses", 0))
+
+
+def record_enhance_use(path=None):
+    """Increment the Enhance use counter. No-op for Pro users. Never raises."""
+    try:
+        lic = load_license(path)
+        if not lic.get("activated"):
+            lic["enhance_uses"] = lic.get("enhance_uses", 0) + 1
+            save_license(lic, path)
+    except Exception:
+        pass
 
 
 def check_startup(path=None):
@@ -326,9 +360,8 @@ def check_startup(path=None):
     lic["launch_count"] = count
     save_license(lic, path)
 
-    # Launch 1..GRACE_LAUNCHES are free; launch GRACE_LAUNCHES+1 is blocked.
     if count <= GRACE_LAUNCHES:
-        remaining = GRACE_LAUNCHES - count   # free launches left AFTER this one
+        remaining = GRACE_LAUNCHES - count
         return "grace", remaining
 
     return "required", 0

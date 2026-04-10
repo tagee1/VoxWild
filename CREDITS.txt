@@ -1,0 +1,172 @@
+TTS Studio — Open Source Credits
+==================================
+Copyright (c) 2025-2026 Cookie Studios. All rights reserved.
+
+TTS Studio is built on the shoulders of the following open-source projects.
+We are grateful to their authors and contributors.
+
+────────────────────────────────────────────────────────────────────────────
+SPEECH SYNTHESIS
+────────────────────────────────────────────────────────────────────────────
+
+Kokoro TTS v1.0
+  License : Apache 2.0
+  Source  : https://github.com/hexgrad/kokoro
+  Notes   : Fast ONNX-based neural TTS engine. Apache 2.0 permits commercial
+            use with attribution.
+
+kokoro-onnx (Python bindings)
+  License : Apache 2.0
+  Source  : https://github.com/thewh1teagle/kokoro-onnx
+
+Chatterbox TTS
+  License : MIT
+  Source  : https://github.com/ResembleAI/chatterbox
+  Notes   : Natural-sounding neural TTS by Resemble AI. Natural mode output
+            includes an inaudible AI watermark via the Perth library (see below).
+
+Perth Watermarker
+  License : MIT
+  Source  : https://github.com/resemble-ai/perth
+  Notes   : Imperceptible neural watermark embedded in all Chatterbox output.
+
+────────────────────────────────────────────────────────────────────────────
+USER INTERFACE
+────────────────────────────────────────────────────────────────────────────
+
+CustomTkinter 5.x
+  License : MIT
+  Source  : https://github.com/TomSchimansky/CustomTkinter
+
+Pillow (PIL Fork)
+  License : HPND (Historical Permission Notice and Disclaimer)
+  Source  : https://github.com/python-pillow/Pillow
+
+darkdetect
+  License : BSD-3-Clause
+  Source  : https://github.com/albertosottile/darkdetect
+
+────────────────────────────────────────────────────────────────────────────
+AUDIO
+────────────────────────────────────────────────────────────────────────────
+
+sounddevice
+  License : MIT
+  Source  : https://github.com/spatialaudio/python-sounddevice
+
+soundfile (libsndfile bindings)
+  License : BSD-3-Clause
+  Source  : https://github.com/bastibe/python-soundfile
+
+pedalboard
+  License : Apache 2.0
+  Source  : https://github.com/spotify/pedalboard
+  Notes   : Audio effects pipeline used for optional audio cleanup
+            (high-pass filter, noise gate, compressor).
+
+noisereduce (optional)
+  License : MIT
+  Source  : https://github.com/timsainb/noisereduce
+  Notes   : Optional AI noise reduction mode. Not bundled by default;
+            installed separately if the user enables AI cleanup mode.
+
+resemble-enhance
+  License : MIT
+  Source  : https://github.com/resemble-ai/resemble-enhance
+  Notes   : AI audio enhancement used in the optional Enhancement panel.
+            MIT permits commercial use with attribution.
+
+lameenc
+  License : LGPL-3.0
+  Source  : https://github.com/gypified/libmp3lame (engine); https://github.com/natesheehan/lameenc (Python bindings)
+  Notes   : MP3 encoding for the "Save as MP3" export feature. The compiled
+            module is distributed unmodified per LGPL-3.0. Source code for
+            the LAME encoder is available at the source URL above.
+
+────────────────────────────────────────────────────────────────────────────
+MACHINE LEARNING & NUMERIC
+────────────────────────────────────────────────────────────────────────────
+
+ONNX Runtime
+  License : MIT
+  Source  : https://github.com/microsoft/onnxruntime
+
+PyTorch
+  License : BSD-3-Clause
+  Source  : https://github.com/pytorch/pytorch
+
+torchaudio
+  License : BSD-2-Clause
+  Source  : https://github.com/pytorch/audio
+
+NumPy
+  License : BSD-3-Clause
+  Source  : https://github.com/numpy/numpy
+
+SciPy
+  License : BSD-3-Clause
+  Source  : https://github.com/scipy/scipy
+
+────────────────────────────────────────────────────────────────────────────
+TEXT PROCESSING
+────────────────────────────────────────────────────────────────────────────
+
+phonemizer-fork
+  License : GPL-3.0
+  Source  : https://github.com/bootphon/phonemizer
+  Notes   : Text-to-phoneme conversion used internally by Kokoro TTS.
+
+espeakng-loader
+  License : GPL-3.0
+  Source  : https://github.com/thewh1teagle/espeakng-loader
+  Notes   : Bundles eSpeak-NG for phonemizer. eSpeak-NG is GPL-3.0.
+
+────────────────────────────────────────────────────────────────────────────
+NETWORKING & MODEL DISTRIBUTION
+────────────────────────────────────────────────────────────────────────────
+
+Requests
+  License : Apache 2.0
+  Source  : https://github.com/psf/requests
+  Notes   : Used for license key validation against the Gumroad API.
+
+certifi
+  License : MPL-2.0
+  Source  : https://github.com/certifi/python-certifi
+
+huggingface_hub
+  License : Apache 2.0
+  Source  : https://github.com/huggingface/huggingface_hub
+  Notes   : Used to download the Chatterbox Natural mode model (~3 GB) from
+            Hugging Face on first use. Apache 2.0 permits commercial use.
+
+────────────────────────────────────────────────────────────────────────────
+LICENSE TEXTS
+────────────────────────────────────────────────────────────────────────────
+
+Full license texts for each library are available at the source URLs above
+or within the respective packages installed alongside this application.
+
+MIT License (short form):
+  Permission is hereby granted, free of charge, to any person obtaining a
+  copy of this software and associated documentation files, to deal in the
+  Software without restriction, including without limitation the rights to
+  use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the above copyright notice and this
+  permission notice.
+
+Apache 2.0 and BSD licenses permit commercial use with attribution, which
+this file provides.
+
+GPL-3.0 libraries (phonemizer-fork, eSpeak-NG) are used as unmodified
+runtime dependencies; TTS Studio does not modify their source code. Source
+code for these libraries is available at the URLs listed above.
+
+LGPL-3.0 libraries (lameenc) are distributed as unmodified compiled modules.
+Source code is available at the URL listed above, allowing users to re-link
+with a modified version of the library per LGPL-3.0 Section 4(d)(0).
+
+────────────────────────────────────────────────────────────────────────────
+TTS Studio itself is proprietary software. See EULA.rtf for terms of use.
+Copyright (c) 2025-2026 Cookie Studios. All rights reserved.

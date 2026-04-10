@@ -114,7 +114,7 @@ def fmt_err(e):
       E010 — Voice clone recording too quiet
       E011 — Voice clone recording too short
       E012 — Failed to reset voice conditioning (default voice switch)
-      E013 — Audio cleanup failed (pedalboard or noisereduce error)
+      E013 — Audio enhancement failed (resemble-enhance error)
       E099 — Unknown / unrecognised error
     """
     raw  = str(e).lower()
@@ -124,8 +124,8 @@ def fmt_err(e):
         return f"{msg}  [{code}]"
 
     # ── Memory / RAM ──────────────────────────────────────────────────────────
-    if any(k in raw for k in ("out of memory", "not enough memory", "memoryerror",
-                               "paging file", "winerror 1455", "cannot allocate")):
+    if any(k in raw for k in ("out of memory", "not enough memory", "not enough ram",
+                               "memoryerror", "paging file", "winerror 1455", "cannot allocate")):
         return _r("Not enough RAM — close other apps and try again", "E001")
 
     # ── Audio device ──────────────────────────────────────────────────────────
@@ -161,8 +161,12 @@ def fmt_err(e):
         return _r("Voice clone recording is too short — use at least 6 seconds of clear speech", "E011")
     if "failed to reset voice conditioning" in raw or "e012" in raw:
         return _r("Failed to reset to default voice — restart Natural mode to recover", "E012")
-    if "audio cleanup" in raw or "e013" in raw:
-        return _r("Audio cleanup failed — generation saved without cleanup", "E013")
+    if "e013" in raw or "enhancement" in raw or "resemble" in raw:
+        # Re-surface the descriptive message from enhance_audio rather than
+        # collapsing it — strip the tag and pass through the detail.
+        detail = full.replace("  [E013]", "").replace(" [E013]", "")
+        first = next((l.strip() for l in detail.splitlines() if l.strip()), detail)
+        return _r(first[:180], "E013")
 
     # ── Audio file format ─────────────────────────────────────────────────────
     if any(k in raw for k in ("sndfile", "unknown format", "could not read",
@@ -206,3 +210,28 @@ def build_srt(segments):
         lines.append(text)
         lines.append("")
     return "\n".join(lines)
+
+
+# ── History card display helpers ──────────────────────────────────────────────
+
+def history_card_preview(text: str, max_chars: int = 100) -> str:
+    """Return a single-line, length-capped preview string for history cards."""
+    preview = text.replace("\n", " ").strip()
+    if len(preview) > max_chars:
+        preview = preview[:max_chars] + "…"
+    return preview
+
+
+def history_card_voice_label(voice: str, max_len: int = 18) -> str:
+    """Shorten a voice profile name for display in a narrow history card.
+
+    Rules (applied in order):
+    1. If the name contains ' - ', take only the part after the last ' - '.
+    2. Strip ' (Best)' suffix.
+    3. If still longer than max_len, truncate with '…'.
+    """
+    short = voice.split(" - ")[-1].replace(" (Best)", "") if " - " in voice else voice
+    short = short.strip()
+    if len(short) > max_len:
+        short = short[: max_len - 1] + "…"
+    return short
