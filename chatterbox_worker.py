@@ -26,14 +26,23 @@ import copy
 #
 # torchaudio loads libtorchaudio.pyd via ctypes.CDLL, so its dependencies
 # (torch DLLs) must be on PATH. We add all relevant DLL dirs to both.
+#
+# We use sysconfig.get_path("purelib") instead of hardcoding "Lib\site-packages"
+# because the embeddable Python (python_embed) may place site-packages at a
+# different path than a regular virtualenv (chatterbox_env).
 if os.name == "nt":
-    _py_dir       = os.path.dirname(os.path.abspath(sys.executable))
-    _torch_lib    = os.path.join(_py_dir, "Lib", "site-packages", "torch",      "lib")
-    _taudio_lib   = os.path.join(_py_dir, "Lib", "site-packages", "torchaudio", "lib")
-    _scripts_dir  = os.path.join(_py_dir, "Scripts")
+    import sysconfig as _sc
+    _py_dir      = os.path.dirname(os.path.abspath(sys.executable))
+    _sp          = _sc.get_path("purelib")   # actual site-packages for this interpreter
+    _torch_lib   = os.path.join(_sp, "torch",      "lib")
+    _taudio_lib  = os.path.join(_sp, "torchaudio", "lib")
+    _scripts_dir = os.path.join(_py_dir, "Scripts")
 
     _dll_dirs = [d for d in [_py_dir, _scripts_dir, _torch_lib, _taudio_lib]
                  if os.path.isdir(d)]
+
+    # Keep a copy for diagnostic logging in main() — the rest of the temps are deleted below.
+    _registered_dll_dirs = list(_dll_dirs)
 
     # 1. PATH — for ctypes.CDLL / LoadLibraryW dependency resolution
     os.environ["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + os.environ.get("PATH", "")
@@ -45,7 +54,27 @@ if os.name == "nt":
     if hasattr(os, "add_dll_directory"):
         _dll_handles = [os.add_dll_directory(_d) for _d in _dll_dirs]
 
-    del _py_dir, _torch_lib, _taudio_lib, _scripts_dir, _dll_dirs
+    del _sc, _py_dir, _sp, _torch_lib, _taudio_lib, _scripts_dir, _dll_dirs
+
+    # 3. VCOMP140.DLL — the VC++ OpenMP runtime required by libtorchaudio.pyd.
+    # On machines without the Visual C++ Redistributable, this DLL is absent from
+    # System32. We bundle vcomp140.dll alongside the worker script in the
+    # installer. Copy it to torchaudio\lib\ (the directory Windows searches first
+    # when loading libtorchaudio.pyd) so it is always found at runtime.
+    try:
+        import shutil as _shutil, sysconfig as _sc2
+        _worker_dir  = os.path.dirname(os.path.abspath(__file__))
+        _vcomp_src   = os.path.join(_worker_dir, "vcomp140.dll")
+        _sp2         = _sc2.get_path("purelib")
+        _taudio_lib2 = os.path.join(_sp2, "torchaudio", "lib")
+        _vcomp_dst   = os.path.join(_taudio_lib2, "vcomp140.dll")
+        if (os.path.isfile(_vcomp_src)
+                and os.path.isdir(_taudio_lib2)
+                and not os.path.isfile(_vcomp_dst)):
+            _shutil.copy2(_vcomp_src, _vcomp_dst)
+        del _shutil, _sc2, _worker_dir, _vcomp_src, _sp2, _taudio_lib2, _vcomp_dst
+    except Exception:
+        pass
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Save the real stdout for our JSON protocol BEFORE anything else touches it

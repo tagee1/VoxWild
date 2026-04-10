@@ -32,6 +32,7 @@ _datas = [
     ("logo.png",              "."),
     ("theme.json",            "."),
     ("chatterbox_worker.py",  "."),  # run by chatterbox_env python, not imported
+    ("vcomp140.dll",          "."),  # OpenMP runtime — copied to torchaudio\lib during Natural mode setup
 
     # ── customtkinter (themes, images, assets) ─────────────────────────────
     (os.path.join(SP, "customtkinter"), "customtkinter"),

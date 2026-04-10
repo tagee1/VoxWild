@@ -689,6 +689,21 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
         on_failure(f"Failed to install Chatterbox: {e}")
         return
 
+    # ── Step 5: copy VCOMP140.DLL into torchaudio\lib\ ───────────────────────────
+    # torchaudio's libtorchaudio.pyd links to VCOMP140.DLL (the VC++ OpenMP runtime).
+    # On machines without the Visual C++ Redistributable, this DLL is missing from
+    # System32 and causes E099. We bundle vcomp140.dll with the installer and copy
+    # it right next to libtorchaudio.pyd so Windows finds it automatically.
+    try:
+        import shutil as _shutil
+        _vcomp_src = _res("vcomp140.dll")
+        _taudio_lib_dir = os.path.join(python_dir, "Lib", "site-packages", "torchaudio", "lib")
+        if os.path.exists(_vcomp_src) and os.path.isdir(_taudio_lib_dir):
+            _shutil.copy2(_vcomp_src, os.path.join(_taudio_lib_dir, "vcomp140.dll"))
+        del _shutil, _vcomp_src, _taudio_lib_dir
+    except Exception:
+        pass  # non-fatal — machines with VC++ Redistributable already have it in System32
+
     if not os.path.exists(python_exe):
         on_failure("Setup finished but Python not found — please try again.")
         return
