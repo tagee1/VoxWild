@@ -419,7 +419,8 @@ def main():
                 del _t
             return embeds, len_cond
         model.t3.prepare_input_embeds = _safe_prepare_input_embeds
-        del _orig_pie, _safe_prepare_input_embeds
+        # Do NOT del _orig_pie — _safe_prepare_input_embeds closes over it.
+        # Deleting the local binding empties the closure cell → NameError on call.
     except Exception:
         pass
     # ─────────────────────────────────────────────────────────────────────────

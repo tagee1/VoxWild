@@ -466,6 +466,55 @@ class TestCFGPatchLogic(unittest.TestCase):
                                msg="batch mismatch must raise without the fix"):
             torch.cat([embeds, bos_embed], dim=1)
 
+    def test_closure_survives_after_orig_deleted(self):
+        """
+        Regression for the 'del _orig_pie' bug shipped in an early build.
+
+        The patched function closes over _orig_pie.  If _orig_pie is deleted
+        from the enclosing scope after patching, Python empties the closure
+        cell and the function raises:
+            NameError: cannot access free variable '_orig_pie'
+        on the first call — even though the patch appeared to apply correctly.
+
+        Verify: calling the patched function AFTER deleting _orig_pie from the
+        local namespace raises NameError.  Then verify the worker's current
+        code does NOT do this (i.e. the function works after the try-block exits).
+        """
+        torch = self.torch
+        EMBED_DIM, SEQ_LEN = 16, 10
+
+        def make_orig():
+            return lambda *, t3_cond, text_tokens, speech_tokens, cfg_weight=0.0: (
+                torch.zeros(1, SEQ_LEN, EMBED_DIM), 5
+            )
+
+        # ── demonstrate the bug ──────────────────────────────────────────────
+        _orig_buggy = make_orig()
+        def _buggy_patch(*, t3_cond, text_tokens, speech_tokens, cfg_weight=0.0):
+            embeds, lc = _orig_buggy(
+                t3_cond=t3_cond, text_tokens=text_tokens,
+                speech_tokens=speech_tokens, cfg_weight=cfg_weight)
+            if cfg_weight > 0.0 and embeds.size(0) == 1:
+                embeds = embeds.expand(2, -1, -1).contiguous()
+            return embeds, lc
+        del _orig_buggy   # ← the bug: empties the closure cell
+
+        with self.assertRaises(NameError,
+                               msg="Deleting _orig_pie must cause NameError on call"):
+            _buggy_patch(t3_cond=None, text_tokens=None,
+                         speech_tokens=None, cfg_weight=0.5)
+
+        # ── verify the fix: _make_patch does NOT delete the closure var ──────
+        patched, _ = self._make_patch(original_batch=1)
+        try:
+            embeds, _ = self._call(patched, cfg_weight=0.5)
+        except NameError as e:
+            self.fail(
+                f"Patched function raised NameError — closure was broken: {e}"
+            )
+        self.assertEqual(embeds.size(0), 2,
+                         "Patch must still expand correctly after the block exits")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
