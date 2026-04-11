@@ -383,6 +383,31 @@ def main():
 
     emit({"type": "ready", "sr": model.sr})
 
+    # ── CFG batch-expansion patch ─────────────────────────────────────────────
+    # Older builds of chatterbox-tts==0.1.7 always double bos_embed inside
+    # T3.inference for CFG, but the matching expand of cond_emb inside
+    # prepare_input_embeds may be absent. This causes embeds=batch1 vs
+    # bos_embed=batch2 → RuntimeError when they're cat'd together.
+    # Fix: wrap prepare_input_embeds to guarantee embeds is expanded to
+    # batch=2 whenever cfg_weight > 0, so the cat always succeeds.
+    try:
+        _orig_pie = model.t3.prepare_input_embeds
+        def _safe_prepare_input_embeds(*, t3_cond, text_tokens,
+                                        speech_tokens, cfg_weight=0.0):
+            embeds, len_cond = _orig_pie(
+                t3_cond=t3_cond, text_tokens=text_tokens,
+                speech_tokens=speech_tokens, cfg_weight=cfg_weight)
+            if cfg_weight > 0.0 and embeds.size(0) == 1:
+                import torch as _t
+                embeds = embeds.expand(2, -1, -1).contiguous()
+                del _t
+            return embeds, len_cond
+        model.t3.prepare_input_embeds = _safe_prepare_input_embeds
+        del _orig_pie, _safe_prepare_input_embeds
+    except Exception:
+        pass
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Save default voice conditioning so we can restore it when the user
     # switches back to Default voice. model.generate() mutates model.conds
     # in-place when given an audio prompt, so without this reset, subsequent
@@ -480,30 +505,13 @@ def main():
                         continue
 
                 emit({"type": "status", "msg": "Generating audio..."})
-                try:
-                    wav = model.generate(
-                        text,
-                        audio_prompt_path=audio_prompt,
-                        exaggeration=exaggeration,
-                        cfg_weight=cfg_weight,
-                        temperature=temperature,
-                    )
-                except RuntimeError as _cfg_err:
-                    # Older chatterbox-tts builds double bos_embed for CFG inside
-                    # t3.inference but don't batch text_tokens in generate(), so
-                    # embeds ends up batch=1 while bos_embed is batch=2.
-                    # Retry with cfg_weight=0 to skip the CFG batch doubling.
-                    if "sizes of tensors must match" in str(_cfg_err) and cfg_weight != 0.0:
-                        emit({"type": "status", "msg": "Generating audio (CFG fallback)..."})
-                        wav = model.generate(
-                            text,
-                            audio_prompt_path=audio_prompt,
-                            exaggeration=exaggeration,
-                            cfg_weight=0.0,
-                            temperature=temperature,
-                        )
-                    else:
-                        raise
+                wav = model.generate(
+                    text,
+                    audio_prompt_path=audio_prompt,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                    temperature=temperature,
+                )
 
                 emit({"type": "status", "msg": "Saving chunk..."})
                 torchaudio.save(out_path, wav, model.sr)
