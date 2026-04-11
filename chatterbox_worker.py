@@ -325,6 +325,10 @@ def main():
         class _NoOpWatermarker:
             def __call__(self, wav, sr=None):
                 return wav
+            def apply_watermark(self, wav, sample_rate=None):
+                import numpy as _np
+                if hasattr(wav, 'numpy'): return wav.numpy()
+                return _np.asarray(wav)
         _perth_stub.PerthImplicitWatermarker = _NoOpWatermarker
         sys.modules["perth"] = _perth_stub
         del _types, _perth_stub, _NoOpWatermarker
