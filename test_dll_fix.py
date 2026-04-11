@@ -253,142 +253,151 @@ class TestDllHandleLifetime(unittest.TestCase):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 2. PATH update
+# 2. PATH update — runs the REAL worker fix code, patches sysconfig
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TestPathUpdate(unittest.TestCase):
-    """The fix prepends DLL dirs to os.environ['PATH']."""
+    """
+    The module-level DLL fix in chatterbox_worker.py must prepend the correct
+    directories to PATH.  These tests execute the REAL fix code (via exec) and
+    control the site-packages path by patching sysconfig.get_path — so if the
+    worker ever changes its path-resolution strategy the tests will fail and
+    tell us immediately.
 
-    def _run_with_fake_dirs(self, existing_dirs):
-        """
-        Run the fix code where os.path.isdir returns True only for existing_dirs.
-        Returns the PATH value seen inside the fix.
-        """
-        original_path = "/original/path"
-        captured = {}
+    Strategy
+    --------
+    1.  Create a real temp directory that mimics a python_embed layout.
+    2.  Patch sys.executable → temp/python.exe  (controls _py_dir)
+    3.  Patch sysconfig.get_path("purelib") → temp/site-packages  (controls _sp)
+    4.  Create whichever sub-dirs should "exist" on disk.
+    5.  Execute the fix block; inspect os.environ["PATH"].
+    """
 
-        def fake_isdir(p):
-            return p in existing_dirs
+    def setUp(self):
+        self._path_backup = os.environ.get("PATH", "")
+
+    def tearDown(self):
+        os.environ["PATH"] = self._path_backup
+
+    # ── shared helper ──────────────────────────────────────────────────────
+
+    def _run_fix_with_layout(self, *, create_subdirs=()):
+        """
+        Execute the real DLL-fix block inside a controlled temp tree.
+
+        Parameters
+        ----------
+        create_subdirs : iterable of str
+            Sub-paths relative to the temp root to create as real directories.
+            E.g. ("site-packages/torch/lib",) creates that directory so isdir
+            returns True for it.
+
+        Returns
+        -------
+        dict with keys:
+            py_dir    – the fake python_embed directory (= temp root)
+            sp        – the fake site-packages directory
+            torch_lib – expected torch/lib path under sp
+            taud_lib  – expected torchaudio/lib path under sp
+            scripts   – expected Scripts path under py_dir
+            path_entries – os.environ["PATH"].split(pathsep) after the fix
+        """
+        code = _extract_fix_code()
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Patch sys.executable so _py_dir is predictable
             fake_exe = os.path.join(tmp, "python.exe")
+            fake_sp  = os.path.join(tmp, "site-packages")
+
+            # Create requested sub-directories so os.path.isdir returns True
+            for sub in create_subdirs:
+                os.makedirs(os.path.join(tmp, sub), exist_ok=True)
+
+            torch_lib = os.path.join(fake_sp, "torch",      "lib")
+            taud_lib  = os.path.join(fake_sp, "torchaudio", "lib")
+            scripts   = os.path.join(tmp,     "Scripts")
+
             with patch.object(sys, "executable", fake_exe):
-                with patch.dict(os.environ, {"PATH": original_path}):
-                    with patch("os.add_dll_directory", return_value=MagicMock()):
-                        with patch("os.path.isdir", side_effect=fake_isdir):
-                            # Manually run the fix logic (mirrors chatterbox_worker.py)
-                            _py_dir      = os.path.dirname(os.path.abspath(sys.executable))
-                            _torch_lib   = os.path.join(_py_dir, "Lib", "site-packages", "torch",      "lib")
-                            _taudio_lib  = os.path.join(_py_dir, "Lib", "site-packages", "torchaudio", "lib")
-                            _scripts_dir = os.path.join(_py_dir, "Scripts")
+                with patch("sysconfig.get_path", return_value=fake_sp):
+                    with patch.dict(os.environ, {"PATH": "/original/path"}):
+                        with patch("os.add_dll_directory", return_value=MagicMock()):
+                            ns = {"__builtins__": __builtins__, "os": os, "sys": sys}
+                            exec(compile(code, str(_WORKER_PATH), "exec"), ns)
 
-                            _dll_dirs = [d for d in [_py_dir, _scripts_dir, _torch_lib, _taudio_lib]
-                                         if os.path.isdir(d)]
+                        path_entries = os.environ["PATH"].split(os.pathsep)
 
-                            os.environ["PATH"] = (
-                                os.pathsep.join(_dll_dirs) + os.pathsep +
-                                os.environ.get("PATH", "")
-                            )
-                            captured["path"]     = os.environ["PATH"]
-                            captured["dll_dirs"] = _dll_dirs
+        return {
+            "py_dir":       tmp,
+            "sp":           fake_sp,
+            "torch_lib":    torch_lib,
+            "taud_lib":     taud_lib,
+            "scripts":      scripts,
+            "path_entries": path_entries,
+        }
 
-        return captured, original_path
+    # ── tests ─────────────────────────────────────────────────────────────
 
     def test_original_path_preserved(self):
-        """Original PATH entries appear after the prepended DLL dirs."""
-        captured, original = self._run_with_fake_dirs(set())
-        self.assertIn(original, captured["path"])
+        """Original PATH entries survive after the fix prepends DLL dirs."""
+        result = self._run_fix_with_layout()
+        self.assertIn("/original/path", result["path_entries"])
 
-    def test_existing_dirs_prepended(self):
-        """Each existing DLL dir appears before the original PATH."""
-        with tempfile.TemporaryDirectory() as tmp:
-            fake_exe = os.path.join(tmp, "python.exe")
-            _py_dir = tmp
-            scripts = os.path.join(tmp, "Scripts")
-            os.makedirs(scripts, exist_ok=True)
-            original = "/old/path"
+    @unittest.skipUnless(os.name == "nt", "Windows-only fix")
+    def test_torch_lib_prepended_when_it_exists(self):
+        """torch/lib is prepended to PATH when the directory exists on disk."""
+        result = self._run_fix_with_layout(
+            create_subdirs=("site-packages/torch/lib",)
+        )
+        self.assertIn(result["torch_lib"], result["path_entries"],
+                      "torch/lib must appear in PATH when it exists")
+        # Must come before the original path
+        torch_idx    = result["path_entries"].index(result["torch_lib"])
+        original_idx = result["path_entries"].index("/original/path")
+        self.assertLess(torch_idx, original_idx,
+                        "torch/lib must be prepended (before original PATH)")
 
-            with patch.object(sys, "executable", fake_exe):
-                with patch.dict(os.environ, {"PATH": original}):
-                    with patch("os.add_dll_directory", return_value=MagicMock()):
-                        _torch   = os.path.join(_py_dir, "Lib", "site-packages", "torch",      "lib")
-                        _taudio  = os.path.join(_py_dir, "Lib", "site-packages", "torchaudio", "lib")
+    @unittest.skipUnless(os.name == "nt", "Windows-only fix")
+    def test_torchaudio_lib_prepended_when_it_exists(self):
+        """torchaudio/lib is prepended to PATH when the directory exists on disk."""
+        result = self._run_fix_with_layout(
+            create_subdirs=("site-packages/torchaudio/lib",)
+        )
+        self.assertIn(result["taud_lib"], result["path_entries"],
+                      "torchaudio/lib must appear in PATH when it exists")
 
-                        def isdir(p):
-                            return p in {_py_dir, scripts}
+    @unittest.skipUnless(os.name == "nt", "Windows-only fix")
+    def test_scripts_dir_prepended_when_it_exists(self):
+        """Scripts dir (under py_dir) is prepended to PATH when it exists."""
+        result = self._run_fix_with_layout(create_subdirs=("Scripts",))
+        self.assertIn(result["scripts"], result["path_entries"],
+                      "Scripts dir must appear in PATH when it exists")
 
-                        with patch("os.path.isdir", side_effect=isdir):
-                            dll_dirs = [d for d in [_py_dir, scripts, _torch, _taudio]
-                                        if os.path.isdir(d)]
-                            os.environ["PATH"] = (
-                                os.pathsep.join(dll_dirs) + os.pathsep +
-                                os.environ.get("PATH", "")
-                            )
-                            path_entries = os.environ["PATH"].split(os.pathsep)
+    @unittest.skipUnless(os.name == "nt", "Windows-only fix")
+    def test_nonexistent_dirs_not_in_path(self):
+        """Directories that don't exist on disk must not appear in PATH."""
+        result = self._run_fix_with_layout()   # create nothing
+        self.assertNotIn(result["torch_lib"], result["path_entries"],
+                         "Missing torch/lib must NOT be in PATH")
+        self.assertNotIn(result["taud_lib"],  result["path_entries"],
+                         "Missing torchaudio/lib must NOT be in PATH")
+        self.assertNotIn(result["scripts"],   result["path_entries"],
+                         "Missing Scripts must NOT be in PATH")
 
-        self.assertIn(_py_dir, path_entries)
-        self.assertIn(scripts, path_entries)
-        # DLL dirs come BEFORE original
-        py_idx  = path_entries.index(_py_dir)
-        old_idx = path_entries.index(original)
-        self.assertLess(py_idx, old_idx, "python_embed dir must precede original PATH")
-
-    def test_nonexistent_dirs_excluded_from_path(self):
-        """Dirs that don't exist on disk are not added to PATH."""
-        captured, _ = self._run_with_fake_dirs(set())  # nothing exists
-        # dll_dirs should be empty → only original PATH remains
-        self.assertEqual(captured["dll_dirs"], [])
-
-    def test_torch_lib_included_when_it_exists(self):
-        """torch/lib is added to PATH when it exists."""
-        with tempfile.TemporaryDirectory() as tmp:
-            fake_exe   = os.path.join(tmp, "python.exe")
-            torch_lib  = os.path.join(tmp, "Lib", "site-packages", "torch", "lib")
-            os.makedirs(torch_lib, exist_ok=True)
-
-            with patch.object(sys, "executable", fake_exe):
-                with patch.dict(os.environ, {"PATH": ""}):
-                    with patch("os.add_dll_directory", return_value=MagicMock()):
-                        _py_dir = os.path.dirname(os.path.abspath(sys.executable))
-                        _torch  = os.path.join(_py_dir, "Lib", "site-packages", "torch",      "lib")
-                        _taud   = os.path.join(_py_dir, "Lib", "site-packages", "torchaudio", "lib")
-                        _scr    = os.path.join(_py_dir, "Scripts")
-
-                        dll_dirs = [d for d in [_py_dir, _scr, _torch, _taud]
-                                    if os.path.isdir(d)]
-                        os.environ["PATH"] = (
-                            os.pathsep.join(dll_dirs) + os.pathsep +
-                            os.environ.get("PATH", "")
-                        )
-                        path_entries = os.environ["PATH"].split(os.pathsep)
-
-        self.assertIn(torch_lib, path_entries)
-
-    def test_torchaudio_lib_included_when_it_exists(self):
-        """torchaudio/lib is added to PATH when it exists."""
-        with tempfile.TemporaryDirectory() as tmp:
-            fake_exe   = os.path.join(tmp, "python.exe")
-            taud_lib   = os.path.join(tmp, "Lib", "site-packages", "torchaudio", "lib")
-            os.makedirs(taud_lib, exist_ok=True)
-
-            with patch.object(sys, "executable", fake_exe):
-                with patch.dict(os.environ, {"PATH": ""}):
-                    with patch("os.add_dll_directory", return_value=MagicMock()):
-                        _py_dir = os.path.dirname(os.path.abspath(sys.executable))
-                        _torch  = os.path.join(_py_dir, "Lib", "site-packages", "torch",      "lib")
-                        _taud   = os.path.join(_py_dir, "Lib", "site-packages", "torchaudio", "lib")
-                        _scr    = os.path.join(_py_dir, "Scripts")
-
-                        dll_dirs = [d for d in [_py_dir, _scr, _torch, _taud]
-                                    if os.path.isdir(d)]
-                        os.environ["PATH"] = (
-                            os.pathsep.join(dll_dirs) + os.pathsep +
-                            os.environ.get("PATH", "")
-                        )
-                        path_entries = os.environ["PATH"].split(os.pathsep)
-
-        self.assertIn(taud_lib, path_entries)
+    @unittest.skipUnless(os.name == "nt", "Windows-only fix")
+    def test_all_existing_dirs_prepended(self):
+        """All four DLL dirs are prepended to PATH when they all exist."""
+        result = self._run_fix_with_layout(create_subdirs=(
+            "site-packages/torch/lib",
+            "site-packages/torchaudio/lib",
+            "Scripts",
+        ))
+        entries = result["path_entries"]
+        for key in ("torch_lib", "taud_lib", "scripts"):
+            self.assertIn(result[key], entries, f"{key} must be in PATH")
+        # All of them must appear before the original path
+        original_idx = entries.index("/original/path")
+        for key in ("torch_lib", "taud_lib", "scripts"):
+            self.assertLess(entries.index(result[key]), original_idx,
+                            f"{key} must precede original PATH")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -522,12 +531,14 @@ class TestWorkerDllFixIntegration(unittest.TestCase):
     def test_path_updated_with_existing_dirs(self):
         """
         After the fix runs, os.environ['PATH'] contains the directories
-        that existed on disk.
+        that existed on disk.  sysconfig.get_path is patched so the worker
+        resolves site-packages to our temp tree, not the real environment.
         """
         with tempfile.TemporaryDirectory() as tmp:
             fake_exe    = os.path.join(tmp, "python.exe")
-            torch_lib   = os.path.join(tmp, "Lib", "site-packages", "torch",      "lib")
-            taud_lib    = os.path.join(tmp, "Lib", "site-packages", "torchaudio", "lib")
+            fake_sp     = os.path.join(tmp, "site-packages")
+            torch_lib   = os.path.join(fake_sp, "torch",      "lib")
+            taud_lib    = os.path.join(fake_sp, "torchaudio", "lib")
             scripts_dir = os.path.join(tmp, "Scripts")
             os.makedirs(torch_lib,   exist_ok=True)
             os.makedirs(taud_lib,    exist_ok=True)
@@ -535,18 +546,19 @@ class TestWorkerDllFixIntegration(unittest.TestCase):
 
             original_path = "/some/original"
             with patch.object(sys, "executable", fake_exe):
-                with patch.dict(os.environ, {"PATH": original_path}):
-                    with patch("os.add_dll_directory", return_value=MagicMock()):
-                        code = _extract_fix_code()
-                        ns = {"__builtins__": __builtins__, "os": os, "sys": sys}
-                        exec(compile(code, str(_WORKER_PATH), "exec"), ns)
+                with patch("sysconfig.get_path", return_value=fake_sp):
+                    with patch.dict(os.environ, {"PATH": original_path}):
+                        with patch("os.add_dll_directory", return_value=MagicMock()):
+                            code = _extract_fix_code()
+                            ns = {"__builtins__": __builtins__, "os": os, "sys": sys}
+                            exec(compile(code, str(_WORKER_PATH), "exec"), ns)
 
-                    path_entries = os.environ["PATH"].split(os.pathsep)
+                        path_entries = os.environ["PATH"].split(os.pathsep)
 
-        self.assertIn(tmp,          path_entries, "python_embed dir must be in PATH")
-        self.assertIn(torch_lib,    path_entries, "torch/lib must be in PATH")
-        self.assertIn(taud_lib,     path_entries, "torchaudio/lib must be in PATH")
-        self.assertIn(scripts_dir,  path_entries, "Scripts must be in PATH")
+        self.assertIn(tmp,           path_entries, "python_embed dir must be in PATH")
+        self.assertIn(torch_lib,     path_entries, "torch/lib must be in PATH")
+        self.assertIn(taud_lib,      path_entries, "torchaudio/lib must be in PATH")
+        self.assertIn(scripts_dir,   path_entries, "Scripts must be in PATH")
         self.assertIn(original_path, path_entries, "Original PATH must be preserved")
 
     @unittest.skipUnless(os.name == "nt", "Windows-only fix")
@@ -588,24 +600,27 @@ class TestWorkerDllFixIntegration(unittest.TestCase):
     def test_add_dll_directory_called_once_per_existing_dir(self):
         """add_dll_directory is called exactly once per directory that exists."""
         with tempfile.TemporaryDirectory() as tmp:
-            fake_exe    = os.path.join(tmp, "python.exe")
-            torch_lib   = os.path.join(tmp, "Lib", "site-packages", "torch",      "lib")
+            fake_exe  = os.path.join(tmp, "python.exe")
+            fake_sp   = os.path.join(tmp, "site-packages")
+            torch_lib = os.path.join(fake_sp, "torch", "lib")
             os.makedirs(torch_lib, exist_ok=True)
             # Scripts and torchaudio/lib intentionally missing
 
             added = []
             with patch.object(sys, "executable", fake_exe):
-                with patch.dict(os.environ, {"PATH": ""}):
-                    with patch("os.add_dll_directory", side_effect=lambda p: (added.append(p), MagicMock())[1]):
-                        code = _extract_fix_code()
-                        ns = {"__builtins__": __builtins__, "os": os, "sys": sys}
-                        exec(compile(code, str(_WORKER_PATH), "exec"), ns)
+                with patch("sysconfig.get_path", return_value=fake_sp):
+                    with patch.dict(os.environ, {"PATH": ""}):
+                        with patch("os.add_dll_directory",
+                                   side_effect=lambda p: (added.append(p), MagicMock())[1]):
+                            code = _extract_fix_code()
+                            ns = {"__builtins__": __builtins__, "os": os, "sys": sys}
+                            exec(compile(code, str(_WORKER_PATH), "exec"), ns)
 
         # tmp (py_dir) and torch_lib exist → 2 calls
         self.assertIn(tmp,       added)
         self.assertIn(torch_lib, added)
-        self.assertNotIn(os.path.join(tmp, "Scripts"),                              added)
-        self.assertNotIn(os.path.join(tmp, "Lib", "site-packages", "torchaudio", "lib"), added)
+        self.assertNotIn(os.path.join(tmp, "Scripts"),                          added)
+        self.assertNotIn(os.path.join(fake_sp, "torchaudio", "lib"),            added)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

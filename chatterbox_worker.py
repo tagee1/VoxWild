@@ -151,6 +151,19 @@ def load_model_from_local(local_dir):
     model.watermarker = watermarker
     return model
 
+def _get_sp():
+    """Return the site-packages directory for this interpreter.
+
+    Uses sysconfig — the only reliable cross-layout resolver.  Works for:
+      • Regular virtualenvs (chatterbox_env)
+      • Embeddable Python zip layouts (python_embed on end-user machines)
+      • PyInstaller frozen processes
+    Never hardcode "Lib/site-packages" — the prefix differs across layouts.
+    """
+    import sysconfig
+    return sysconfig.get_path("purelib")
+
+
 def _scan_missing_dlls(pyd_path):
     """
     Read the PE import table of a .pyd/.dll and check each dependency.
@@ -250,8 +263,7 @@ def _preload_torch_dlls():
     if os.name != "nt":
         return
     import ctypes
-    _py_dir    = os.path.dirname(os.path.abspath(sys.executable))
-    _torch_lib = os.path.join(_py_dir, "Lib", "site-packages", "torch", "lib")
+    _torch_lib = os.path.join(_get_sp(), "torch", "lib")
     if not os.path.isdir(_torch_lib):
         return
     # Load in dependency order: leaves first, dependents after.
@@ -287,11 +299,11 @@ def main():
     # torch must be imported first so its DLLs are in the process table.
     try:
         import torch as _torch_for_scan
-        _py_dir   = os.path.dirname(os.path.abspath(sys.executable))
-        _pyd_path = os.path.join(_py_dir, "Lib", "site-packages",
-                                 "torchaudio", "lib", "libtorchaudio.pyd")
+        _pyd_path = os.path.join(_get_sp(), "torchaudio", "lib", "libtorchaudio.pyd")
         _scan     = _scan_missing_dlls(_pyd_path)
-        _log_path = os.path.join(os.path.dirname(_py_dir), "dll_diagnostic.log")
+        _log_path = os.path.join(
+            os.environ.get("APPDATA", ""), "TTS Studio", "dll_diagnostic.log"
+        )
         with open(_log_path, "w", encoding="utf-8") as _lf:
             _lf.write(f"libtorchaudio.pyd dependency scan:\n")
             for entry in _scan:
