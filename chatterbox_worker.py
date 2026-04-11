@@ -312,6 +312,10 @@ def main():
             class _NoOpWatermarker:
                 def __call__(self, wav, sr=None):
                     return wav
+                def apply_watermark(self, wav, sample_rate=None):
+                    import numpy as _np
+                    if hasattr(wav, 'numpy'): return wav.numpy()
+                    return _np.asarray(wav)
             _perth.PerthImplicitWatermarker = _NoOpWatermarker
             del _NoOpWatermarker
         del _perth
@@ -476,13 +480,30 @@ def main():
                         continue
 
                 emit({"type": "status", "msg": "Generating audio..."})
-                wav = model.generate(
-                    text,
-                    audio_prompt_path=audio_prompt,
-                    exaggeration=exaggeration,
-                    cfg_weight=cfg_weight,
-                    temperature=temperature,
-                )
+                try:
+                    wav = model.generate(
+                        text,
+                        audio_prompt_path=audio_prompt,
+                        exaggeration=exaggeration,
+                        cfg_weight=cfg_weight,
+                        temperature=temperature,
+                    )
+                except RuntimeError as _cfg_err:
+                    # Older chatterbox-tts builds double bos_embed for CFG inside
+                    # t3.inference but don't batch text_tokens in generate(), so
+                    # embeds ends up batch=1 while bos_embed is batch=2.
+                    # Retry with cfg_weight=0 to skip the CFG batch doubling.
+                    if "sizes of tensors must match" in str(_cfg_err) and cfg_weight != 0.0:
+                        emit({"type": "status", "msg": "Generating audio (CFG fallback)..."})
+                        wav = model.generate(
+                            text,
+                            audio_prompt_path=audio_prompt,
+                            exaggeration=exaggeration,
+                            cfg_weight=0.0,
+                            temperature=temperature,
+                        )
+                    else:
+                        raise
 
                 emit({"type": "status", "msg": "Saving chunk..."})
                 torchaudio.save(out_path, wav, model.sr)
