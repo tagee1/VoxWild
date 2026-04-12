@@ -77,8 +77,24 @@ if os.name == "nt":
         pass
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Save the real stdout for our JSON protocol BEFORE anything else touches it
-_proto = sys.stdout
+# ── Binary-mode stdio for IPC ────────────────────────────────────────────────
+# The parent reads/writes our pipes as raw bytes (binary mode) to avoid any
+# encoding mismatch between the child's locale (often cp1252 on Windows) and
+# the parent's expected encoding (utf-8).  We grab the raw binary buffers
+# *underneath* the TextIOWrappers that Python placed on sys.stdout/sys.stdin,
+# so we bypass the child's codec entirely and handle UTF-8 ourselves.
+#
+# sys.stdout.buffer is a BufferedWriter wrapping the pipe fd.  We must grab it
+# BEFORE redirecting sys.stdout to devnull (which replaces both wrapper and buffer).
+if hasattr(sys.stdout, "buffer"):
+    _proto_bin = sys.stdout.buffer          # BufferedWriter over pipe fd
+else:
+    _proto_bin = sys.stdout                 # fallback (shouldn't happen)
+
+if hasattr(sys.stdin, "buffer"):
+    _stdin_bin = sys.stdin.buffer           # BufferedReader over pipe fd
+else:
+    _stdin_bin = sys.stdin                  # fallback
 
 # Redirect stdout during imports so third-party print() spam doesn't corrupt
 # the line-delimited JSON protocol.
@@ -89,7 +105,15 @@ logging.disable(logging.WARNING)
 os.environ["TQDM_DISABLE"] = "1"
 
 def emit(obj):
-    print(json.dumps(obj), file=_proto, flush=True)
+    """Write a JSON line to the parent over the binary pipe.
+
+    Encodes as UTF-8 explicitly, appends \\n, and flushes.  This is immune to
+    the child process's locale / default encoding because we never go through a
+    TextIOWrapper — we write raw bytes directly to the pipe fd's BufferedWriter.
+    """
+    line = json.dumps(obj, ensure_ascii=True) + "\n"
+    _proto_bin.write(line.encode("utf-8"))
+    _proto_bin.flush()
 
 def load_model_from_local(local_dir):
     """Load Chatterbox model step-by-step from local cache with progress messages."""
@@ -292,7 +316,7 @@ def _preload_torch_dlls():
 
 
 def main():
-    emit({"type": "status", "msg": "Starting Natural mode — loading 3 GB model on CPU..."})
+    emit({"type": "status", "msg": "Starting Natural mode - loading model on CPU..."})
     _preload_torch_dlls()
 
     # Scan libtorchaudio.pyd's DLL imports BEFORE attempting to load it.
@@ -412,8 +436,8 @@ def main():
     except Exception:
         _default_conds = None
 
-    for raw in sys.stdin:
-        raw = raw.strip()
+    for raw_bytes in _stdin_bin:
+        raw = raw_bytes.decode("utf-8", errors="replace").strip()
         if not raw:
             continue
         try:

@@ -1,5 +1,20 @@
 import sys
+import os
 import ctypes
+import multiprocessing
+multiprocessing.freeze_support()
+
+# ── Make python_embed packages importable in the frozen app ──────────────────
+# resemble-enhance (and future pip-installed packages) live in python_embed's
+# site-packages. Append (not prepend) so PyInstaller-bundled packages keep
+# priority and only packages NOT in the bundle are resolved from python_embed.
+_embed_sp = os.path.join(
+    os.environ.get("APPDATA", ""), "TTS Studio",
+    "python_embed", "Lib", "site-packages",
+)
+if os.path.isdir(_embed_sp) and _embed_sp not in sys.path:
+    sys.path.append(_embed_sp)
+del _embed_sp
 
 # ── Suppress console windows for ALL subprocesses (torch, resemble-enhance, etc.) ──
 # Any library that calls subprocess.Popen without CREATE_NO_WINDOW would pop a
@@ -19,7 +34,6 @@ import sounddevice as sd
 import soundfile as sf
 import threading
 import numpy as np
-import os
 import json
 import re
 import time
@@ -461,20 +475,34 @@ class ChatterboxEngine:
                 scripts_dir + os.pathsep +
                 env.get("PATH", "")
             )
+            # Force UTF-8 on the worker's stdin/stdout/stderr so the parent
+            # (which reads with encoding="utf-8") never hits a codec mismatch.
+            env["PYTHONIOENCODING"] = "utf-8"
+
+            # Write stderr to a file (not a pipe) to avoid deadlocking on
+            # the 4 GB machine. Pipe-based stderr blocks the worker when the
+            # buffer fills with torch/diffusers warnings and the parent isn't
+            # draining it.  A file avoids this entirely.
+            _stderr_log = os.path.join(
+                os.environ.get("APPDATA", ""), "TTS Studio",
+                "worker_startup_crash.log",
+            )
+            _stderr_fh = open(_stderr_log, "w", encoding="utf-8")
 
             proc = subprocess.Popen(
                 [self.PYTHON, self.WORKER],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,
+                stderr=_stderr_fh,
+                # Binary mode — no text=True, no encoding.
+                # The worker writes UTF-8 bytes directly to the pipe.
+                # We read raw bytes here and decode ourselves.
+                # This eliminates all TextIOWrapper/locale mismatches.
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 env=env,
             )
-            for raw in proc.stdout:
-                raw = raw.strip()
+            for raw_bytes in proc.stdout:
+                raw = raw_bytes.decode("utf-8", errors="replace").strip()
                 if not raw:
                     continue
                 try:
@@ -487,17 +515,32 @@ class ChatterboxEngine:
                 elif msg["type"] == "ready":
                     self._sr   = msg.get("sr", 24000)
                     self._proc = proc
+                    _stderr_fh.close()
                     return
                 elif msg["type"] == "error":
                     proc.kill()
+                    _stderr_fh.close()
                     raise RuntimeError(msg["msg"])
             proc.kill()
-            raise RuntimeError("Chatterbox worker exited during startup.")
+            _stderr_fh.close()
+            # Read back the log for the UI error message.
+            _stderr = ""
+            try:
+                with open(_stderr_log, encoding="utf-8") as _f:
+                    _stderr = _f.read()
+            except Exception:
+                pass
+            _tail = _stderr.strip().splitlines()[-3:] if _stderr.strip() else []
+            _hint = "\n".join(_tail)
+            raise RuntimeError(
+                f"Chatterbox worker exited during startup.\n{_hint}".strip()
+                + "  [E099]"
+            )
 
     def stop(self):
         if self._proc and self._proc.poll() is None:
             try:
-                self._proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                self._proc.stdin.write((json.dumps({"cmd": "quit"}) + "\n").encode("utf-8"))
                 self._proc.stdin.flush()
                 self._proc.wait(timeout=5)
             except Exception:
@@ -528,10 +571,10 @@ class ChatterboxEngine:
             "cfg_weight": cfg_weight,
             "temperature": temperature,
         }
-        self._proc.stdin.write(json.dumps(req) + "\n")
+        self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
         self._proc.stdin.flush()
-        for raw in self._proc.stdout:
-            raw = raw.strip()
+        for raw_bytes in self._proc.stdout:
+            raw = raw_bytes.decode("utf-8", errors="replace").strip()
             if not raw:
                 continue
             try:
@@ -755,7 +798,7 @@ def _save_fx_settings():
         s["fx_gain"]              = gain_slider.get()
         s["fx_noise_gate"]        = noise_gate_var.get()
         s["fx_trim"]              = trim_var.get()
-        s["fx_enhance"]           = enhance_var.get()
+        s["fx_enhance"]           = False  # never persist — see _restore_fx_settings
         s["fx_enhance_mode"]      = enhance_mode.get()
         _save_settings(s)
     except Exception:
@@ -774,8 +817,12 @@ def _restore_fx_settings():
         noise_gate_var.set(s.get("fx_noise_gate",        _FX_DEFAULTS["fx_noise_gate"]))
         trim_var.set(s.get("fx_trim",                    _FX_DEFAULTS["fx_trim"]))
         enhance_mode.set(s.get("fx_enhance_mode",        _FX_DEFAULTS["fx_enhance_mode"]))
-        # enhance_var last — its trace checks for resemble_enhance
-        enhance_var.set(s.get("fx_enhance",              _FX_DEFAULTS["fx_enhance"]))
+        # Never auto-restore the Enhancement checkbox. When checked, the trace
+        # fires _install_resemble_enhance which runs pip against python_embed.
+        # If the user switches to Natural mode while pip is still running, the
+        # worker imports packages that pip is actively modifying → silent crash.
+        # Enhancement must be explicitly opted-in each session.
+        # enhance_var.set(s.get("fx_enhance", _FX_DEFAULTS["fx_enhance"]))
         update_all_labels()
     except Exception:
         pass
@@ -3757,9 +3804,23 @@ def _install_resemble_enhance():
     app.after(0, lambda: _enhance_mode_btn.configure(state="disabled"))
 
     def _pip(*args):
+        if getattr(sys, "frozen", False):
+            # Frozen PyInstaller app: sys.executable is the .exe itself.
+            # Use python_embed's interpreter for pip operations.
+            _py = os.path.join(
+                os.environ.get("APPDATA", ""),
+                "TTS Studio", "python_embed", "python.exe",
+            )
+            if not os.path.exists(_py):
+                raise RuntimeError(
+                    "Natural mode must be set up before Enhancement — "
+                    "switch to Natural mode first."
+                )
+        else:
+            _py = sys.executable
         return subprocess.run(
-            [sys.executable, "-m", "pip", "install", *args],
-            capture_output=True, text=True
+            [_py, "-m", "pip", "install", *args],
+            capture_output=True, text=True,
         )
 
     def _pip_error(r):

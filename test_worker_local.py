@@ -75,15 +75,15 @@ def main():
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        # Binary mode — matches the production binary-pipe protocol.
+        # Worker writes UTF-8 bytes; we decode here.
         cwd=str(REPO),
     )
 
     def send(obj):
         line = json.dumps(obj)
         print(f"[harness] >>> {line}")
-        proc.stdin.write(line + "\n")
+        proc.stdin.write((line + "\n").encode("utf-8"))
         proc.stdin.flush()
 
     def read_until(predicate, deadline):
@@ -93,10 +93,10 @@ def main():
                 return None
             if proc.poll() is not None:
                 return None
-            line = proc.stdout.readline()
-            if not line:
+            raw = proc.stdout.readline()
+            if not raw:
                 return None
-            line = line.strip()
+            line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
@@ -112,7 +112,7 @@ def main():
     try:
         ready = read_until(lambda m: m.get("type") in ("ready", "error"), deadline)
         if ready is None:
-            stderr = proc.stderr.read() if proc.stderr else ""
+            stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
             print("FAIL: worker exited or timed out before sending ready.",
                   file=sys.stderr)
             if stderr:
@@ -160,7 +160,7 @@ def main():
         except Exception:
             proc.kill()
         if proc.stderr:
-            stderr = proc.stderr.read()
+            stderr = proc.stderr.read().decode("utf-8", errors="replace")
             if stderr.strip():
                 print(f"\n[worker stderr tail]\n{stderr}")
 
