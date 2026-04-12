@@ -399,31 +399,8 @@ def main():
 
     emit({"type": "ready", "sr": model.sr})
 
-    # ── CFG batch-expansion patch ─────────────────────────────────────────────
-    # Older builds of chatterbox-tts==0.1.7 always double bos_embed inside
-    # T3.inference for CFG, but the matching expand of cond_emb inside
-    # prepare_input_embeds may be absent. This causes embeds=batch1 vs
-    # bos_embed=batch2 → RuntimeError when they're cat'd together.
-    # Fix: wrap prepare_input_embeds to guarantee embeds is expanded to
-    # batch=2 whenever cfg_weight > 0, so the cat always succeeds.
-    try:
-        _orig_pie = model.t3.prepare_input_embeds
-        def _safe_prepare_input_embeds(*, t3_cond, text_tokens,
-                                        speech_tokens, cfg_weight=0.0):
-            embeds, len_cond = _orig_pie(
-                t3_cond=t3_cond, text_tokens=text_tokens,
-                speech_tokens=speech_tokens, cfg_weight=cfg_weight)
-            if cfg_weight > 0.0 and embeds.size(0) == 1:
-                import torch as _t
-                embeds = embeds.expand(2, -1, -1).contiguous()
-                del _t
-            return embeds, len_cond
-        model.t3.prepare_input_embeds = _safe_prepare_input_embeds
-        # Do NOT del _orig_pie — _safe_prepare_input_embeds closes over it.
-        # Deleting the local binding empties the closure cell → NameError on call.
-    except Exception:
-        pass
-    # ─────────────────────────────────────────────────────────────────────────
+    # CFG floor is applied per-call below at the model.generate site, not
+    # here — see the comment next to `_safe_cfg = ...`.
 
     # Save default voice conditioning so we can restore it when the user
     # switches back to Default voice. model.generate() mutates model.conds
@@ -522,11 +499,18 @@ def main():
                         continue
 
                 emit({"type": "status", "msg": "Generating audio..."})
+                # The PyPI build of chatterbox-tts==0.1.7 unconditionally doubles
+                # bos_embed for CFG inside T3.inference, so cfg_weight=0.0 (which
+                # tells tts.py not to double text_tokens) crashes with a batch
+                # mismatch. Floor to a tiny non-zero value: tts.py doubles
+                # text_tokens normally, and the CFG fusion `cond + 0.001*(cond-uncond)`
+                # is perceptually identical to no CFG.
+                _safe_cfg = cfg_weight if cfg_weight >= 0.001 else 0.001
                 wav = model.generate(
                     text,
                     audio_prompt_path=audio_prompt,
                     exaggeration=exaggeration,
-                    cfg_weight=cfg_weight,
+                    cfg_weight=_safe_cfg,
                     temperature=temperature,
                 )
 

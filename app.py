@@ -3505,7 +3505,7 @@ _section_label(cb_frame, "PARAMETERS",
 cb_exag_slider, cb_exag_label = make_slider(cb_frame, "Exaggeration", 0.0, 1.0, 20, 0.5,
     tooltip="Controls emotional intensity. Higher = more expressive and dramatic. "
             "Lower = flatter, more neutral. 0.5 is a good starting point.")
-cb_cfg_slider,  cb_cfg_label  = make_slider(cb_frame, "CFG Weight",   0.0, 1.0, 20, 0.0,
+cb_cfg_slider,  cb_cfg_label  = make_slider(cb_frame, "CFG Weight",   0.0, 1.0, 20, 0.5,
     tooltip="Classifier-Free Guidance — how closely the output follows the voice clone sample. "
             "Higher values sound more like the clone but can reduce naturalness. "
             "0 uses the model's own judgment.")
