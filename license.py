@@ -4,7 +4,7 @@ license.py — Gumroad license key validation for TTS Studio.
 Flow:
   - First GRACE_LAUNCHES launches: app runs freely, status bar shows a countdown.
   - Freemium: Fast mode free forever. Natural: 3 free generations. Enhancement: 3 free uses.
-  - On activation: calls Gumroad /v2/licenses/verify (increment_uses_count=true),
+  - On activation: calls Gumroad /v2/licenses/verify (increment_uses_count=false),
     stores key locally.
   - Subsequent launches: validated locally; silent background re-validation once
     per session to catch revoked keys.
@@ -228,8 +228,8 @@ def _verify_license(permalink, key, increment):
 # ── Public API ────────────────────────────────────────────────────────────────
 def activate_license(key, path=None):
     """
-    Activate a license key via Gumroad (increments use count).
-    Tries monthly permalink first, then lifetime — covers both products.
+    Activate a license key via Gumroad (validates only, no use count increment).
+    Tries monthly product first, then lifetime — covers both products.
     Saves the result to license.json on success.
 
     Returns:
@@ -241,7 +241,7 @@ def activate_license(key, path=None):
 
     ok, resp = False, {}
     for permalink in _ALL_PERMALINKS:
-        ok, resp = _verify_license(permalink, key, "true")
+        ok, resp = _verify_license(permalink, key, "false")
         if ok and resp.get("success") is True:
             break  # found the right product
 

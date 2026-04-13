@@ -5150,8 +5150,10 @@ def _handle_license_on_startup():
         def _revalidate():
             valid = _lic.validate_license_silent(lic.get("key"))
             if not valid:
+                # Deactivate locally so freemium limits kick in immediately
+                _lic.deactivate_license()
                 app.after(0, lambda: status_label.configure(
-                    text="⚠️ License validation failed. Please re-activate via the 🔑 Activate button."))
+                    text="⚠️ License revoked or expired. Pro features are now limited."))
                 app.after(0, lambda: _activate_btn.pack(side="right", padx=(0, 6), pady=14))
         threading.Thread(target=_revalidate, daemon=True).start()
     # Free users: Activate button already visible in header — nothing else to do.
