@@ -5032,7 +5032,7 @@ def _show_activation_modal(can_skip=True, remaining=0):
 
     def _open_store():
         import webbrowser
-        webbrowser.open(f"https://tagee1.github.io/tts-studio/")
+        webbrowser.open("https://tagee1.github.io/tts-studio-site/")
 
     ctk.CTkButton(
         btn_row, text="Buy a License", width=110, height=34,
