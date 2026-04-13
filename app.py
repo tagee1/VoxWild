@@ -5150,12 +5150,24 @@ def _handle_license_on_startup():
         def _revalidate():
             valid = _lic.validate_license_silent(lic.get("key"))
             if not valid:
-                # Deactivate locally so freemium limits kick in immediately
-                _lic.deactivate_license()
+                # Suspend locally so freemium limits kick in, but keep the key
+                # so next launch can re-validate (e.g. if access is restored).
+                lic["activated"] = False
+                _lic.save_license(lic)
                 app.after(0, lambda: status_label.configure(
                     text="⚠️ License revoked or expired. Pro features are now limited."))
                 app.after(0, lambda: _activate_btn.pack(side="right", padx=(0, 6), pady=14))
         threading.Thread(target=_revalidate, daemon=True).start()
+    elif lic.get("key"):
+        # Suspended license — key exists but not activated. Re-check silently.
+        def _recheck():
+            valid = _lic.validate_license_silent(lic.get("key"))
+            if valid:
+                lic["activated"] = True
+                _lic.save_license(lic)
+                app.after(0, lambda: status_label.configure(
+                    text="✅ License re-activated. Welcome back!"))
+        threading.Thread(target=_recheck, daemon=True).start()
     # Free users: Activate button already visible in header — nothing else to do.
 
 # Seed Kokoro calibration on first-ever launch using a quick inference.
