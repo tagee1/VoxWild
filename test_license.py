@@ -1025,7 +1025,8 @@ class TestVerifyLicense(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 1)
         # Verify it used the hardcoded product_id
         call_params = mock_post.call_args[0][0]
-        self.assertEqual(call_params["product_id"], lic._GUMROAD_PRODUCT_ID)
+        self.assertEqual(call_params["product_id"],
+                         lic._GUMROAD_PRODUCT_IDS["TTSStudioProLifetime"])
 
     # ── hardcoded fails, permalink fallback works ────────────────────────────
 
@@ -1223,7 +1224,7 @@ class TestLiveGumroadAPI(unittest.TestCase):
     def _require_active_key(self):
         """Skip test if the test key has been revoked/disabled on Gumroad."""
         ok, resp = _gr_post({
-            "product_id": lic._GUMROAD_PRODUCT_ID,
+            "product_id": lic._GUMROAD_PRODUCT_IDS["TTSStudioProLifetime"],
             "license_key": self.TEST_KEY,
             "increment_uses_count": "false",
         })
@@ -1232,7 +1233,7 @@ class TestLiveGumroadAPI(unittest.TestCase):
         return resp
 
     def test_hardcoded_product_id_validates_lifetime_key(self):
-        """Hardcoded _GUMROAD_PRODUCT_ID successfully validates a real key."""
+        """Hardcoded lifetime product_id successfully validates a real key."""
         resp = self._require_active_key()
         self.assertEqual(resp["purchase"]["product_name"], "TTS Studio Pro Lifetime")
 
@@ -1247,7 +1248,7 @@ class TestLiveGumroadAPI(unittest.TestCase):
         msg = resp.get("message", "")
         m = _PRODUCT_ID_RE.search(msg)
         self.assertIsNotNone(m, f"No product_id in error: {msg}")
-        self.assertEqual(m.group(1), lic._GUMROAD_PRODUCT_ID)
+        self.assertEqual(m.group(1), lic._GUMROAD_PRODUCT_IDS["TTSStudioProLifetime"])
 
     def test_verify_license_end_to_end(self):
         """_verify_license finds the right product and validates the key."""
