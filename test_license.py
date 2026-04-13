@@ -1179,11 +1179,18 @@ class TestLiveGumroadAPI(unittest.TestCase):
         import tempfile
         tmp = os.path.join(tempfile.gettempdir(), "test_live_lic.json")
         try:
+            # Pre-seed with current machine_id so this counts as a reinstall
+            # (doesn't increment uses — avoids burning test activations)
+            _write_license(tmp, {
+                "key": self.TEST_KEY,
+                "machine_id": lic._get_machine_id(),
+            })
             success, msg = activate_license(self.TEST_KEY, path=tmp)
             self.assertTrue(success, f"Activation failed: {msg}")
             data = load_license(tmp)
             self.assertTrue(data["activated"])
             self.assertEqual(data["key"], self.TEST_KEY)
+            self.assertEqual(data["machine_id"], lic._get_machine_id())
         finally:
             try:
                 os.unlink(tmp)

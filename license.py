@@ -31,6 +31,7 @@ LICENSE_FILE = os.path.join(_USER_DIR, "license.json")
 GRACE_LAUNCHES    = 3
 FREE_NATURAL_USES = 3   # lifetime free Natural (Chatterbox) generations
 FREE_ENHANCE_USES = 3   # lifetime free Resemble Enhance uses
+MAX_MACHINES      = 2   # max simultaneous machine activations per key
 
 # Gumroad product permalinks — one per product (monthly vs lifetime)
 PRODUCT_PERMALINK          = "TTSStudioPro"          # monthly
@@ -61,7 +62,19 @@ _DEFAULT_LICENSE = {
     "launch_count":    0,
     "natural_uses":    0,
     "enhance_uses":    0,
+    "machine_id":      None,
 }
+
+
+def _get_machine_id():
+    """Generate a stable machine fingerprint.
+
+    Uses computer name + OS username, hashed. Survives reinstalls because
+    license.json lives in %APPDATA% which the installer doesn't delete.
+    """
+    import hashlib, platform, getpass
+    raw = f"{platform.node()}|{getpass.getuser()}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 # ── License file I/O ──────────────────────────────────────────────────────────
@@ -228,9 +241,10 @@ def _verify_license(permalink, key, increment):
 # ── Public API ────────────────────────────────────────────────────────────────
 def activate_license(key, path=None):
     """
-    Activate a license key via Gumroad (validates only, no use count increment).
-    Tries monthly product first, then lifetime — covers both products.
-    Saves the result to license.json on success.
+    Activate a license key via Gumroad with machine-based use tracking.
+
+    Same-machine reinstalls don't burn an activation (machine_id matches).
+    New machines increment the use count; rejected if uses > MAX_MACHINES.
 
     Returns:
         (success: bool, message: str)
@@ -239,18 +253,34 @@ def activate_license(key, path=None):
     if not key:
         return False, "Please enter a license key."
 
+    # Check if this is the same machine that already activated this key
+    lic = load_license(path)
+    current_machine = _get_machine_id()
+    same_machine = (lic.get("key") == key and lic.get("machine_id") == current_machine)
+
+    # Same machine reinstall → don't increment; new machine → increment
+    increment = "false" if same_machine else "true"
+
     ok, resp = False, {}
     for permalink in _ALL_PERMALINKS:
-        ok, resp = _verify_license(permalink, key, "false")
+        ok, resp = _verify_license(permalink, key, increment)
         if ok and resp.get("success") is True:
             break  # found the right product
 
     if ok and resp.get("success") is True:
-        lic = load_license(path)
+        # Check activation limit (only matters for new machines)
+        uses = resp.get("uses", 1)
+        if not same_machine and uses > MAX_MACHINES:
+            return False, (
+                f"This license key is already active on {MAX_MACHINES} machines. "
+                "Deactivate another machine or contact support."
+            )
+
         lic.update({
             "key":             key,
             "activated":       True,
             "activation_date": datetime.now().isoformat(),
+            "machine_id":      current_machine,
         })
 
         saved = save_license(lic, path)
