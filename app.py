@@ -5213,25 +5213,40 @@ def _show_update_banner(latest_tag: str):
 
 def _check_for_update():
     """Background thread: check GitHub releases API on every launch.
-    Never raises — update check is best-effort and must not affect startup."""
+    Writes diagnostic log so silent failures can be debugged."""
+    _log_path = os.path.join(
+        os.environ.get("APPDATA", ""), "TTS Studio", "update_check.log")
+    def _log(msg):
+        try:
+            with open(_log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
     try:
+        _log(f"Starting update check — current VERSION={VERSION}")
         import urllib.request
         import json as _json
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         req = urllib.request.Request(
             api_url, headers={"User-Agent": f"TTS-Studio/{VERSION}"})
+        _log(f"Fetching {api_url}")
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = _json.loads(resp.read())
         tag = data.get("tag_name", "").lstrip("v")
+        _log(f"GitHub returned tag_name='{data.get('tag_name')}' (parsed tag='{tag}')")
         if not tag:
+            _log("No tag returned — skipping")
             return
         current = tuple(int(x) for x in VERSION.split(".") if x.isdigit())
         latest  = tuple(int(x) for x in tag.split(".")  if x.isdigit())
+        _log(f"current={current} latest={latest} newer={latest > current}")
         if latest > current:
             v = data["tag_name"]
+            _log(f"Showing update banner for {v}")
             app.after(0, lambda: _show_update_banner(v))
-    except Exception:
-        pass  # non-critical; never block or crash on failure
+    except Exception as e:
+        import traceback
+        _log(f"EXCEPTION: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 def _show_onboarding(on_done=None):
