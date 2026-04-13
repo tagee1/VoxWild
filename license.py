@@ -11,7 +11,7 @@ Flow:
 
 Gumroad license API:
   POST https://api.gumroad.com/v2/licenses/verify
-  Body: product_permalink=<id>&license_key=<key>&increment_uses_count=<true|false>
+  Body: product_id=<permalink>&license_key=<key>&increment_uses_count=<true|false>
   Response: { success: true/false, purchase: {...}, uses: N }
 """
 import os
@@ -36,6 +36,14 @@ FREE_ENHANCE_USES = 3   # lifetime free Resemble Enhance uses
 PRODUCT_PERMALINK          = "TTSStudioPro"          # monthly
 PRODUCT_PERMALINK_LIFETIME = "TTSStudioProLifetime"  # lifetime
 _ALL_PERMALINKS = (PRODUCT_PERMALINK, PRODUCT_PERMALINK_LIFETIME)
+
+# Gumroad internal product IDs — required for products created after Jan 2023.
+# The API rejects product_permalink and demands product_id instead.
+# Both products share the same internal ID on Gumroad.
+_GUMROAD_PRODUCT_ID = "cwSJcg1w4rgcNO-T6K732w=="
+
+# Fallback cache for runtime discovery (if hardcoded ID ever changes)
+_PRODUCT_IDS = {}  # permalink -> internal product_id
 
 # Store URLs
 STORE_URL          = "https://cookiestudios.gumroad.com"
@@ -172,6 +180,51 @@ def _gr_post(params):
         return False, {"error": f"Unexpected error: {e}"}
 
 
+import re
+_PRODUCT_ID_RE = re.compile(r"set 'product_id' to '([^']+)'")
+
+
+def _verify_license(permalink, key, increment):
+    """Verify a license key against a Gumroad product.
+
+    Gumroad products created after Jan 2023 require the internal product_id
+    (not the permalink slug) for license verification.  We try:
+      1. The hardcoded _GUMROAD_PRODUCT_ID (fastest, no extra round-trip)
+      2. Any previously discovered ID in _PRODUCT_IDS cache
+      3. product_permalink as a fallback — if Gumroad's error contains
+         the real product_id, we extract it and retry.
+
+    Returns (ok: bool, response: dict).
+    """
+    params_base = {"license_key": key, "increment_uses_count": increment}
+
+    # 1. Try the hardcoded product_id first (covers both monthly & lifetime)
+    ok, resp = _gr_post({**params_base, "product_id": _GUMROAD_PRODUCT_ID})
+    if ok and resp.get("success") is True:
+        return ok, resp
+
+    # 2. Try cached discovered ID (if different from hardcoded)
+    if permalink in _PRODUCT_IDS and _PRODUCT_IDS[permalink] != _GUMROAD_PRODUCT_ID:
+        ok, resp = _gr_post({**params_base, "product_id": _PRODUCT_IDS[permalink]})
+        if ok and resp.get("success") is True:
+            return ok, resp
+
+    # 3. Fallback: use product_permalink, discover product_id from error
+    ok, resp = _gr_post({**params_base, "product_permalink": permalink})
+    if ok and resp.get("success") is True:
+        return ok, resp
+
+    # Extract product_id from Gumroad's error message if present
+    msg = resp.get("message", "")
+    m = _PRODUCT_ID_RE.search(msg)
+    if m:
+        real_id = m.group(1)
+        _PRODUCT_IDS[permalink] = real_id
+        return _gr_post({**params_base, "product_id": real_id})
+
+    return ok, resp
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 def activate_license(key, path=None):
     """
@@ -188,11 +241,7 @@ def activate_license(key, path=None):
 
     ok, resp = False, {}
     for permalink in _ALL_PERMALINKS:
-        ok, resp = _gr_post({
-            "product_permalink":    permalink,
-            "license_key":          key,
-            "increment_uses_count": "true",
-        })
+        ok, resp = _verify_license(permalink, key, "true")
         if ok and resp.get("success") is True:
             break  # found the right product
 
@@ -235,11 +284,7 @@ def validate_license_silent(key):
         return False
 
     for permalink in _ALL_PERMALINKS:
-        ok, resp = _gr_post({
-            "product_permalink":    permalink,
-            "license_key":          key,
-            "increment_uses_count": "false",
-        })
+        ok, resp = _verify_license(permalink, key, "false")
         if resp.get("_network_error"):
             return True  # can't reach server — assume valid, check again next session
         if ok and resp.get("success") is True:

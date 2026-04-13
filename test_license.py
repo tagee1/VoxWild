@@ -28,6 +28,8 @@ from license import (
     _DEFAULT_LICENSE,
     _extract_error,
     _gr_post,
+    _verify_license,
+    _PRODUCT_ID_RE,
     activate_license,
     check_startup,
     deactivate_license,
@@ -481,7 +483,7 @@ class TestGrPost(unittest.TestCase):
     def test_success_returns_true_and_json(self, mock_urlopen):
         payload = {"success": True, "purchase": {}}
         mock_urlopen.return_value = _make_urlopen_mock(payload)
-        ok, resp = _gr_post({"license_key": "KEY", "product_permalink": "tts-studio"})
+        ok, resp = _gr_post({"license_key": "KEY", "product_id": "tts-studio"})
         self.assertTrue(ok)
         self.assertTrue(resp["success"])
 
@@ -800,127 +802,126 @@ class TestDualPermalink(unittest.TestCase):
 
     # ── activate_license ──────────────────────────────────────────────────────
 
-    @patch("license._gr_post")
-    def test_activate_monthly_key_succeeds_first_try(self, mock_post):
-        """Monthly key: first permalink succeeds → second never called."""
-        mock_post.return_value = (True, {"success": True, "purchase": {}})
+    @patch("license._verify_license")
+    def test_activate_monthly_key_succeeds_first_try(self, mock_verify):
+        """Monthly key: first product succeeds → second never called."""
+        mock_verify.return_value = (True, {"success": True, "purchase": {}})
         ok, msg = activate_license("MONTHLY-KEY", self.path)
         self.assertTrue(ok, msg)
-        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(mock_verify.call_count, 1)
 
-    @patch("license._gr_post")
-    def test_activate_lifetime_key_succeeds_on_second_permalink(self, mock_post):
+    @patch("license._verify_license")
+    def test_activate_lifetime_key_succeeds_on_second_product(self, mock_verify):
         """Lifetime key: monthly returns success=False, lifetime returns True."""
-        mock_post.side_effect = [
+        mock_verify.side_effect = [
             (True, {"success": False, "message": "That license does not exist."}),
             (True, {"success": True, "purchase": {}}),
         ]
         ok, msg = activate_license("LIFETIME-KEY", self.path)
         self.assertTrue(ok, msg)
-        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_verify.call_count, 2)
         self.assertEqual(load_license(self.path)["key"], "LIFETIME-KEY")
 
-    @patch("license._gr_post")
-    def test_activate_both_permalinks_fail_returns_error(self, mock_post):
-        """Both permalinks reject key → error returned, file not touched."""
-        mock_post.side_effect = [
+    @patch("license._verify_license")
+    def test_activate_both_products_fail_returns_error(self, mock_verify):
+        """Both products reject key → error returned, file not touched."""
+        mock_verify.side_effect = [
             (True, {"success": False, "message": "That license does not exist."}),
             (True, {"success": False, "message": "That license does not exist."}),
         ]
         ok, msg = activate_license("BAD-KEY", self.path)
         self.assertFalse(ok)
-        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_verify.call_count, 2)
         self.assertIn("does not exist", msg.lower())
         self.assertFalse(load_license(self.path)["activated"])
 
-    @patch("license._gr_post")
-    def test_activate_network_error_first_still_tries_second(self, mock_post):
-        """Network error on monthly permalink still attempts lifetime permalink."""
-        mock_post.side_effect = [
+    @patch("license._verify_license")
+    def test_activate_network_error_first_still_tries_second(self, mock_verify):
+        """Network error on first product still attempts second."""
+        mock_verify.side_effect = [
             (False, {"_network_error": True, "error": "Could not reach server."}),
             (True, {"success": True, "purchase": {}}),
         ]
         ok, msg = activate_license("KEY", self.path)
         self.assertTrue(ok, msg)
-        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_verify.call_count, 2)
 
-    @patch("license._gr_post")
-    def test_activate_both_network_errors_returns_friendly_message(self, mock_post):
-        """Both permalinks hit network error → friendly network error message returned."""
+    @patch("license._verify_license")
+    def test_activate_both_network_errors_returns_friendly_message(self, mock_verify):
+        """Both products hit network error → friendly network error message returned."""
         err = {"_network_error": True, "error": "Could not reach activation server. Check your internet connection."}
-        mock_post.side_effect = [(False, err), (False, err)]
+        mock_verify.side_effect = [(False, err), (False, err)]
         ok, msg = activate_license("KEY", self.path)
         self.assertFalse(ok)
-        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_verify.call_count, 2)
         self.assertIn("internet connection", msg.lower())
 
-    @patch("license._gr_post")
-    def test_activate_uses_both_permalink_constants(self, mock_post):
-        """Both _ALL_PERMALINKS values must be passed to _gr_post."""
-        mock_post.side_effect = [
+    @patch("license._verify_license")
+    def test_activate_tries_both_permalinks(self, mock_verify):
+        """Both _ALL_PERMALINKS values must be tried."""
+        mock_verify.side_effect = [
             (True, {"success": False, "message": "Not found."}),
             (True, {"success": True, "purchase": {}}),
         ]
         activate_license("KEY", self.path)
-        permalinks_used = [call[0][0]["product_permalink"] for call in mock_post.call_args_list]
+        permalinks_used = [call[0][0] for call in mock_verify.call_args_list]
         self.assertIn(lic.PRODUCT_PERMALINK, permalinks_used)
         self.assertIn(lic.PRODUCT_PERMALINK_LIFETIME, permalinks_used)
 
-    @patch("license._gr_post")
-    def test_activate_http_404_on_first_tries_second(self, mock_post):
-        """HTTP 404 on monthly (wrong product) → tries lifetime permalink."""
-        mock_post.side_effect = [
+    @patch("license._verify_license")
+    def test_activate_first_fails_tries_second(self, mock_verify):
+        """First product fails → tries second."""
+        mock_verify.side_effect = [
             (False, {"_status_code": 404}),
             (True, {"success": True, "purchase": {}}),
         ]
         ok, msg = activate_license("KEY", self.path)
         self.assertTrue(ok, msg)
-        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_verify.call_count, 2)
 
     # ── validate_license_silent ───────────────────────────────────────────────
 
-    @patch("license._gr_post")
-    def test_silent_valid_on_first_permalink_returns_true(self, mock_post):
-        """Key valid on monthly → True, second permalink not attempted."""
-        mock_post.return_value = (True, {"success": True})
+    @patch("license._verify_license")
+    def test_silent_valid_on_first_permalink_returns_true(self, mock_verify):
+        """Key valid on first product → True, second not attempted."""
+        mock_verify.return_value = (True, {"success": True})
         result = validate_license_silent("KEY-1234")
         self.assertTrue(result)
-        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(mock_verify.call_count, 1)
 
-    @patch("license._gr_post")
-    def test_silent_valid_on_second_permalink_returns_true(self, mock_post):
-        """Key valid only on lifetime permalink → True after two calls."""
-        mock_post.side_effect = [
+    @patch("license._verify_license")
+    def test_silent_valid_on_second_permalink_returns_true(self, mock_verify):
+        """Key valid only on lifetime → True after two calls."""
+        mock_verify.side_effect = [
             (True, {"success": False}),
             (True, {"success": True}),
         ]
         result = validate_license_silent("KEY-1234")
         self.assertTrue(result)
-        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_verify.call_count, 2)
 
-    @patch("license._gr_post")
-    def test_silent_both_invalid_returns_false(self, mock_post):
-        """Key rejected by both permalinks → False."""
-        mock_post.return_value = (True, {"success": False})
+    @patch("license._verify_license")
+    def test_silent_both_invalid_returns_false(self, mock_verify):
+        """Key rejected by both products → False."""
+        mock_verify.return_value = (True, {"success": False})
         result = validate_license_silent("KEY-1234")
         self.assertFalse(result)
-        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_verify.call_count, 2)
 
-    @patch("license._gr_post")
-    def test_silent_network_error_returns_true_immediately(self, mock_post):
-        """Network error → benefit of the doubt, True returned without trying second permalink."""
-        mock_post.return_value = (False, {"_network_error": True, "error": "No network."})
+    @patch("license._verify_license")
+    def test_silent_network_error_returns_true_immediately(self, mock_verify):
+        """Network error → benefit of the doubt, True without trying second."""
+        mock_verify.return_value = (False, {"_network_error": True, "error": "No network."})
         result = validate_license_silent("KEY-1234")
         self.assertTrue(result)
-        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(mock_verify.call_count, 1)
 
-    @patch("license._gr_post")
-    def test_silent_increment_uses_count_is_false(self, mock_post):
-        """Silent validation must never increment use count."""
-        mock_post.return_value = (True, {"success": True})
+    @patch("license._verify_license")
+    def test_silent_increment_uses_count_is_false(self, mock_verify):
+        """Silent validation must pass increment='false'."""
+        mock_verify.return_value = (True, {"success": True})
         validate_license_silent("KEY-1234")
-        call_params = mock_post.call_args[0][0]
-        self.assertEqual(call_params.get("increment_uses_count"), "false")
+        self.assertEqual(mock_verify.call_args[0][2], "false")
 
 
 # ── TestDeactivatePreservesFreemium ───────────────────────────────────────────
@@ -976,6 +977,211 @@ class TestDeactivatePreservesFreemium(unittest.TestCase):
         data = load_license(self.path)
         self.assertEqual(data["natural_uses"], 0)
         self.assertEqual(data["enhance_uses"], 0)
+
+
+# ── TestVerifyLicense — product_id discovery ─────────────────────────────────
+
+class TestVerifyLicense(unittest.TestCase):
+    """Tests for _verify_license and product_id auto-discovery."""
+
+    def setUp(self):
+        # Clear cached product IDs between tests
+        lic._PRODUCT_IDS.clear()
+
+    def tearDown(self):
+        lic._PRODUCT_IDS.clear()
+
+    # ── regex ────────────────────────────────────────────────────────────────
+
+    def test_regex_extracts_product_id_with_special_chars(self):
+        """Gumroad product IDs contain -, +, = — regex must capture all."""
+        msg = ("The 'product_id' parameter is required to verify the license "
+               "for this product. Please set 'product_id' to "
+               "'cwSJcg1w4rgcNO-T6K732w==' in the request.")
+        m = _PRODUCT_ID_RE.search(msg)
+        self.assertIsNotNone(m, "Regex did not match")
+        self.assertEqual(m.group(1), "cwSJcg1w4rgcNO-T6K732w==")
+
+    def test_regex_extracts_simple_product_id(self):
+        msg = "Please set 'product_id' to 'abc123' in the request."
+        m = _PRODUCT_ID_RE.search(msg)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "abc123")
+
+    def test_regex_no_match_on_unrelated_message(self):
+        msg = "That license does not exist for the provided product."
+        m = _PRODUCT_ID_RE.search(msg)
+        self.assertIsNone(m)
+
+    # ── hardcoded product_id succeeds immediately ────────────────────────────
+
+    @patch("license._gr_post")
+    def test_hardcoded_id_succeeds_first_try(self, mock_post):
+        """When hardcoded product_id works, only one API call is made."""
+        mock_post.return_value = (True, {"success": True, "purchase": {}})
+        ok, resp = _verify_license("TTSStudioProLifetime", "KEY", "false")
+        self.assertTrue(ok)
+        self.assertTrue(resp["success"])
+        self.assertEqual(mock_post.call_count, 1)
+        # Verify it used the hardcoded product_id
+        call_params = mock_post.call_args[0][0]
+        self.assertEqual(call_params["product_id"], lic._GUMROAD_PRODUCT_ID)
+
+    # ── hardcoded fails, permalink fallback works ────────────────────────────
+
+    @patch("license._gr_post")
+    def test_permalink_fallback_when_hardcoded_fails(self, mock_post):
+        """Hardcoded ID fails → falls back to product_permalink."""
+        mock_post.side_effect = [
+            (True, {"success": False, "message": "Not found."}),  # hardcoded
+            (True, {"success": True, "purchase": {}}),             # permalink
+        ]
+        ok, resp = _verify_license("TTSStudioPro", "KEY", "false")
+        self.assertTrue(ok)
+        self.assertEqual(mock_post.call_count, 2)
+        call_params = mock_post.call_args_list[1][0][0]
+        self.assertIn("product_permalink", call_params)
+
+    # ── product_id discovery from error message ──────────────────────────────
+
+    @patch("license._gr_post")
+    def test_discovers_product_id_from_error_message(self, mock_post):
+        """When permalink returns product_id hint, extract it and retry."""
+        mock_post.side_effect = [
+            # hardcoded ID fails
+            (True, {"success": False, "message": "Not found."}),
+            # permalink fails with product_id hint
+            (False, {"success": False,
+                     "message": "Please set 'product_id' to 'abc123XYZ==' in the request."}),
+            # retry with discovered ID succeeds
+            (True, {"success": True, "purchase": {}}),
+        ]
+        ok, resp = _verify_license("TTSStudioPro", "KEY", "true")
+        self.assertTrue(ok)
+        self.assertEqual(mock_post.call_count, 3)
+        # Discovered ID should be cached
+        self.assertEqual(lic._PRODUCT_IDS["TTSStudioPro"], "abc123XYZ==")
+        # Third call should use discovered ID
+        call_params = mock_post.call_args_list[2][0][0]
+        self.assertEqual(call_params["product_id"], "abc123XYZ==")
+
+    @patch("license._gr_post")
+    def test_cached_id_used_on_subsequent_calls(self, mock_post):
+        """Once a product_id is discovered, it's used directly next time."""
+        lic._PRODUCT_IDS["TTSStudioPro"] = "cached-id-123"
+        mock_post.side_effect = [
+            (True, {"success": False}),  # hardcoded fails
+            (True, {"success": True}),   # cached works
+        ]
+        ok, resp = _verify_license("TTSStudioPro", "KEY", "false")
+        self.assertTrue(ok)
+        call_params = mock_post.call_args_list[1][0][0]
+        self.assertEqual(call_params["product_id"], "cached-id-123")
+
+    # ── all attempts fail ────────────────────────────────────────────────────
+
+    @patch("license._gr_post")
+    def test_all_attempts_fail_returns_last_error(self, mock_post):
+        """When everything fails (no product_id hint), return the error."""
+        mock_post.return_value = (True, {
+            "success": False,
+            "message": "That license does not exist for the provided product.",
+        })
+        ok, resp = _verify_license("TTSStudioPro", "BAD-KEY", "false")
+        self.assertFalse(resp["success"])
+        self.assertIn("does not exist", resp["message"])
+
+    # ── network error propagates ─────────────────────────────────────────────
+
+    @patch("license._gr_post")
+    def test_network_error_propagates(self, mock_post):
+        """Network error on hardcoded ID check propagates up."""
+        mock_post.return_value = (False, {"_network_error": True, "error": "timeout"})
+        ok, resp = _verify_license("TTSStudioPro", "KEY", "false")
+        self.assertFalse(ok)
+        # On network error, hardcoded fails, permalink fails, no hint → return error
+        self.assertTrue(resp.get("_network_error"))
+
+
+# ── TestLiveGumroadAPI — real API integration (skipped without network) ──────
+
+class TestLiveGumroadAPI(unittest.TestCase):
+    """Integration tests that hit the real Gumroad API.
+
+    These verify the actual product_id, regex extraction, and end-to-end flow.
+    Skipped if the network is unreachable.
+    """
+
+    TEST_KEY = "820BE1AD-944648C2-835D6427-C25DF9FD"
+
+    @classmethod
+    def setUpClass(cls):
+        """Skip all tests if Gumroad API is unreachable."""
+        try:
+            import urllib.request
+            # Base URL returns 404, so just check we can connect (any HTTP response = reachable)
+            urllib.request.urlopen("https://api.gumroad.com", timeout=5)
+        except urllib.error.HTTPError:
+            pass  # 404 is fine — server is reachable
+        except Exception:
+            raise unittest.SkipTest("Gumroad API unreachable — skipping live tests")
+
+    def setUp(self):
+        lic._PRODUCT_IDS.clear()
+
+    def tearDown(self):
+        lic._PRODUCT_IDS.clear()
+
+    def test_hardcoded_product_id_validates_lifetime_key(self):
+        """Hardcoded _GUMROAD_PRODUCT_ID successfully validates a real key."""
+        ok, resp = _gr_post({
+            "product_id": lic._GUMROAD_PRODUCT_ID,
+            "license_key": self.TEST_KEY,
+            "increment_uses_count": "false",
+        })
+        self.assertTrue(ok, f"API returned ok=False: {resp}")
+        self.assertTrue(resp.get("success"), f"API returned success=False: {resp}")
+        self.assertEqual(resp["purchase"]["product_name"], "TTS Studio Pro Lifetime")
+
+    def test_product_permalink_returns_product_id_hint(self):
+        """Sending product_permalink returns error with real product_id."""
+        ok, resp = _gr_post({
+            "product_permalink": "TTSStudioProLifetime",
+            "license_key": self.TEST_KEY,
+            "increment_uses_count": "false",
+        })
+        # Should fail with a message containing the product_id
+        msg = resp.get("message", "")
+        m = _PRODUCT_ID_RE.search(msg)
+        self.assertIsNotNone(m, f"No product_id in error: {msg}")
+        self.assertEqual(m.group(1), lic._GUMROAD_PRODUCT_ID)
+
+    def test_verify_license_end_to_end(self):
+        """_verify_license finds the right product and validates the key."""
+        ok, resp = _verify_license("TTSStudioProLifetime", self.TEST_KEY, "false")
+        self.assertTrue(ok)
+        self.assertTrue(resp.get("success"))
+
+    def test_verify_license_bad_key_returns_failure(self):
+        """Invalid key returns success=False, not an exception."""
+        ok, resp = _verify_license("TTSStudioProLifetime", "FAKE-KEY-1234", "false")
+        self.assertFalse(resp.get("success", True))
+
+    def test_full_activate_flow(self):
+        """Full activate_license with a real key writes license.json."""
+        import tempfile
+        tmp = os.path.join(tempfile.gettempdir(), "test_live_lic.json")
+        try:
+            success, msg = activate_license(self.TEST_KEY, path=tmp)
+            self.assertTrue(success, f"Activation failed: {msg}")
+            data = load_license(tmp)
+            self.assertTrue(data["activated"])
+            self.assertEqual(data["key"], self.TEST_KEY)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
