@@ -3173,28 +3173,31 @@ smooth = SmoothProgress(progress_bar, progress_time_label)
 _sep(app)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
+# ── Tab bar + Generate/Stop row ──────────────────────────────────────────────
+_tab_row = ctk.CTkFrame(app, fg_color=C_BG, corner_radius=0, height=40)
+_tab_row.pack(fill="x")
+_tab_row.pack_propagate(False)
+
+stop_button = ctk.CTkButton(
+    _tab_row, text="Stop", command=stop_audio,
+    width=60, height=28,
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    state="disabled", **BTN_GHOST, corner_radius=8)
+stop_button.pack(side="right", padx=(0, 14), pady=6)
+
+play_button = ctk.CTkButton(
+    _tab_row, text="Generate", command=generate_and_store,
+    width=100, height=28,
+    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+    corner_radius=8)
+play_button.pack(side="right", padx=(0, 4), pady=6)
+
 tabs = ctk.CTkTabview(app, fg_color=C_BG)
 tabs.pack(fill="both", expand=True, padx=0, pady=0)
 tabs.add("  Studio  ")
 tabs.add("  Queue  ")
 tabs.add("  Dialogue  ")
 tabs.add("  Profiles  ")
-
-# Generate / Stop buttons in the tab bar row
-_tab_bar = tabs._segmented_button.master  # frame that holds the segmented button
-stop_button = ctk.CTkButton(
-    _tab_bar, text="Stop", command=stop_audio,
-    width=60, height=28,
-    font=ctk.CTkFont(family="Segoe UI", size=12),
-    state="disabled", **BTN_GHOST, corner_radius=8)
-stop_button.pack(side="right", padx=(0, 10), pady=6)
-
-play_button = ctk.CTkButton(
-    _tab_bar, text="Generate", command=generate_and_store,
-    width=100, height=28,
-    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-    corner_radius=8)
-play_button.pack(side="right", padx=(0, 4), pady=6)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STUDIO TAB
