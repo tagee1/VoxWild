@@ -12,7 +12,7 @@
 ;     /a installer_output\TTS-Studio-Setup.exe
 
 #define MyAppName      "TTS Studio"
-#define MyAppVersion   "1.0.4"
+#define MyAppVersion   "1.0.6"
 #define MyAppPublisher "Cookie Studios"
 #define MyAppURL       "https://cookiestudios.gumroad.com/l/TTSStudioPro"
 #define MyAppSupportURL "mailto:cookiestudios.dev@gmail.com"

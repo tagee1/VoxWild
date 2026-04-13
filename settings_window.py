@@ -78,180 +78,188 @@ def open_settings_window(parent, voices: list, profiles: list, on_save_callback=
 
     win = ctk.CTkToplevel(parent)
     win.title("Settings")
-    _center_window(win, 520, 640)
+    _center_window(win, 520, 680)
     win.resizable(False, False)
     win.grab_set()
     win.configure(fg_color=C_BG)
 
     current = load_settings()
 
-    # ── Header band ───────────────────────────────────────────────────────────
-    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=60)
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=90)
     hdr.pack(fill="x")
     hdr.pack_propagate(False)
-
-    hdr_inner = ctk.CTkFrame(hdr, fg_color="transparent")
-    hdr_inner.pack(side="left", padx=18, pady=10)
-    ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=8, height=8,
-                 corner_radius=4).pack(side="left", padx=(0, 10))
-    ctk.CTkLabel(hdr_inner, text="Settings",
-                 font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
-                 text_color=C_TXT).pack(side="left")
+    ctk.CTkLabel(hdr, text="Settings",
+                 font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
+                 text_color=C_TXT).pack(pady=(18, 0))
+    ctk.CTkLabel(hdr, text="Customize your TTS Studio experience",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT3).pack(pady=(2, 0))
 
     ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
-
-    ctk.CTkLabel(win,
-                 text="Changes take effect immediately after saving.",
-                 font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT3).pack(pady=(10, 6))
 
     # ── Scrollable body ───────────────────────────────────────────────────────
     scroll = ctk.CTkScrollableFrame(win, fg_color=C_BG,
                                     scrollbar_button_color=C_ELEVATED,
                                     scrollbar_button_hover_color=C_ACCENT_D)
-    scroll.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+    scroll.pack(fill="both", expand=True, padx=20, pady=(14, 0))
 
-    def _section(text):
-        row = ctk.CTkFrame(scroll, fg_color="transparent")
-        row.pack(anchor="w", padx=4, pady=(16, 4))
-        ctk.CTkFrame(row, fg_color=C_ACCENT, width=3, height=10,
-                     corner_radius=2).pack(side="left", padx=(0, 6))
-        ctk.CTkLabel(row, text=text,
+    def _card():
+        """Container for a group of related settings."""
+        c = ctk.CTkFrame(scroll, fg_color=C_CARD, corner_radius=10,
+                         border_width=1, border_color=C_BORDER)
+        c.pack(fill="x", pady=(0, 12))
+        return c
+
+    def _section_title(parent, text):
+        ctk.CTkLabel(parent, text=text,
                      font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
-                     text_color=C_TXT2, anchor="w").pack(side="left")
-        ctk.CTkFrame(scroll, height=1, fg_color=C_BORDER,
-                     corner_radius=0).pack(fill="x", pady=(0, 8))
+                     text_color=C_ACCENT, anchor="w").pack(
+            anchor="w", padx=16, pady=(12, 8))
 
-    def _row_label(text, note=""):
-        f = ctk.CTkFrame(scroll, fg_color="transparent")
-        f.pack(fill="x", padx=4, pady=(0, 2))
+    def _field_label(parent, text, hint=""):
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+        f.pack(fill="x", padx=16, pady=(0, 4))
         ctk.CTkLabel(f, text=text, anchor="w",
-                     font=ctk.CTkFont(family="Segoe UI", size=12),
+                     font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
                      text_color=C_TXT).pack(side="left")
-        if note:
-            ctk.CTkLabel(f, text=note, anchor="w",
+        if hint:
+            ctk.CTkLabel(f, text=hint, anchor="w",
                          font=ctk.CTkFont(family="Segoe UI", size=10),
-                         text_color=C_TXT3).pack(side="left", padx=(6, 0))
+                         text_color=C_TXT3).pack(side="left", padx=(8, 0))
 
-    # ── General ───────────────────────────────────────────────────────────────
-    _section("GENERAL")
+    def _hint(parent, text):
+        ctk.CTkLabel(parent, text=text,
+                     font=ctk.CTkFont(family="Segoe UI", size=10),
+                     text_color=C_TXT3, anchor="w", justify="left",
+                     wraplength=440).pack(anchor="w", padx=16, pady=(2, 12))
 
-    _row_label("Default output folder", "(where files are saved)")
+    # ── OUTPUT ────────────────────────────────────────────────────────────────
+    output_card = _card()
+    _section_title(output_card, "OUTPUT")
+
+    _field_label(output_card, "Default save folder")
     folder_var = ctk.StringVar(value=current.get("default_output_folder", ""))
-    folder_frame = ctk.CTkFrame(scroll, fg_color="transparent")
-    folder_frame.pack(fill="x", padx=4, pady=(0, 10))
+    folder_frame = ctk.CTkFrame(output_card, fg_color="transparent")
+    folder_frame.pack(fill="x", padx=16, pady=(0, 14))
 
     folder_entry = ctk.CTkEntry(
-        folder_frame, textvariable=folder_var, width=330,
-        fg_color=C_CARD, border_color=C_BORDER, text_color=C_TXT,
-        placeholder_text="Click Browse to set...",
-        placeholder_text_color=C_TXT3)
-    folder_entry.pack(side="left", padx=(0, 8))
+        folder_frame, textvariable=folder_var,
+        fg_color=C_ELEVATED, border_color=C_BORDER, text_color=C_TXT,
+        placeholder_text="No folder set — you'll be prompted each time",
+        placeholder_text_color=C_TXT3, height=32)
+    folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
     def browse_folder():
-        path = filedialog.askdirectory()
+        path = filedialog.askdirectory(parent=win)
         if path:
             folder_var.set(path)
 
     ctk.CTkButton(folder_frame, text="Browse", command=browse_folder,
-                  width=88, height=32,
+                  width=80, height=32,
                   font=ctk.CTkFont(family="Segoe UI", size=12),
                   **BTN_GHOST).pack(side="left")
 
-    # ── Voice Defaults ────────────────────────────────────────────────────────
-    _section("VOICE DEFAULTS")
+    # ── VOICE ─────────────────────────────────────────────────────────────────
+    voice_card = _card()
+    _section_title(voice_card, "VOICE DEFAULTS")
 
-    _row_label("Default voice", "(used when app starts)")
-    default_voice_var = ctk.StringVar(value=current.get("default_voice", voices[0] if voices else ""))
+    _field_label(voice_card, "Voice", "loaded on startup")
+    default_voice_var = ctk.StringVar(
+        value=current.get("default_voice", voices[0] if voices else ""))
     ctk.CTkOptionMenu(
-        scroll, variable=default_voice_var, values=voices,
-        width=340, dynamic_resizing=False,
-        fg_color=C_CARD, button_color=C_ACCENT_D, button_hover_color=C_ACCENT,
+        voice_card, variable=default_voice_var, values=voices or [""],
+        dynamic_resizing=False, height=32,
+        fg_color=C_ELEVATED, button_color=C_ACCENT_D, button_hover_color=C_ACCENT,
         text_color=C_TXT, dropdown_fg_color=C_SURFACE,
         dropdown_hover_color=C_ELEVATED, dropdown_text_color=C_TXT
-    ).pack(anchor="w", padx=4, pady=(0, 10))
+    ).pack(fill="x", padx=16, pady=(0, 12))
 
-    _row_label("Default speed")
-    speed_frame = ctk.CTkFrame(scroll, fg_color="transparent")
-    speed_frame.pack(fill="x", padx=4, pady=(0, 10))
+    _field_label(voice_card, "Speed")
+    speed_row = ctk.CTkFrame(voice_card, fg_color="transparent")
+    speed_row.pack(fill="x", padx=16, pady=(0, 12))
     default_speed_var = ctk.DoubleVar(value=current.get("default_speed", 0.85))
     speed_val_lbl = ctk.CTkLabel(
-        speed_frame, text=f"{default_speed_var.get():.2f}x", width=54,
-        font=ctk.CTkFont(family="Segoe UI", size=12),
+        speed_row, text=f"{default_speed_var.get():.2f}x", width=54,
+        font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
         text_color=C_ACCENT)
     speed_val_lbl.pack(side="right")
     def on_speed(v):
         speed_val_lbl.configure(text=f"{float(v):.2f}x")
-    ctk.CTkSlider(speed_frame, from_=0.5, to=2.0, number_of_steps=30,
+    ctk.CTkSlider(speed_row, from_=0.5, to=2.0, number_of_steps=30,
                   variable=default_speed_var, command=on_speed,
-                  width=310).pack(side="left")
+                  progress_color=C_ACCENT, button_color=C_ACCENT,
+                  button_hover_color=C_ACCENT_H).pack(
+        side="left", fill="x", expand=True, padx=(0, 8))
 
-    _row_label("Default profile", "(loaded on startup)")
+    _field_label(voice_card, "FX profile", "loaded on startup")
     default_profile_var = ctk.StringVar(
         value=current.get("default_profile", profiles[0] if profiles else ""))
     ctk.CTkOptionMenu(
-        scroll, variable=default_profile_var,
+        voice_card, variable=default_profile_var,
         values=profiles if profiles else ["None"],
-        width=340, dynamic_resizing=False,
-        fg_color=C_CARD, button_color=C_ACCENT_D, button_hover_color=C_ACCENT,
+        dynamic_resizing=False, height=32,
+        fg_color=C_ELEVATED, button_color=C_ACCENT_D, button_hover_color=C_ACCENT,
         text_color=C_TXT, dropdown_fg_color=C_SURFACE,
         dropdown_hover_color=C_ELEVATED, dropdown_text_color=C_TXT
-    ).pack(anchor="w", padx=4, pady=(0, 10))
+    ).pack(fill="x", padx=16, pady=(0, 14))
 
-    # ── Text Cleaner ──────────────────────────────────────────────────────────
-    _section("TEXT CLEANER")
+    # ── TEXT ──────────────────────────────────────────────────────────────────
+    text_card = _card()
+    _section_title(text_card, "TEXT HANDLING")
 
     auto_clean_var = ctk.BooleanVar(value=current.get("auto_clean_text", False))
     ctk.CTkCheckBox(
-        scroll,
-        text="Auto-clean text when imported or pasted",
+        text_card,
+        text="Auto-clean text on import or paste",
         variable=auto_clean_var,
         font=ctk.CTkFont(family="Segoe UI", size=12),
-        text_color=C_TXT
-    ).pack(anchor="w", padx=4, pady=(0, 4))
-    ctk.CTkLabel(
-        scroll,
-        text="Removes HTML, fixes spacing, expands abbreviations, and more.",
-        font=ctk.CTkFont(family="Segoe UI", size=10),
-        text_color=C_TXT3, anchor="w"
-    ).pack(fill="x", padx=4, pady=(0, 10))
+        text_color=C_TXT,
+        fg_color=C_ACCENT, hover_color=C_ACCENT_H,
+        border_color=C_BORDER, checkmark_color=C_BG,
+    ).pack(anchor="w", padx=16, pady=(0, 2))
+    _hint(text_card,
+          "Strips HTML, fixes spacing, expands common abbreviations, "
+          "and normalizes quotes.")
 
-    # ── Notifications ─────────────────────────────────────────────────────────
-    _section("NOTIFICATIONS")
+    # ── NOTIFICATIONS ─────────────────────────────────────────────────────────
+    notif_card = _card()
+    _section_title(notif_card, "NOTIFICATIONS")
 
     notify_var = ctk.BooleanVar(value=current.get("notify_on_completion", True))
     ctk.CTkCheckBox(
-        scroll,
-        text="Show notification when generation finishes",
+        notif_card,
+        text="Notify when generation finishes",
         variable=notify_var,
         font=ctk.CTkFont(family="Segoe UI", size=12),
-        text_color=C_TXT
-    ).pack(anchor="w", padx=4, pady=(0, 8))
+        text_color=C_TXT,
+        fg_color=C_ACCENT, hover_color=C_ACCENT_H,
+        border_color=C_BORDER, checkmark_color=C_BG,
+    ).pack(anchor="w", padx=16, pady=(0, 10))
 
-    _row_label("Only notify if generation takes longer than:")
-    thresh_frame = ctk.CTkFrame(scroll, fg_color="transparent")
-    thresh_frame.pack(fill="x", padx=4, pady=(0, 10))
+    _field_label(notif_card, "Only notify if generation takes longer than")
+    thresh_row = ctk.CTkFrame(notif_card, fg_color="transparent")
+    thresh_row.pack(fill="x", padx=16, pady=(0, 14))
     thresh_var = ctk.IntVar(value=current.get("notify_threshold_seconds", 10))
     thresh_lbl = ctk.CTkLabel(
-        thresh_frame, text=f"{thresh_var.get()}s", width=40,
-        font=ctk.CTkFont(family="Segoe UI", size=12),
+        thresh_row, text=f"{thresh_var.get()}s", width=40,
+        font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
         text_color=C_ACCENT)
     thresh_lbl.pack(side="right")
     def on_thresh(v):
         thresh_lbl.configure(text=f"{int(float(v))}s")
-    ctk.CTkSlider(thresh_frame, from_=5, to=60, number_of_steps=55,
+    ctk.CTkSlider(thresh_row, from_=5, to=60, number_of_steps=55,
                   variable=thresh_var, command=on_thresh,
-                  width=310).pack(side="left")
+                  progress_color=C_ACCENT, button_color=C_ACCENT,
+                  button_hover_color=C_ACCENT_H).pack(
+        side="left", fill="x", expand=True, padx=(0, 8))
 
-    # ── Footer buttons ────────────────────────────────────────────────────────
+    # ── Footer ────────────────────────────────────────────────────────────────
     ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
 
-    btn_frame = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=60)
-    btn_frame.pack(fill="x")
-    btn_frame.pack_propagate(False)
-
-    btn_inner = ctk.CTkFrame(btn_frame, fg_color="transparent")
-    btn_inner.pack(side="left", padx=16, pady=12)
+    foot = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=64)
+    foot.pack(fill="x")
+    foot.pack_propagate(False)
 
     def on_save():
         new_settings = {
@@ -269,15 +277,18 @@ def open_settings_window(parent, voices: list, profiles: list, on_save_callback=
             on_save_callback(new_settings)
         win.destroy()
 
+    # Buttons right-aligned, primary Save + ghost Cancel
     ctk.CTkButton(
-        btn_inner, text="Save Settings", command=on_save,
-        width=148, height=36,
-        font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
-    ).pack(side="left", padx=(0, 10))
+        foot, text="Save", command=on_save,
+        width=110, height=34,
+        font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+        fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color=C_BG,
+        corner_radius=8,
+    ).pack(side="right", padx=(0, 20), pady=15)
 
     ctk.CTkButton(
-        btn_inner, text="Cancel", command=win.destroy,
-        width=96, height=36,
+        foot, text="Cancel", command=win.destroy,
+        width=90, height=34,
         font=ctk.CTkFont(family="Segoe UI", size=12),
-        **BTN_GHOST
-    ).pack(side="left")
+        corner_radius=8, **BTN_GHOST
+    ).pack(side="right", padx=(0, 8), pady=15)
