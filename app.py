@@ -2573,18 +2573,9 @@ def _do_word_count():
     speed = speed_slider.get()
     audio = estimate_audio_duration(text, speed)
     proc  = estimate_processing_time(text)
-    cal       = _get_calibration()
-    use_cb    = engine_var.get() == "Natural"
-    n_samples = len(cal.get("cb_samples" if use_cb else "samples") or [])
-    if n_samples == 0:
-        note = "  (Calibrating — improves after first run)"
-    elif n_samples == 1:
-        note = "  (Calibrating...)"
-    else:
-        note = ""
     word_count_label.configure(
         text=f"Words: {words:,}  |  Chars: {chars:,}  |  "
-             f"Audio: ~{format_time(audio)}  |  Processing: ~{format_time(proc)}{note}"
+             f"Audio: ~{format_time(audio)}  |  Processing: ~{format_time(proc)}"
     )
 
 # ── Main Actions ──────────────────────────────────────────────────────────────
@@ -2637,6 +2628,7 @@ def generate_and_store():
             add_to_history(samples, sr, text, voice_name, segments=segments)
             app.after(0, lambda: status_label.configure(
                 text="✅ Audio ready! Click ▶ Play in the history panel."))
+            app.after(0, update_word_count)  # refresh calibration note
         except GenerationCancelled:
             smooth.finish()
             app.after(0, lambda: status_label.configure(text="Generation cancelled."))
