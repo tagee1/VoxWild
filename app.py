@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.0.1"
+VERSION          = "1.0.2"
 GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
@@ -5212,15 +5212,11 @@ def _show_update_banner(latest_tag: str):
 
 
 def _check_for_update():
-    """Background thread: check GitHub releases API once per day.
+    """Background thread: check GitHub releases API on every launch.
     Never raises — update check is best-effort and must not affect startup."""
     try:
         import urllib.request
         import json as _json
-        s = _get_settings()
-        today = datetime.now().strftime("%Y-%m-%d")
-        if s.get("last_update_check") == today:
-            return
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         req = urllib.request.Request(
             api_url, headers={"User-Agent": f"TTS-Studio/{VERSION}"})
@@ -5231,8 +5227,6 @@ def _check_for_update():
             return
         current = tuple(int(x) for x in VERSION.split(".") if x.isdigit())
         latest  = tuple(int(x) for x in tag.split(".")  if x.isdigit())
-        s["last_update_check"] = today
-        _save_settings(s)
         if latest > current:
             v = data["tag_name"]
             app.after(0, lambda: _show_update_banner(v))
