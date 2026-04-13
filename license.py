@@ -4,14 +4,14 @@ license.py — Gumroad license key validation for TTS Studio.
 Flow:
   - First GRACE_LAUNCHES launches: app runs freely, status bar shows a countdown.
   - Freemium: Fast mode free forever. Natural: 3 free generations. Enhancement: 3 free uses.
-  - On activation: calls Gumroad /v2/licenses/verify (increment_uses_count=true),
+  - On activation: calls Gumroad /v2/licenses/verify (increment_uses_count=false),
     stores key locally.
   - Subsequent launches: validated locally; silent background re-validation once
     per session to catch revoked keys.
 
 Gumroad license API:
   POST https://api.gumroad.com/v2/licenses/verify
-  Body: product_permalink=<id>&license_key=<key>&increment_uses_count=<true|false>
+  Body: product_id=<permalink>&license_key=<key>&increment_uses_count=<true|false>
   Response: { success: true/false, purchase: {...}, uses: N }
 """
 import os
@@ -31,11 +31,20 @@ LICENSE_FILE = os.path.join(_USER_DIR, "license.json")
 GRACE_LAUNCHES    = 3
 FREE_NATURAL_USES = 3   # lifetime free Natural (Chatterbox) generations
 FREE_ENHANCE_USES = 3   # lifetime free Resemble Enhance uses
+MAX_MACHINES      = 2   # max simultaneous machine activations per key
 
 # Gumroad product permalinks — one per product (monthly vs lifetime)
 PRODUCT_PERMALINK          = "TTSStudioPro"          # monthly
 PRODUCT_PERMALINK_LIFETIME = "TTSStudioProLifetime"  # lifetime
 _ALL_PERMALINKS = (PRODUCT_PERMALINK, PRODUCT_PERMALINK_LIFETIME)
+
+# Gumroad internal product IDs — required for products created after Jan 2023.
+# The API rejects product_permalink and demands product_id instead.
+# Both products share the same internal ID on Gumroad.
+_GUMROAD_PRODUCT_ID = "cwSJcg1w4rgcNO-T6K732w=="
+
+# Fallback cache for runtime discovery (if hardcoded ID ever changes)
+_PRODUCT_IDS = {}  # permalink -> internal product_id
 
 # Store URLs
 STORE_URL          = "https://cookiestudios.gumroad.com"
@@ -53,7 +62,19 @@ _DEFAULT_LICENSE = {
     "launch_count":    0,
     "natural_uses":    0,
     "enhance_uses":    0,
+    "machine_id":      None,
 }
+
+
+def _get_machine_id():
+    """Generate a stable machine fingerprint.
+
+    Uses computer name + OS username, hashed. Survives reinstalls because
+    license.json lives in %APPDATA% which the installer doesn't delete.
+    """
+    import hashlib, platform, getpass
+    raw = f"{platform.node()}|{getpass.getuser()}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 # ── License file I/O ──────────────────────────────────────────────────────────
@@ -172,12 +193,58 @@ def _gr_post(params):
         return False, {"error": f"Unexpected error: {e}"}
 
 
+import re
+_PRODUCT_ID_RE = re.compile(r"set 'product_id' to '([^']+)'")
+
+
+def _verify_license(permalink, key, increment):
+    """Verify a license key against a Gumroad product.
+
+    Gumroad products created after Jan 2023 require the internal product_id
+    (not the permalink slug) for license verification.  We try:
+      1. The hardcoded _GUMROAD_PRODUCT_ID (fastest, no extra round-trip)
+      2. Any previously discovered ID in _PRODUCT_IDS cache
+      3. product_permalink as a fallback — if Gumroad's error contains
+         the real product_id, we extract it and retry.
+
+    Returns (ok: bool, response: dict).
+    """
+    params_base = {"license_key": key, "increment_uses_count": increment}
+
+    # 1. Try the hardcoded product_id first (covers both monthly & lifetime)
+    ok, resp = _gr_post({**params_base, "product_id": _GUMROAD_PRODUCT_ID})
+    if ok and resp.get("success") is True:
+        return ok, resp
+
+    # 2. Try cached discovered ID (if different from hardcoded)
+    if permalink in _PRODUCT_IDS and _PRODUCT_IDS[permalink] != _GUMROAD_PRODUCT_ID:
+        ok, resp = _gr_post({**params_base, "product_id": _PRODUCT_IDS[permalink]})
+        if ok and resp.get("success") is True:
+            return ok, resp
+
+    # 3. Fallback: use product_permalink, discover product_id from error
+    ok, resp = _gr_post({**params_base, "product_permalink": permalink})
+    if ok and resp.get("success") is True:
+        return ok, resp
+
+    # Extract product_id from Gumroad's error message if present
+    msg = resp.get("message", "")
+    m = _PRODUCT_ID_RE.search(msg)
+    if m:
+        real_id = m.group(1)
+        _PRODUCT_IDS[permalink] = real_id
+        return _gr_post({**params_base, "product_id": real_id})
+
+    return ok, resp
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 def activate_license(key, path=None):
     """
-    Activate a license key via Gumroad (increments use count).
-    Tries monthly permalink first, then lifetime — covers both products.
-    Saves the result to license.json on success.
+    Activate a license key via Gumroad with machine-based use tracking.
+
+    Same-machine reinstalls don't burn an activation (machine_id matches).
+    New machines increment the use count; rejected if uses > MAX_MACHINES.
 
     Returns:
         (success: bool, message: str)
@@ -186,22 +253,34 @@ def activate_license(key, path=None):
     if not key:
         return False, "Please enter a license key."
 
+    # Check if this is the same machine that already activated this key
+    lic = load_license(path)
+    current_machine = _get_machine_id()
+    same_machine = (lic.get("key") == key and lic.get("machine_id") == current_machine)
+
+    # Same machine reinstall → don't increment; new machine → increment
+    increment = "false" if same_machine else "true"
+
     ok, resp = False, {}
     for permalink in _ALL_PERMALINKS:
-        ok, resp = _gr_post({
-            "product_permalink":    permalink,
-            "license_key":          key,
-            "increment_uses_count": "true",
-        })
+        ok, resp = _verify_license(permalink, key, increment)
         if ok and resp.get("success") is True:
             break  # found the right product
 
     if ok and resp.get("success") is True:
-        lic = load_license(path)
+        # Check activation limit (only matters for new machines)
+        uses = resp.get("uses", 1)
+        if not same_machine and uses > MAX_MACHINES:
+            return False, (
+                f"This license key is already active on {MAX_MACHINES} machines. "
+                "Deactivate another machine or contact support."
+            )
+
         lic.update({
             "key":             key,
             "activated":       True,
             "activation_date": datetime.now().isoformat(),
+            "machine_id":      current_machine,
         })
 
         saved = save_license(lic, path)
@@ -235,11 +314,7 @@ def validate_license_silent(key):
         return False
 
     for permalink in _ALL_PERMALINKS:
-        ok, resp = _gr_post({
-            "product_permalink":    permalink,
-            "license_key":          key,
-            "increment_uses_count": "false",
-        })
+        ok, resp = _verify_license(permalink, key, "false")
         if resp.get("_network_error"):
             return True  # can't reach server — assume valid, check again next session
         if ok and resp.get("success") is True:

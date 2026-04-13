@@ -1,5 +1,20 @@
 import sys
+import os
 import ctypes
+import multiprocessing
+multiprocessing.freeze_support()
+
+# ── Make python_embed packages importable in the frozen app ──────────────────
+# resemble-enhance (and future pip-installed packages) live in python_embed's
+# site-packages. Append (not prepend) so PyInstaller-bundled packages keep
+# priority and only packages NOT in the bundle are resolved from python_embed.
+_embed_sp = os.path.join(
+    os.environ.get("APPDATA", ""), "TTS Studio",
+    "python_embed", "Lib", "site-packages",
+)
+if os.path.isdir(_embed_sp) and _embed_sp not in sys.path:
+    sys.path.append(_embed_sp)
+del _embed_sp
 
 # ── Suppress console windows for ALL subprocesses (torch, resemble-enhance, etc.) ──
 # Any library that calls subprocess.Popen without CREATE_NO_WINDOW would pop a
@@ -19,7 +34,6 @@ import sounddevice as sd
 import soundfile as sf
 import threading
 import numpy as np
-import os
 import json
 import re
 import time
@@ -97,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.0.1"
+VERSION          = "1.0.0"
 GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
@@ -276,7 +290,7 @@ except Exception:
     pass
 
 app = ctk.CTk()
-app.title(f"AI Text to Speech Studio  v{VERSION}")
+app.title(f"TTS Studio  v{VERSION}")
 app.geometry("1380x860")
 app.minsize(1100, 720)
 
@@ -288,11 +302,28 @@ app.report_callback_exception = _on_tk_exception
 app.configure(fg_color=C_BG)
 app.withdraw()   # hidden until splash finishes
 
+# ── Windows taskbar identity ─────────────────────────────────────────────────
+# Set AppUserModelID so Windows shows our icon in the taskbar instead of the
+# generic Python icon. Must be called before the window is shown.
+try:
+    import ctypes
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CookieStudios.TTSStudio.1")
+except Exception:
+    pass
+
 # Set app icon (deferred slightly so taskbar picks it up after window is shown)
 _APP_DIR = _res(".")
 def _set_icon():
     try:
         app.iconbitmap(_res("icon.ico"))
+    except Exception:
+        pass
+    # Also set iconphoto for window managers that don't use iconbitmap
+    try:
+        from PIL import Image as _IconImg, ImageTk as _IconTk
+        _icon_img = _IconImg.open(_res("icon.ico"))
+        _icon_photo = _IconTk.PhotoImage(_icon_img)
+        app.iconphoto(True, _icon_photo)
     except Exception:
         pass
 app.after(100, _set_icon)
@@ -350,7 +381,7 @@ def _run_splash(on_done):
         ctk.CTkLabel(inner, image=LOGO_IMG_LG, text="").place(relx=0.5, rely=0.28, anchor="center")
 
     # App name
-    ctk.CTkLabel(inner, text="AI Text to Speech Studio",
+    ctk.CTkLabel(inner, text="TTS Studio",
                  font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
                  text_color=C_TXT).place(relx=0.5, rely=0.60, anchor="center")
     ctk.CTkLabel(inner, text=f"v{VERSION}  ·  Kokoro  ·  Chatterbox",
@@ -417,12 +448,13 @@ class ChatterboxEngine:
     WORKER = _res("chatterbox_worker.py")
 
     # Dev env (running from source) — sibling of app.py
-    _PYTHON_DEV  = _res(os.path.join("chatterbox_env", "Scripts", "python.exe"))
-    # Installed env — created by auto-setup, lives in APPDATA (always user-writable)
-    _CB_ENV_DIR  = os.path.join(
-        os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio", "chatterbox_env"
+    _PYTHON_DEV    = _res(os.path.join("chatterbox_env", "Scripts", "python.exe"))
+    # Auto-installed env: embeddable Python extracted to APPDATA (no system Python needed)
+    _CB_BASE_DIR   = os.path.join(
+        os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio"
     )
-    _PYTHON_USER = os.path.join(_CB_ENV_DIR, "Scripts", "python.exe")
+    _CB_PYTHON_DIR = os.path.join(_CB_BASE_DIR, "python_embed")
+    _PYTHON_USER   = os.path.join(_CB_PYTHON_DIR, "python.exe")
 
     def __init__(self):
         self._proc   = None
@@ -447,18 +479,47 @@ class ChatterboxEngine:
                     "chatterbox_env not found.\n"
                     f"Expected: {self.PYTHON}"
                 )
+
+            # Prepend the Python directory (and Scripts/) to PATH so Windows
+            # can find python3xx.dll and torch C-extension DLLs when the
+            # worker subprocess loads them. Without this, the frozen app's
+            # stripped PATH causes "Could not find module" OSErrors.
+            python_dir  = os.path.dirname(self.PYTHON)
+            scripts_dir = os.path.join(python_dir, "Scripts")
+            env = os.environ.copy()
+            env["PATH"] = (
+                python_dir + os.pathsep +
+                scripts_dir + os.pathsep +
+                env.get("PATH", "")
+            )
+            # Force UTF-8 on the worker's stdin/stdout/stderr so the parent
+            # (which reads with encoding="utf-8") never hits a codec mismatch.
+            env["PYTHONIOENCODING"] = "utf-8"
+
+            # Write stderr to a file (not a pipe) to avoid deadlocking on
+            # the 4 GB machine. Pipe-based stderr blocks the worker when the
+            # buffer fills with torch/diffusers warnings and the parent isn't
+            # draining it.  A file avoids this entirely.
+            _stderr_log = os.path.join(
+                os.environ.get("APPDATA", ""), "TTS Studio",
+                "worker_startup_crash.log",
+            )
+            _stderr_fh = open(_stderr_log, "w", encoding="utf-8")
+
             proc = subprocess.Popen(
                 [self.PYTHON, self.WORKER],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,
+                stderr=_stderr_fh,
+                # Binary mode — no text=True, no encoding.
+                # The worker writes UTF-8 bytes directly to the pipe.
+                # We read raw bytes here and decode ourselves.
+                # This eliminates all TextIOWrapper/locale mismatches.
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                env=env,
             )
-            for raw in proc.stdout:
-                raw = raw.strip()
+            for raw_bytes in proc.stdout:
+                raw = raw_bytes.decode("utf-8", errors="replace").strip()
                 if not raw:
                     continue
                 try:
@@ -467,21 +528,36 @@ class ChatterboxEngine:
                     continue  # skip any non-JSON noise
                 if msg["type"] == "status":
                     if status_cb:
-                        status_cb(f"🎙️ {msg['msg']}")
+                        status_cb(msg['msg'])
                 elif msg["type"] == "ready":
                     self._sr   = msg.get("sr", 24000)
                     self._proc = proc
+                    _stderr_fh.close()
                     return
                 elif msg["type"] == "error":
                     proc.kill()
+                    _stderr_fh.close()
                     raise RuntimeError(msg["msg"])
             proc.kill()
-            raise RuntimeError("Chatterbox worker exited during startup.")
+            _stderr_fh.close()
+            # Read back the log for the UI error message.
+            _stderr = ""
+            try:
+                with open(_stderr_log, encoding="utf-8") as _f:
+                    _stderr = _f.read()
+            except Exception:
+                pass
+            _tail = _stderr.strip().splitlines()[-3:] if _stderr.strip() else []
+            _hint = "\n".join(_tail)
+            raise RuntimeError(
+                f"Chatterbox worker exited during startup.\n{_hint}".strip()
+                + "  [E099]"
+            )
 
     def stop(self):
         if self._proc and self._proc.poll() is None:
             try:
-                self._proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                self._proc.stdin.write((json.dumps({"cmd": "quit"}) + "\n").encode("utf-8"))
                 self._proc.stdin.flush()
                 self._proc.wait(timeout=5)
             except Exception:
@@ -512,10 +588,10 @@ class ChatterboxEngine:
             "cfg_weight": cfg_weight,
             "temperature": temperature,
         }
-        self._proc.stdin.write(json.dumps(req) + "\n")
+        self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
         self._proc.stdin.flush()
-        for raw in self._proc.stdout:
-            raw = raw.strip()
+        for raw_bytes in self._proc.stdout:
+            raw = raw_bytes.decode("utf-8", errors="replace").strip()
             if not raw:
                 continue
             try:
@@ -524,7 +600,7 @@ class ChatterboxEngine:
                 continue  # skip non-JSON noise
             if msg["type"] == "status":
                 if status_cb:
-                    status_cb(f"🎙️ {msg['msg']}")
+                    status_cb(msg['msg'])
             elif msg["type"] == "done":
                 samples, sr = sf.read(tmp.name)
                 os.unlink(tmp.name)
@@ -538,114 +614,242 @@ class ChatterboxEngine:
 
 chatterbox_engine = ChatterboxEngine()
 
+
+class EnhanceEngine:
+    """Manages a persistent enhance_worker.py subprocess."""
+
+    WORKER = _res("enhance_worker.py")
+
+    # Same Python paths as ChatterboxEngine — enhancement runs in python_embed
+    _CB_BASE_DIR   = os.path.join(
+        os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio"
+    )
+    _CB_PYTHON_DIR = os.path.join(_CB_BASE_DIR, "python_embed")
+    _PYTHON_USER   = os.path.join(_CB_PYTHON_DIR, "python.exe")
+    _PYTHON_DEV    = _res(os.path.join("chatterbox_env", "Scripts", "python.exe"))
+
+    def __init__(self):
+        self._proc = None
+        self._lock = threading.Lock()
+
+    @property
+    def PYTHON(self):
+        if os.path.exists(self._PYTHON_DEV):
+            return self._PYTHON_DEV
+        return self._PYTHON_USER
+
+    def start(self, status_cb=None):
+        """Start worker and block until ready. Raises on failure."""
+        with self._lock:
+            if self.is_ready:
+                return
+            if not os.path.exists(self.PYTHON):
+                raise FileNotFoundError(
+                    "python_embed not found — set up Natural mode first.\n"
+                    f"Expected: {self.PYTHON}"
+                )
+
+            python_dir  = os.path.dirname(self.PYTHON)
+            scripts_dir = os.path.join(python_dir, "Scripts")
+            env = os.environ.copy()
+            env["PATH"] = (
+                python_dir + os.pathsep +
+                scripts_dir + os.pathsep +
+                env.get("PATH", "")
+            )
+            env["PYTHONIOENCODING"] = "utf-8"
+
+            _stderr_log = os.path.join(
+                os.environ.get("APPDATA", ""), "TTS Studio",
+                "enhance_startup_crash.log",
+            )
+            _stderr_fh = open(_stderr_log, "w", encoding="utf-8")
+
+            proc = subprocess.Popen(
+                [self.PYTHON, self.WORKER],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=_stderr_fh,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                env=env,
+            )
+            for raw_bytes in proc.stdout:
+                raw = raw_bytes.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if msg["type"] == "status":
+                    if status_cb:
+                        status_cb(msg["msg"])
+                elif msg["type"] == "ready":
+                    self._proc = proc
+                    _stderr_fh.close()
+                    return
+                elif msg["type"] == "error":
+                    proc.kill()
+                    _stderr_fh.close()
+                    raise RuntimeError(msg["msg"])
+            proc.kill()
+            _stderr_fh.close()
+            _stderr = ""
+            try:
+                with open(_stderr_log, encoding="utf-8") as _f:
+                    _stderr = _f.read()
+            except Exception:
+                pass
+            _tail = _stderr.strip().splitlines()[-3:] if _stderr.strip() else []
+            _hint = "\n".join(_tail)
+            raise RuntimeError(
+                f"Enhance worker exited during startup.\n{_hint}".strip()
+                + "  [E013]"
+            )
+
+    def stop(self):
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.stdin.write(
+                    (json.dumps({"cmd": "quit"}) + "\n").encode("utf-8")
+                )
+                self._proc.stdin.flush()
+                self._proc.wait(timeout=5)
+            except Exception:
+                self._proc.kill()
+        self._proc = None
+
+    @property
+    def is_ready(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    def enhance(self, input_path, output_path, device="cpu", status_cb=None):
+        """Enhance one audio file; returns (sample_rate, rms_delta_db)."""
+        req = {
+            "cmd": "enhance",
+            "input_path": input_path,
+            "output_path": output_path,
+            "device": device,
+        }
+        self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
+        self._proc.stdin.flush()
+        for raw_bytes in self._proc.stdout:
+            raw = raw_bytes.decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if msg["type"] == "status":
+                if status_cb:
+                    status_cb(msg["msg"])
+            elif msg["type"] == "done":
+                return msg.get("sr", 44100), msg.get("rms_delta_db", 0.0)
+            elif msg["type"] == "error":
+                self.stop()
+                raise RuntimeError(msg["msg"])
+        self.stop()
+        raise RuntimeError("Enhance worker closed unexpectedly.")
+
+
+enhance_engine = EnhanceEngine()
+
 # ── Chatterbox auto-setup helpers ─────────────────────────────────────────────
 
 def _cb_env_exists():
-    """Return True if a usable chatterbox_env Python is already installed."""
+    """Return True if a usable Natural mode Python is already installed."""
     return os.path.exists(chatterbox_engine.PYTHON)
-
-
-def _find_system_python():
-    """
-    Find Python 3.10+ on the system.
-    Tries the Windows py launcher with specific versions first, then generic names.
-    Returns the executable path string, or None if not found.
-    """
-    import shutil
-
-    # Windows Python Launcher — most reliable (tries 3.11 first to match our env)
-    if shutil.which("py"):
-        for ver in ("3.11", "3.12", "3.10", "3.13"):
-            try:
-                r = subprocess.run(
-                    ["py", f"-{ver}", "-c", "import sys; print(sys.executable)"],
-                    capture_output=True, text=True, timeout=8,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-                if r.returncode == 0 and r.stdout.strip():
-                    return r.stdout.strip()
-            except Exception:
-                pass
-
-    # Fall back to generic interpreter names
-    for name in ("python3", "python"):
-        path = shutil.which(name)
-        if not path:
-            continue
-        try:
-            r = subprocess.run(
-                [path, "-c",
-                 "import sys; v=sys.version_info; "
-                 "print(v.major, v.minor); print(sys.executable)"],
-                capture_output=True, text=True, timeout=8,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            if r.returncode == 0:
-                lines = r.stdout.strip().splitlines()
-                if len(lines) >= 2:
-                    major, minor = map(int, lines[0].split())
-                    if (major, minor) >= (3, 10):
-                        return lines[1]
-        except Exception:
-            pass
-
-    return None
 
 
 def _run_chatterbox_setup(update_status, on_success, on_failure):
     """
-    Background thread: find Python → create venv → install packages.
+    Background thread: download embeddable Python → bootstrap pip → install packages.
+    No system Python required — downloads and manages its own interpreter.
     Calls on_success() or on_failure(error_message) when done.
     """
-    env_dir     = ChatterboxEngine._CB_ENV_DIR
-    python_user = ChatterboxEngine._PYTHON_USER
+    import urllib.request
+    import urllib.error
+    import zipfile
+    import glob as _glob
+    import tempfile
 
-    # Step 1 — find Python
-    update_status("Looking for Python 3.10+ on your system…")
-    py = _find_system_python()
-    if not py:
-        on_failure(
-            "Python 3.10 or later was not found on your system.\n\n"
-            "Please install Python from python.org (3.10, 3.11, 3.12, or 3.13),\n"
-            "then switch to Natural mode again."
-        )
-        return
+    python_dir = ChatterboxEngine._CB_PYTHON_DIR
+    python_exe = ChatterboxEngine._PYTHON_USER
 
-    # Step 2 — create venv
-    update_status("Creating Natural mode environment…")
-    try:
-        os.makedirs(os.path.dirname(env_dir), exist_ok=True)
-        r = subprocess.run(
-            [py, "-m", "venv", env_dir],
-            capture_output=True, text=True, timeout=120,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        if r.returncode != 0:
-            on_failure(
-                "Failed to create Python environment:\n"
-                + (r.stderr or r.stdout or "Unknown error").strip()[-400:]
-            )
+    # ── Step 1: download + extract Python embeddable ─────────────────────────
+    if not os.path.exists(python_exe):
+        update_status("Downloading Python 3.11 (~15 MB)…")
+        py_url  = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+        zip_tmp = os.path.join(tempfile.gettempdir(), "tts_python_embed.zip")
+        try:
+            os.makedirs(python_dir, exist_ok=True)
+            urllib.request.urlretrieve(py_url, zip_tmp)
+        except urllib.error.URLError as e:
+            on_failure(f"Could not download Python — check your internet connection.\n({e})")
             return
-    except Exception as e:
-        on_failure(f"Failed to create Python environment: {e}")
-        return
+        except Exception as e:
+            on_failure(f"Failed to download Python: {e}")
+            return
 
-    # Step 3 — upgrade pip (non-fatal if it fails)
-    update_status("Upgrading pip…")
-    try:
-        subprocess.run(
-            [python_user, "-m", "pip", "install", "--upgrade", "pip", "--quiet"],
-            capture_output=True, timeout=120,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    except Exception:
-        pass
+        update_status("Extracting Python 3.11…")
+        try:
+            with zipfile.ZipFile(zip_tmp, "r") as zf:
+                zf.extractall(python_dir)
+            os.unlink(zip_tmp)
+        except Exception as e:
+            on_failure(f"Failed to extract Python: {e}")
+            return
 
-    # Step 4 — install PyTorch CPU (~800 MB)
-    update_status("Downloading PyTorch (CPU) — ~800 MB, this may take a few minutes…")
+        # Enable site-packages so pip-installed libraries are importable.
+        # The embeddable zip ships with '#import site' commented out — uncomment it.
+        try:
+            for pth in _glob.glob(os.path.join(python_dir, "python*._pth")):
+                with open(pth, encoding="utf-8") as f:
+                    content = f.read()
+                content = content.replace("#import site", "import site")
+                with open(pth, "w", encoding="utf-8") as f:
+                    f.write(content)
+        except Exception as e:
+            on_failure(f"Failed to configure Python environment: {e}")
+            return
+
+    # ── Step 2: bootstrap pip ─────────────────────────────────────────────────
+    pip_exe = os.path.join(python_dir, "Scripts", "pip.exe")
+    if not os.path.exists(pip_exe):
+        update_status("Installing pip…")
+        get_pip_url = "https://bootstrap.pypa.io/get-pip.py"
+        get_pip_tmp = os.path.join(tempfile.gettempdir(), "tts_get_pip.py")
+        try:
+            urllib.request.urlretrieve(get_pip_url, get_pip_tmp)
+        except urllib.error.URLError as e:
+            on_failure(f"Could not download pip installer — check your internet connection.\n({e})")
+            return
+        except Exception as e:
+            on_failure(f"Failed to download pip installer: {e}")
+            return
+        try:
+            r = subprocess.run(
+                [python_exe, get_pip_tmp, "--quiet"],
+                capture_output=True, text=True, timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            os.unlink(get_pip_tmp)
+            if r.returncode != 0:
+                on_failure(
+                    "Failed to install pip:\n"
+                    + (r.stderr or r.stdout or "Unknown error").strip()[-400:]
+                )
+                return
+        except Exception as e:
+            on_failure(f"Failed to install pip: {e}")
+            return
+
+    # ── Step 3: install PyTorch CPU (~800 MB) ─────────────────────────────────
+    update_status("Downloading PyTorch (CPU) — ~800 MB, this may take several minutes…")
     try:
         r = subprocess.run(
-            [python_user, "-m", "pip", "install",
+            [python_exe, "-m", "pip", "install",
              "torch==2.6.0", "torchaudio==2.6.0",
              "--index-url", "https://download.pytorch.org/whl/cpu",
              "--quiet"],
@@ -665,11 +869,11 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
         on_failure(f"Failed to install PyTorch: {e}")
         return
 
-    # Step 5 — install chatterbox-tts (~200 MB)
+    # ── Step 4: install chatterbox-tts (~200 MB) ──────────────────────────────
     update_status("Installing Chatterbox TTS and dependencies…")
     try:
         r = subprocess.run(
-            [python_user, "-m", "pip", "install", "chatterbox-tts==0.1.7", "--quiet"],
+            [python_exe, "-m", "pip", "install", "chatterbox-tts==0.1.7", "--quiet"],
             capture_output=True, text=True, timeout=600,    # 10 min
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
@@ -686,9 +890,23 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
         on_failure(f"Failed to install Chatterbox: {e}")
         return
 
-    # Verify
-    if not os.path.exists(python_user):
-        on_failure("Setup finished but environment not found — please try again.")
+    # ── Step 5: copy VCOMP140.DLL into torchaudio\lib\ ───────────────────────────
+    # torchaudio's libtorchaudio.pyd links to VCOMP140.DLL (the VC++ OpenMP runtime).
+    # On machines without the Visual C++ Redistributable, this DLL is missing from
+    # System32 and causes E099. We bundle vcomp140.dll with the installer and copy
+    # it right next to libtorchaudio.pyd so Windows finds it automatically.
+    try:
+        import shutil as _shutil
+        _vcomp_src = _res("vcomp140.dll")
+        _taudio_lib_dir = os.path.join(python_dir, "Lib", "site-packages", "torchaudio", "lib")
+        if os.path.exists(_vcomp_src) and os.path.isdir(_taudio_lib_dir):
+            _shutil.copy2(_vcomp_src, os.path.join(_taudio_lib_dir, "vcomp140.dll"))
+        del _shutil, _vcomp_src, _taudio_lib_dir
+    except Exception:
+        pass  # non-fatal — machines with VC++ Redistributable already have it in System32
+
+    if not os.path.exists(python_exe):
+        on_failure("Setup finished but Python not found — please try again.")
         return
 
     on_success()
@@ -738,7 +956,7 @@ def _save_fx_settings():
         s["fx_gain"]              = gain_slider.get()
         s["fx_noise_gate"]        = noise_gate_var.get()
         s["fx_trim"]              = trim_var.get()
-        s["fx_enhance"]           = enhance_var.get()
+        s["fx_enhance"]           = False  # never persist — see _restore_fx_settings
         s["fx_enhance_mode"]      = enhance_mode.get()
         _save_settings(s)
     except Exception:
@@ -757,8 +975,12 @@ def _restore_fx_settings():
         noise_gate_var.set(s.get("fx_noise_gate",        _FX_DEFAULTS["fx_noise_gate"]))
         trim_var.set(s.get("fx_trim",                    _FX_DEFAULTS["fx_trim"]))
         enhance_mode.set(s.get("fx_enhance_mode",        _FX_DEFAULTS["fx_enhance_mode"]))
-        # enhance_var last — its trace checks for resemble_enhance
-        enhance_var.set(s.get("fx_enhance",              _FX_DEFAULTS["fx_enhance"]))
+        # Never auto-restore the Enhancement checkbox. When checked, the trace
+        # fires _install_resemble_enhance which runs pip against python_embed.
+        # If the user switches to Natural mode while pip is still running, the
+        # worker imports packages that pip is actively modifying → silent crash.
+        # Enhancement must be explicitly opted-in each session.
+        # enhance_var.set(s.get("fx_enhance", _FX_DEFAULTS["fx_enhance"]))
         update_all_labels()
     except Exception:
         pass
@@ -800,7 +1022,7 @@ def save_calibration(data):
 def record_calibration(word_count, elapsed_seconds, use_cb=None):
     data = _get_calibration()
     if use_cb is None:
-        use_cb = engine_var.get() == "🎙️ Natural"
+        use_cb = engine_var.get() == "Natural"
     wps = word_count / elapsed_seconds if elapsed_seconds > 0 else (0.5 if use_cb else 55)
     _EMA_ALPHA = 0.4
     if use_cb:
@@ -818,7 +1040,7 @@ def record_calibration(word_count, elapsed_seconds, use_cb=None):
 
 def get_words_per_second():
     data = _get_calibration()
-    if engine_var.get() == "🎙️ Natural":
+    if engine_var.get() == "Natural":
         return data.get("cb_words_per_second") or 0.5
     return data.get("words_per_second") or 55
 
@@ -986,19 +1208,15 @@ def add_to_history(samples, sample_rate, text, voice_name, segments=None):
             app.after(0, lambda e=entry: _prepend_history_card(e))
             return
 
-        # Always show card immediately then enhance in background regardless of mode.
-        # CPU/GPU/Async only controls which device the enhance thread uses.
+        # Always show card immediately then enhance in background.
+        # CPU/GPU/Async controls which device the worker uses.
         mode = enhance_mode.get()
         if mode == "GPU":
             device = "cuda"
         elif mode == "CPU":
             device = "cpu"
-        else:  # Async — auto-detect
-            try:
-                import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                device = "cpu"
+        else:  # Async — worker auto-detects
+            device = "cpu"
         entry["enhancing"] = True
         app.after(0, lambda e=entry: _prepend_history_card(e))
         threading.Thread(target=_enhance_async, args=(entry, device), daemon=True).start()
@@ -1007,41 +1225,50 @@ def add_to_history(samples, sample_rate, text, voice_name, segments=None):
 
 
 def _enhance_async(entry, device="cpu"):
-    """Background thread: run Resemble Enhance, verify it worked, refresh the card."""
+    """Background thread: enhance audio via subprocess worker, refresh the card."""
     app.after(0, lambda: status_label.configure(
         text="✨ Enhancing audio... (first run downloads ~450 MB of model weights)"))
     try:
         original_samples = entry["samples"].copy()
         original_sr      = entry["sample_rate"]
 
-        enhanced, new_sr = enhance_audio(original_samples, original_sr, device=device)
-        enhanced_clipped = np.clip(enhanced, -1.0, 1.0)
+        # Write input audio to temp file for the worker
+        input_tmp  = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        output_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        input_tmp.close()
+        output_tmp.close()
 
-        # ── Verify enhancement actually changed the audio ─────────────────────
-        # Resample original to the output sr for a fair comparison
-        from scipy.signal import resample_poly
-        from math import gcd
-        g = gcd(original_sr, new_sr)
-        orig_resampled = resample_poly(original_samples, new_sr // g, original_sr // g).astype(np.float32)
-        min_len = min(len(orig_resampled), len(enhanced_clipped))
-        rms_orig     = float(np.sqrt(np.mean(orig_resampled[:min_len] ** 2)))
-        rms_enhanced = float(np.sqrt(np.mean(enhanced_clipped[:min_len] ** 2)))
-        mad = float(np.mean(np.abs(orig_resampled[:min_len] - enhanced_clipped[:min_len])))
+        sf.write(input_tmp.name, original_samples, original_sr)
 
-        if mad < 1e-6:
-            raise RuntimeError(
-                "Enhancement produced no change — the model output is identical to the input. "
-                "This usually means the model weights failed to load or the library isn't "
-                "working correctly. Try: pip install resemble-enhance --no-deps --force-reinstall  [E013]"
-            )
+        # Start worker if not already running
+        def _status(msg):
+            app.after(0, lambda m=msg: status_label.configure(text=f"✨ {m}"))
 
-        rms_delta_db = 20 * np.log10(rms_enhanced / rms_orig) if rms_orig > 1e-9 else 0.0
+        enhance_engine.start(status_cb=_status)
+
+        # Send enhance request
+        new_sr, rms_delta_db = enhance_engine.enhance(
+            input_tmp.name, output_tmp.name, device=device, status_cb=_status,
+        )
+
+        # Read back enhanced audio
+        enhanced, _ = sf.read(output_tmp.name, dtype="float32")
+
+        # Clean up temp files
+        try:
+            os.unlink(input_tmp.name)
+        except OSError:
+            pass
+        try:
+            os.unlink(output_tmp.name)
+        except OSError:
+            pass
 
         entry["original_samples"] = original_samples
         entry["original_sr"]      = original_sr
-        entry["samples"]          = enhanced_clipped
+        entry["samples"]          = enhanced
         entry["sample_rate"]      = new_sr
-        entry["duration"]         = len(enhanced_clipped) / new_sr
+        entry["duration"]         = len(enhanced) / new_sr
 
         _lic.record_enhance_use()
 
@@ -1049,18 +1276,21 @@ def _enhance_async(entry, device="cpu"):
             text=f"✅ Enhancement done  ({db:+.1f} dB RMS) — use Orig button to A/B compare"))
 
     except Exception as e:
-        # Use the raw error string — enhance_audio now writes descriptive messages.
-        # _fmt_err would compress these into a generic E013 line, losing the detail.
         _log_crash(e)
         raw_msg = str(e)
-        # Strip the [E013] tag from the display — it's noise for the status bar
         display_msg = raw_msg.replace("  [E013]", "").replace(" [E013]", "")
         app.after(0, lambda m=display_msg: status_label.configure(
             text=f"⚠️ Enhancement failed: {m}"))
+        # Clean up temp files on error
+        for _t in (input_tmp, output_tmp):
+            try:
+                os.unlink(_t.name)
+            except Exception:
+                pass
     finally:
         entry["enhancing"] = False
         app.after(0, refresh_history_panel)
-        app.after(0, _save_history)   # re-save with enhanced audio (or failed state)
+        app.after(0, _save_history)
 
 def _prepend_history_card(entry):
     """Add entry to the top of the history panel and rebuild."""
@@ -1164,18 +1394,18 @@ def _make_history_card(parent, idx, entry):
     row_play.pack(fill="x", pady=(7, 0))
 
     play_btn = ctk.CTkButton(
-        row_play, text="▶  Play", width=72, height=26,
+        row_play, text="Play", width=72, height=26,
         font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
         fg_color=C_ACCENT_D, hover_color=C_ACCENT, text_color=C_TXT, corner_radius=5,
     )
     pause_btn = ctk.CTkButton(
-        row_play, text="⏸", width=30, height=26,
-        font=ctk.CTkFont(family="Segoe UI", size=13),
+        row_play, text="Pause", width=50, height=26,
+        font=ctk.CTkFont(family="Segoe UI", size=11),
         state="disabled", **BTN_GHOST, corner_radius=5,
     )
     stop_btn = ctk.CTkButton(
-        row_play, text="⏹", width=30, height=26,
-        font=ctk.CTkFont(family="Segoe UI", size=13),
+        row_play, text="Stop", width=44, height=26,
+        font=ctk.CTkFont(family="Segoe UI", size=11),
         state="disabled", **BTN_GHOST, corner_radius=5,
     )
     play_btn.configure(command=lambda e=entry, b=play_btn, p=pause_btn, s=stop_btn:
@@ -1231,13 +1461,13 @@ def _make_history_card(parent, idx, entry):
             **BTN_GHOST, corner_radius=5,
         )
         orig_pause_btn = ctk.CTkButton(
-            row_act, text="⏸", width=26, height=22,
-            font=ctk.CTkFont(family="Segoe UI", size=11),
+            row_act, text="Pause", width=46, height=22,
+            font=ctk.CTkFont(family="Segoe UI", size=10),
             state="disabled", **BTN_GHOST, corner_radius=5,
         )
         orig_stop_btn  = ctk.CTkButton(
-            row_act, text="⏹", width=26, height=22,
-            font=ctk.CTkFont(family="Segoe UI", size=11),
+            row_act, text="Stop", width=40, height=22,
+            font=ctk.CTkFont(family="Segoe UI", size=10),
             state="disabled", **BTN_GHOST, corner_radius=5,
         )
         orig_play_btn.configure(
@@ -1248,9 +1478,8 @@ def _make_history_card(parent, idx, entry):
                 _toggle_history_pause(e, b, p))
         orig_stop_btn.configure(
             command=lambda b=orig_play_btn: _history_stop(b))
-        orig_play_btn.pack(side="left",  padx=(0, 2))
-        orig_pause_btn.pack(side="left", padx=(0, 2))
-        orig_stop_btn.pack(side="left",  padx=(0, 4))
+        orig_play_btn.pack(side="left",  padx=(0, 4))
+        # Pause/Stop hidden until playback starts (they look like empty boxes when disabled)
 
     return outer
 
@@ -1265,12 +1494,14 @@ def _reset_play_btn():
     pause_btn = _active_pause_btn[0]
     if pause_btn:
         try:
-            pause_btn.configure(text="⏸", state="disabled")
+            pause_btn.pack_forget()
+            pause_btn.configure(text="Pause", state="disabled")
         except Exception:
             pass
     stop_btn = _active_stop_btn[0]
     if stop_btn:
         try:
+            stop_btn.pack_forget()
             stop_btn.configure(state="disabled")
         except Exception:
             pass
@@ -1318,11 +1549,13 @@ def _toggle_history_playback(entry, btn, pause_btn=None, stop_btn=None):
             pass
     if pause_btn:
         try:
+            pause_btn.pack(side="left", padx=(0, 2))
             pause_btn.configure(state="normal")
         except Exception:
             pass
     if stop_btn:
         try:
+            stop_btn.pack(side="left", padx=(0, 4))
             stop_btn.configure(state="normal")
         except Exception:
             pass
@@ -1352,7 +1585,7 @@ def _history_stop(play_btn):
         _play_id[0] += 1   # invalidate any bg thread before stopping
         sd.stop()
         _reset_play_btn()
-        status_label.configure(text="⏹ Stopped.")
+        status_label.configure(text="Stopped.")
     except Exception as e:
         _log_crash(e)
 
@@ -1375,17 +1608,17 @@ def _toggle_history_pause(entry, play_btn, pause_btn):
             _log_crash(e)
         if pause_btn:
             try:
-                pause_btn.configure(text="▶")
+                pause_btn.configure(text="Resume")
             except Exception:
                 pass
-        status_label.configure(text="⏸ Paused.")
+        status_label.configure(text="Paused.")
     else:
         # ── Resume ───────────────────────────────────────────────────────────
         resume_pos = _pause_pos[0]
         _pause_pos[0] = None
         if pause_btn:
             try:
-                pause_btn.configure(text="⏸")
+                pause_btn.configure(text="Pause")
             except Exception:
                 pass
 
@@ -1545,7 +1778,7 @@ def _save_as_mp3(entry, filepath):
         _year    = year_var.get().strip()
         _quality = quality_var.get()
         win.destroy()
-        status_label.configure(text="⏳ Encoding MP3...")
+        status_label.configure(text="Encoding MP3...")
         app.update_idletasks()
 
         try:
@@ -1832,12 +2065,12 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
     """
     lo, hi = progress_range
     text = apply_pronunciation(text)
-    use_chatterbox = engine_var.get() == "🎙️ Natural"
+    use_chatterbox = engine_var.get() == "Natural"
 
     if use_chatterbox:
         # ── Chatterbox path ────────────────────────────────────────────────────
         if not chatterbox_engine.is_ready:
-            if status_cb: status_cb("🎙️ Waiting for Natural mode to finish loading...")
+            if status_cb: status_cb("Waiting for Natural mode to finish loading...")
             chatterbox_engine.start(status_cb=status_cb)
         chunks = chunk_text(text)
         all_samples, sample_rate = [], None
@@ -1851,7 +2084,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
         for i, chunk in enumerate(chunks):
             if _cancel_event.is_set():
                 raise GenerationCancelled()
-            if status_cb: status_cb(f"🎙️ Generating chunk {i+1}/{len(chunks)}...")
+            if status_cb: status_cb(f"Generating chunk {i+1}/{len(chunks)}...")
             samples, sr = chatterbox_engine.generate_chunk(
                 chunk,
                 audio_prompt_path=prompt,
@@ -2236,7 +2469,7 @@ def queue_generate_all():
     bitrate      = {"128 kbps": 128, "192 kbps": 192, "320 kbps": 320}.get(
                        queue_mp3_quality_var.get(), 192)
     ext          = ".mp3" if use_mp3 else ".wav"
-    queue_natural = engine_var.get() == "🎙️ Natural"
+    queue_natural = engine_var.get() == "Natural"
 
     # ── Freemium gate: Natural mode — check before starting the batch ─────────
     if queue_natural and not _lic.can_use_natural():
@@ -2292,7 +2525,7 @@ def queue_generate_all():
                 safe_name = item['name'].replace(' ', '_')
                 out_path  = os.path.join(out_dir, f"{i+1:02d}_{safe_name}{ext}")
                 if use_mp3:
-                    scb(f"⏳ Encoding MP3...")
+                    scb(f"Encoding MP3...")
                     _encode_mp3_file(out_path, samples, sr, bitrate,
                                      title=item["name"], artist=voice_name)
                 else:
@@ -2340,18 +2573,9 @@ def _do_word_count():
     speed = speed_slider.get()
     audio = estimate_audio_duration(text, speed)
     proc  = estimate_processing_time(text)
-    cal       = _get_calibration()
-    use_cb    = engine_var.get() == "🎙️ Natural"
-    n_samples = len(cal.get("cb_samples" if use_cb else "samples") or [])
-    if n_samples == 0:
-        note = "  (Calibrating — improves after first run)"
-    elif n_samples == 1:
-        note = "  (Calibrating...)"
-    else:
-        note = ""
     word_count_label.configure(
         text=f"Words: {words:,}  |  Chars: {chars:,}  |  "
-             f"Audio: ~{format_time(audio)}  |  Processing: ~{format_time(proc)}{note}"
+             f"Audio: ~{format_time(audio)}  |  Processing: ~{format_time(proc)}"
     )
 
 # ── Main Actions ──────────────────────────────────────────────────────────────
@@ -2363,7 +2587,7 @@ def generate_and_store():
         status_label.configure(text="⚠️ Please enter some text.")
         return
 
-    using_natural = engine_var.get() == "🎙️ Natural"
+    using_natural = engine_var.get() == "Natural"
 
     # ── Freemium gate: Natural mode ───────────────────────────────────────────
     if using_natural and not _lic.can_use_natural():
@@ -2381,7 +2605,7 @@ def generate_and_store():
     est        = estimate_processing_time(text)
 
     _cancel_event.clear()
-    play_button.configure(state="disabled", text="⏳ Working...")
+    play_button.configure(state="disabled", text="Working...")
     stop_button.configure(state="normal", text="Cancel",
                           fg_color="#2a0f0f", hover_color="#3d1515",
                           text_color=C_DANGER, border_width=1, border_color="#3d1515")
@@ -2404,9 +2628,10 @@ def generate_and_store():
             add_to_history(samples, sr, text, voice_name, segments=segments)
             app.after(0, lambda: status_label.configure(
                 text="✅ Audio ready! Click ▶ Play in the history panel."))
+            app.after(0, update_word_count)  # refresh calibration note
         except GenerationCancelled:
             smooth.finish()
-            app.after(0, lambda: status_label.configure(text="⏹ Generation cancelled."))
+            app.after(0, lambda: status_label.configure(text="Generation cancelled."))
         except Exception as e:
             _log_crash(e)
             smooth.finish()
@@ -2414,7 +2639,7 @@ def generate_and_store():
             app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
         finally:
             is_generating = False
-            app.after(0, lambda: play_button.configure(state="normal", text="▶  Generate"))
+            app.after(0, lambda: play_button.configure(state="normal", text="Generate"))
             app.after(0, lambda: stop_button.configure(
                 state="disabled", text="Stop",
                 fg_color="transparent", hover_color=C_ELEVATED,
@@ -2428,8 +2653,8 @@ def stop_audio():
         cancel_generation()   # signals the generation thread to stop after current chunk
     else:
         sd.stop()
-        status_label.configure(text="⏹ Stopped.")
-        play_button.configure(state="normal", text="▶  Generate")
+        status_label.configure(text="Stopped.")
+        play_button.configure(state="normal", text="Generate")
         stop_button.configure(state="disabled", text="Stop",
                               fg_color="transparent", hover_color=C_ELEVATED,
                               text_color=C_TXT2, border_width=1, border_color=C_BORDER)
@@ -2881,14 +3106,14 @@ if LOGO_IMG_SM:
 else:
     ctk.CTkFrame(title_left, fg_color=C_ACCENT, width=10, height=10,
                  corner_radius=5).pack(side="left", padx=(0, 10))
-ctk.CTkLabel(title_left, text="AI Text to Speech Studio",
+ctk.CTkLabel(title_left, text="TTS Studio",
              font=ctk.CTkFont(family="Segoe UI", size=17, weight="bold"),
              text_color=C_TXT).pack(side="left")
 ctk.CTkLabel(title_left, text=f" v{VERSION}",
              font=ctk.CTkFont(family="Segoe UI", size=11),
              text_color=C_TXT3).pack(side="left")
 
-# Right: action buttons
+# Right: action buttons (packed right-to-left)
 ctk.CTkButton(header, text="About", command=show_about,
               width=72, height=30,
               font=ctk.CTkFont(family="Segoe UI", size=12),
@@ -2897,6 +3122,7 @@ ctk.CTkButton(header, text="Settings", command=show_settings,
               width=84, height=30,
               font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_GHOST).pack(side="right", padx=(0, 6), pady=14)
+
 _activate_btn = ctk.CTkButton(
     header, text="🔑 Activate", command=lambda: _show_activation_modal(can_skip=True),
     width=98, height=30,
@@ -2947,6 +3173,25 @@ smooth = SmoothProgress(progress_bar, progress_time_label)
 _sep(app)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
+# ── Tab bar + Generate/Stop row ──────────────────────────────────────────────
+_tab_row = ctk.CTkFrame(app, fg_color=C_BG, corner_radius=0, height=40)
+_tab_row.pack(fill="x")
+_tab_row.pack_propagate(False)
+
+stop_button = ctk.CTkButton(
+    _tab_row, text="Stop", command=stop_audio,
+    width=60, height=28,
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    state="disabled", **BTN_GHOST, corner_radius=8)
+stop_button.pack(side="right", padx=(0, 14), pady=6)
+
+play_button = ctk.CTkButton(
+    _tab_row, text="Generate", command=generate_and_store,
+    width=100, height=28,
+    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+    corner_radius=8)
+play_button.pack(side="right", padx=(0, 4), pady=6)
+
 tabs = ctk.CTkTabview(app, fg_color=C_BG)
 tabs.pack(fill="both", expand=True, padx=0, pady=0)
 tabs.add("  Studio  ")
@@ -3038,9 +3283,9 @@ mid_panel = _panel(studio, 1)
 _section_label(mid_panel, "ENGINE",
     tooltip="Choose between Fast mode (Kokoro — instant, offline) and Natural mode "
             "(Chatterbox — slower, more human-sounding, supports voice cloning).")
-engine_var = ctk.StringVar(value="⚡ Fast")
+engine_var = ctk.StringVar(value="Fast")
 engine_toggle = ctk.CTkSegmentedButton(
-    mid_panel, values=["⚡ Fast", "🎙️ Natural"],
+    mid_panel, values=["Fast", "Natural"],
     variable=engine_var,
     font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
     width=214)
@@ -3264,12 +3509,12 @@ def show_voice_recorder():
                               text_color=C_TXT3)
     timer_lbl.pack(side="left", padx=(14, 8), pady=12)
 
-    record_btn = ctk.CTkButton(ctrl, text="⏺  Record", width=120, height=36,
+    record_btn = ctk.CTkButton(ctrl, text="Record", width=120, height=36,
                                 font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
                                 fg_color=C_REC, hover_color="#a52020", corner_radius=8)
     record_btn.pack(side="left", padx=(0, 6), pady=12)
 
-    play_btn = ctk.CTkButton(ctrl, text="▶  Preview", width=100, height=36,
+    play_btn = ctk.CTkButton(ctrl, text="Preview", width=100, height=36,
                               font=ctk.CTkFont(family="Segoe UI", size=12),
                               **BTN_GHOST, corner_radius=8, state="disabled")
     play_btn.pack(side="left", padx=(0, 6), pady=12)
@@ -3304,7 +3549,7 @@ def show_voice_recorder():
             _chunks.clear()
         _recording.set()
         _start[0] = time.time()
-        record_btn.configure(text="⏹  Stop")
+        record_btn.configure(text="Stop")
         play_btn.configure(state="disabled")
         save_btn.configure(state="disabled")
         rec_status.configure(text="Recording...", text_color=C_REC)
@@ -3323,7 +3568,7 @@ def show_voice_recorder():
         if _stream[0]:
             _stream[0].stop(); _stream[0].close(); _stream[0] = None
         timer_lbl.configure(text_color=C_TXT3)
-        record_btn.configure(text="⏺  Record Again")
+        record_btn.configure(text="Record Again")
         with _chunks_lock:
             chunks_snap = list(_chunks)
         if not chunks_snap:
@@ -3488,7 +3733,7 @@ _section_label(cb_frame, "PARAMETERS",
 cb_exag_slider, cb_exag_label = make_slider(cb_frame, "Exaggeration", 0.0, 1.0, 20, 0.5,
     tooltip="Controls emotional intensity. Higher = more expressive and dramatic. "
             "Lower = flatter, more neutral. 0.5 is a good starting point.")
-cb_cfg_slider,  cb_cfg_label  = make_slider(cb_frame, "CFG Weight",   0.0, 1.0, 20, 0.0,
+cb_cfg_slider,  cb_cfg_label  = make_slider(cb_frame, "CFG Weight",   0.0, 1.0, 20, 0.5,
     tooltip="Classifier-Free Guidance — how closely the output follows the voice clone sample. "
             "Higher values sound more like the clone but can reduce naturalness. "
             "0 uses the model's own judgment.")
@@ -3502,7 +3747,7 @@ speed_slider, speed_label = make_slider(mid_panel, "Playback Speed", 0.5, 2.0, 3
 
 # Engine switch logic
 def _on_engine_change(*_):
-    if engine_var.get() == "🎙️ Natural":
+    if engine_var.get() == "Natural":
         kokoro_frame.pack_forget()
         cb_frame.pack(fill="x")
         if not chatterbox_engine.is_ready:
@@ -3520,7 +3765,7 @@ def _on_engine_change(*_):
                 ).start()
 
             def _revert_to_fast():
-                engine_var.set("⚡ Fast")
+                engine_var.set("Fast")
 
             def _after_setup():
                 """Called when auto-setup completes successfully — proceed with normal load."""
@@ -3543,33 +3788,12 @@ def _on_engine_change(*_):
         cb_frame.pack_forget()
         kokoro_frame.pack(fill="x")
         if chatterbox_engine.is_ready:
-            status_label.configure(text="⚡ Fast mode active — Natural mode unloaded.")
+            status_label.configure(text="Fast mode active — Natural mode unloaded.")
             threading.Thread(target=chatterbox_engine.stop, daemon=True).start()
 
 engine_var.trace_add("write", _on_engine_change)
 
-# Generate / Stop
-_sep(mid_panel)
-gen_btns = ctk.CTkFrame(mid_panel, fg_color="transparent")
-gen_btns.pack(fill="x", padx=14, pady=10)
-
-play_button = ctk.CTkButton(
-    gen_btns, text="▶  Generate", command=generate_and_store,
-    width=214, height=46,
-    font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
-    corner_radius=10)
-play_button.pack(pady=(0, 6))
-
-stop_button = ctk.CTkButton(
-    gen_btns, text="Stop", command=stop_audio,
-    width=214, height=30,
-    font=ctk.CTkFont(family="Segoe UI", size=12),
-    state="disabled", **BTN_GHOST, corner_radius=8)
-stop_button.pack(pady=(0, 4))
-
-ctk.CTkLabel(mid_panel, text="Ctrl+Enter  ·  Esc to stop",
-             font=ctk.CTkFont(family="Segoe UI", size=10),
-             text_color=C_TXT3).pack(pady=(4, 8))
+# Generate / Stop buttons are in the header bar
 
 # ── Enhancement panel ─────────────────────────────────────────────────────────
 # Outer card sits in the grid; inner scrollable frame holds all controls so
@@ -3582,6 +3806,48 @@ enh_panel = ctk.CTkScrollableFrame(
     scrollbar_button_hover_color=C_ACCENT_D)
 enh_panel.pack(fill="both", expand=True)
 
+# ── AI Enhancement (above FX so it's visible without scrolling) ───────────────
+_section_label(enh_panel, "AI ENHANCEMENT",
+    tooltip="Uses Resemble AI's enhancement model to improve audio quality — removes noise, "
+            "adds presence, and makes TTS sound more natural. "
+            "First use downloads ~450 MB of model weights. "
+            "Async mode runs in the background after generation.")
+
+enhance_var  = ctk.BooleanVar(value=False)
+enhance_mode = ctk.StringVar(value="Async")
+
+_enhance_row = ctk.CTkFrame(enh_panel, fg_color="transparent")
+_enhance_row.pack(fill="x", padx=14, pady=(0, 4))
+_enhance_cb = ctk.CTkCheckBox(_enhance_row, text="Resemble Enhance", variable=enhance_var,
+                              font=ctk.CTkFont(family="Segoe UI", size=11),
+                              text_color=C_TXT2, checkmark_color=C_ACCENT,
+                              fg_color=C_ACCENT_D, hover_color=C_ACCENT_D,
+                              border_color=C_BORDER)
+_enhance_cb.pack(side="left")
+
+_enhance_mode_btn = ctk.CTkSegmentedButton(
+    enh_panel,
+    values=["CPU", "GPU", "Async"],
+    variable=enhance_mode,
+    font=ctk.CTkFont(family="Segoe UI", size=11),
+    width=214,
+)
+_enhance_mode_btn.pack(padx=14, pady=(0, 4))
+
+# GPU hint (shown if CUDA not available)
+try:
+    import torch as _torch_check
+    if not _torch_check.cuda.is_available():
+        ctk.CTkLabel(enh_panel,
+                     text="GPU: no CUDA detected — use CPU or Async",
+                     font=ctk.CTkFont(family="Segoe UI", size=9),
+                     text_color=C_TXT3).pack(padx=14, anchor="w", pady=(0, 2))
+    del _torch_check
+except ImportError:
+    pass
+
+# ── Audio FX ──────────────────────────────────────────────────────────────────
+_sep(enh_panel)
 _section_label(enh_panel, "AUDIO FX",
     tooltip="Post-processing chain applied to every generated clip. "
             "Runs in order: Trim → High-pass → Low-pass → Noise Gate → Compressor → Reverb → Gain. "
@@ -3651,47 +3917,6 @@ ctk.CTkButton(enh_panel, text="Reset to defaults", command=reset_enhancements,
               font=ctk.CTkFont(family="Segoe UI", size=11),
               **BTN_GHOST).pack(padx=14, pady=(0, 8))
 
-# ── AI Enhancement ────────────────────────────────────────────────────────────
-_sep(enh_panel)
-_section_label(enh_panel, "AI ENHANCEMENT",
-    tooltip="Uses Resemble AI's enhancement model to improve audio quality — removes noise, "
-            "adds presence, and makes TTS sound more natural. "
-            "First use downloads ~450 MB of model weights. "
-            "Async mode runs in the background after generation.")
-
-enhance_var  = ctk.BooleanVar(value=False)
-enhance_mode = ctk.StringVar(value="Async")
-
-_enhance_row = ctk.CTkFrame(enh_panel, fg_color="transparent")
-_enhance_row.pack(fill="x", padx=14, pady=(0, 4))
-_enhance_cb = ctk.CTkCheckBox(_enhance_row, text="Resemble Enhance", variable=enhance_var,
-                              font=ctk.CTkFont(family="Segoe UI", size=11),
-                              text_color=C_TXT2, checkmark_color=C_ACCENT,
-                              fg_color=C_ACCENT_D, hover_color=C_ACCENT_D,
-                              border_color=C_BORDER)
-_enhance_cb.pack(side="left")
-
-_enhance_mode_btn = ctk.CTkSegmentedButton(
-    enh_panel,
-    values=["CPU", "GPU", "Async"],
-    variable=enhance_mode,
-    font=ctk.CTkFont(family="Segoe UI", size=11),
-    width=214,
-)
-_enhance_mode_btn.pack(padx=14, pady=(0, 4))
-
-# GPU hint (shown if CUDA not available)
-try:
-    import torch as _torch_check
-    if not _torch_check.cuda.is_available():
-        ctk.CTkLabel(enh_panel,
-                     text="GPU: no CUDA detected — use CPU or Async",
-                     font=ctk.CTkFont(family="Segoe UI", size=9),
-                     text_color=C_TXT3).pack(padx=14, anchor="w", pady=(0, 2))
-    del _torch_check
-except ImportError:
-    pass
-
 
 def _resemble_deps_without_deepspeed():
     """Return resemble-enhance's declared deps with deepspeed and training extras removed.
@@ -3721,44 +3946,54 @@ def _resemble_deps_without_deepspeed():
 
 
 def _install_resemble_enhance():
-    """Background thread: install resemble-enhance without deepspeed.
+    """Background thread: install resemble-enhance into python_embed.
 
     Strategy
     --------
-    1. pip install resemble-enhance --no-deps  (avoids deepspeed build failure)
-    2. Stub deepspeed via sys.meta_path so it never causes an ImportError
-    3. Iteratively: try to import resemble_enhance, catch the exact missing
-       module name from the ImportError, pip install just that package, repeat.
-       This installs only what inference actually needs — not demo deps like
-       gradio or profiling deps like ptflops.
-    4. Once the import succeeds, declare done.
+    1. pip install numpy<2 (resemble-enhance 0.0.1 incompatible with numpy 2.x)
+    2. pip install resemble-enhance --no-deps  (avoids deepspeed build failure)
+    3. Iteratively: try to import in python_embed subprocess, catch the missing
+       module name, pip install just that package, repeat.
+    4. Once the subprocess import succeeds, declare done.
+
+    All imports run in python_embed (subprocess) — never in the frozen app.
     """
-    # Packages that are demo/training-only — skip installing them if they come up
-    _SKIP_PKGS = {"deepspeed", "gradio", "celluloid", "ptflops", "tabulate"}
+    _SKIP_PKGS = {"deepspeed", "gradio", "celluloid", "ptflops"}
 
     app.after(0, lambda: _enhance_cb.configure(state="disabled"))
     app.after(0, lambda: _enhance_mode_btn.configure(state="disabled"))
 
+    _py = enhance_engine.PYTHON
+
     def _pip(*args):
         return subprocess.run(
-            [sys.executable, "-m", "pip", "install", *args],
-            capture_output=True, text=True
+            [_py, "-m", "pip", "install", *args],
+            capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
     def _pip_error(r):
         lines = (r.stderr or r.stdout or "pip failed").strip().splitlines()
         return lines[-1] if lines else "pip failed"
 
-    def _clear_resemble_cache():
-        for key in list(sys.modules.keys()):
-            if key == "resemble_enhance" or key.startswith("resemble_enhance."):
-                del sys.modules[key]
+    def _try_import():
+        """Try importing resemble-enhance via enhance_worker.py --check.
+
+        Uses the real worker's deepspeed stub + PosixPath fix — no
+        duplicated logic, tests the exact code path that runs at runtime.
+        Returns (ok, error_msg).
+        """
+        r = subprocess.run(
+            [_py, enhance_engine.WORKER, "--check"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if r.returncode == 0:
+            return True, ""
+        return False, (r.stderr or r.stdout or "").strip()
 
     try:
-        # ── Step 1: install the package itself + numpy pin ────────────────────
-        # resemble-enhance 0.0.1 is incompatible with numpy 2.x (scalar API
-        # changed). Pin to numpy<2 before anything else so subsequent dep
-        # installs don't pull in a newer numpy.
+        # ── Step 1: numpy pin + resemble-enhance ─────────────────────────────
         app.after(0, lambda: status_label.configure(
             text="📦 Installing Resemble Enhance..."))
         r = _pip("numpy<2", "--upgrade")
@@ -3768,55 +4003,39 @@ def _install_resemble_enhance():
         if r.returncode != 0:
             raise RuntimeError(f"Could not install resemble-enhance: {_pip_error(r)}")
 
-        # ── Step 2: stub deepspeed ────────────────────────────────────────────
-        from audio_utils import _stub_deepspeed
-        _stub_deepspeed()
-
-        # ── Step 3: iteratively resolve missing deps ──────────────────────────
-        import importlib
+        # ── Step 2: iteratively resolve missing deps via subprocess ───────────
         skipped = []
-        for attempt in range(20):   # safety cap — should never need more than ~10
-            _clear_resemble_cache()
-            try:
-                importlib.import_module("resemble_enhance")
-                from resemble_enhance.enhancer.inference import enhance  # noqa: F401
-                break   # import clean — done
-            except ImportError as exc:
-                raw = str(exc)
-                # Extract the top-level missing package name
-                # e.g. "No module named 'pandas'" → "pandas"
-                #      "No module named 'torchvision.transforms'" → "torchvision"
-                missing = raw.replace("No module named", "").strip(" '\"")
-                pkg = missing.split(".")[0].strip()
+        for attempt in range(20):
+            ok, err = _try_import()
+            if ok:
+                break
 
-                if not pkg:
-                    raise RuntimeError(f"Unrecognised ImportError: {raw}")
+            # Extract missing module: "No module named 'pandas'" → "pandas"
+            missing = ""
+            for line in err.splitlines():
+                if "No module named" in line:
+                    missing = line.split("No module named")[-1].strip(" '\"")
+                    break
+            if not missing:
+                # ModuleNotFoundError isn't the only possible failure —
+                # surface the last line of stderr to the user.
+                last_line = err.splitlines()[-1] if err else "unknown error"
+                raise RuntimeError(f"Import check failed: {last_line}")
 
-                if pkg.lower() in _SKIP_PKGS:
-                    # Demo/training dep — skip installing, stub if deepspeed
-                    if pkg.lower() == "deepspeed":
-                        _stub_deepspeed()
-                    else:
-                        skipped.append(pkg)
-                        # Stub this package too so the import can proceed
-                        import types
-                        if pkg not in sys.modules:
-                            stub = types.ModuleType(pkg)
-                            stub.__path__ = []
-                            stub.__getattr__ = lambda n: type("_S", (), {
-                                "__call__": lambda s, *a, **k: s,
-                                "__getattr__": lambda s, n: type("_S", (), {})()
-                            })()
-                            sys.modules[pkg] = stub
-                    continue
+            pkg = missing.split(".")[0].strip()
+            if not pkg:
+                raise RuntimeError(f"Unrecognised ImportError: {missing}")
 
-                app.after(0, lambda p=pkg: status_label.configure(
-                    text=f"📦 Installing missing dep: {p}..."))
-                r = _pip(pkg)
-                if r.returncode != 0:
-                    raise RuntimeError(
-                        f"Failed to install '{pkg}': {_pip_error(r)}"
-                    )
+            if pkg.lower() in _SKIP_PKGS:
+                skipped.append(pkg)
+                # enhance_worker.py --check stubs these automatically
+                continue
+
+            app.after(0, lambda p=pkg: status_label.configure(
+                text=f"📦 Installing missing dep: {p}..."))
+            r = _pip(pkg)
+            if r.returncode != 0:
+                raise RuntimeError(f"Failed to install '{pkg}': {_pip_error(r)}")
         else:
             raise RuntimeError("Dependency resolution did not converge after 20 attempts.")
 
@@ -3834,22 +4053,43 @@ def _install_resemble_enhance():
         app.after(0, lambda: _enhance_mode_btn.configure(state="normal"))
 
 
+def _enhance_deps_installed():
+    """Check if resemble-enhance is importable in python_embed.
+
+    Runs enhance_worker.py --check, which uses the same deepspeed stub
+    and PosixPath fix as the real worker — no duplicated logic.
+    """
+    _py = enhance_engine.PYTHON
+    if not os.path.exists(_py):
+        return False
+    try:
+        r = subprocess.run(
+            [_py, enhance_engine.WORKER, "--check"],
+            capture_output=True, timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _on_enhance_toggle(*_):
     if not enhance_var.get():
         return
-    from audio_utils import _stub_deepspeed
-    _stub_deepspeed()
-    try:
-        import resemble_enhance  # noqa: F401
-        # Import succeeded — check for missing transitive deps by doing a deeper probe
-        from resemble_enhance.enhancer.inference import enhance  # noqa: F401
-    except ImportError as exc:
-        missing = str(exc)
-        # Always trigger install — covers both "not installed" and "dep missing"
+    if not os.path.exists(enhance_engine.PYTHON):
         enhance_var.set(False)
-        app.after(0, lambda m=missing: status_label.configure(
-            text=f"📦 Missing dependency ({m}) — auto-installing..."))
-        threading.Thread(target=_install_resemble_enhance, daemon=True).start()
+        app.after(0, lambda: status_label.configure(
+            text="⚠️ Natural mode must be set up before Enhancement — switch to Natural mode first."))
+        return
+    # Check in a thread to avoid blocking UI (subprocess call)
+    def _check():
+        if _enhance_deps_installed():
+            return  # deps ready, checkbox stays on
+        app.after(0, lambda: enhance_var.set(False))
+        app.after(0, lambda: status_label.configure(
+            text="📦 Resemble Enhance not installed — auto-installing..."))
+        _install_resemble_enhance()
+    threading.Thread(target=_check, daemon=True).start()
 
 
 enhance_var.trace_add("write", _on_enhance_toggle)
@@ -4215,7 +4455,7 @@ def dlg_detect_speakers():
                 dlg_detect_speakers()
             return _do
 
-        ctk.CTkButton(row, text="↺", width=28, height=28,
+        ctk.CTkButton(row, text="Reset", width=52, height=28,
                       font=ctk.CTkFont(family="Segoe UI", size=12),
                       command=_make_rename(speaker, name_var),
                       **BTN_GHOST).pack(side="left", padx=(0, 6), pady=8)
@@ -4250,7 +4490,7 @@ def dlg_generate():
     est            = estimate_processing_time(" ".join(t for _, t in d_lines))
 
     _dlg_cancel_event.clear()
-    dlg_gen_btn.configure(state="disabled", text="⏳ Generating...")
+    dlg_gen_btn.configure(state="disabled", text="Generating...")
     dlg_detect_btn.configure(state="disabled")
     dlg_cancel_btn.configure(command=lambda: _dlg_cancel_event.set())
     dlg_cancel_btn.pack(pady=(0, 4))
@@ -4319,16 +4559,18 @@ if _saved_clone and _saved_clone != _CLONE_DEFAULT:
 
 def _show_chatterbox_setup_modal(on_complete, on_cancel):
     """
-    Show a setup modal and install chatterbox_env in the background.
-    Calls on_complete() on success, on_cancel() if the user dismisses after failure.
+    Two-phase setup modal:
+      Phase 1 — confirm: shows what will be downloaded, Set Up / Cancel buttons.
+      Phase 2 — progress: downloads and installs in background; dismissible only on failure.
+    Calls on_complete() on success, on_cancel() if user cancels or dismisses after failure.
     """
     win = ctk.CTkToplevel(app)
     win.title("Natural Mode Setup")
-    _center_window(win, 500, 310)
+    _center_window(win, 500, 400)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.transient(app)
-    win.protocol("WM_DELETE_WINDOW", lambda: None)   # blocked until success/failure
+    win.protocol("WM_DELETE_WINDOW", lambda: None)
     win.attributes("-topmost", True)
     win.lift()
 
@@ -4340,47 +4582,69 @@ def _show_chatterbox_setup_modal(on_complete, on_cancel):
     hdr_inner.pack(side="left", padx=16, pady=10)
     ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=4, height=20,
                  corner_radius=2).pack(side="left", padx=(0, 10))
-    ctk.CTkLabel(hdr_inner, text="Setting Up Natural Mode",
+    ctk.CTkLabel(hdr_inner, text="Natural Mode Setup",
                  font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
                  text_color=C_TXT).pack(side="left")
     ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
 
-    # ── Info callout ──────────────────────────────────────────────────────────
-    callout = ctk.CTkFrame(win, fg_color=C_ACCENT_D, corner_radius=8)
-    callout.pack(fill="x", padx=20, pady=(16, 0))
-    ctk.CTkLabel(
-        callout,
-        text="Downloading PyTorch + Chatterbox (~1 GB). Keep the app open.\n"
-             "The 3 GB model files are downloaded on your first generation.",
-        font=ctk.CTkFont(family="Segoe UI", size=11),
-        text_color=C_WARN,
-        justify="left",
-    ).pack(anchor="w", padx=12, pady=8)
+    # ── Phase 1: confirmation body ────────────────────────────────────────────
+    confirm_frame = ctk.CTkFrame(win, fg_color="transparent")
+    confirm_frame.pack(fill="x", padx=20, pady=(16, 0))
 
-    # ── Progress bar ──────────────────────────────────────────────────────────
+    ctk.CTkLabel(confirm_frame,
+                 text="Natural mode uses a separate AI engine that needs to be\n"
+                      "downloaded once. The app will handle everything automatically.",
+                 font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT2, justify="left", anchor="w",
+                 ).pack(anchor="w", pady=(0, 14))
+
+    ctk.CTkLabel(confirm_frame, text="WHAT WILL BE DOWNLOADED",
+                 font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
+                 text_color=C_TXT3, anchor="w").pack(anchor="w", pady=(0, 6))
+
+    items_frame = ctk.CTkFrame(confirm_frame, fg_color=C_ELEVATED, corner_radius=8)
+    items_frame.pack(fill="x", pady=(0, 4))
+    for label, size in (
+        ("Python 3.11  (runtime environment)", "~15 MB"),
+        ("PyTorch CPU  (AI inference library)", "~800 MB"),
+        ("Chatterbox TTS  (voice model)",       "~200 MB"),
+    ):
+        row = ctk.CTkFrame(items_frame, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(row, text=label,
+                     font=ctk.CTkFont(family="Segoe UI", size=11),
+                     text_color=C_TXT2, anchor="w").pack(side="left")
+        ctk.CTkLabel(row, text=size,
+                     font=ctk.CTkFont(family="Segoe UI", size=11),
+                     text_color=C_TXT3, anchor="e").pack(side="right")
+
+    ctk.CTkLabel(confirm_frame,
+                 text="The 3 GB voice model downloads on your first generation.",
+                 font=ctk.CTkFont(family="Segoe UI", size=10),
+                 text_color=C_TXT3, anchor="w").pack(anchor="w", pady=(8, 0))
+
+    # ── Phase 1: buttons ──────────────────────────────────────────────────────
+    btn_frame = ctk.CTkFrame(win, fg_color="transparent")
+    btn_frame.pack(fill="x", padx=20, pady=16)
+
+    # ── Phase 2: progress elements (hidden until setup starts) ────────────────
     bar = ctk.CTkProgressBar(win, mode="indeterminate",
                              progress_color=C_ACCENT, fg_color=C_ACCENT_D)
-    bar.pack(fill="x", padx=20, pady=(14, 6))
-    bar.start()
-
-    # ── Status text ───────────────────────────────────────────────────────────
-    status_var = ctk.StringVar(value="Initializing…")
-    ctk.CTkLabel(win, textvariable=status_var,
-                 font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT2, wraplength=460, anchor="w", justify="left",
-                 ).pack(padx=20, anchor="w")
-
-    # ── Dismiss button (hidden until failure) ─────────────────────────────────
-    dismiss_btn = ctk.CTkButton(win, text="Cancel — Use Fast Mode",
+    status_var = ctk.StringVar(value="")
+    status_lbl = ctk.CTkLabel(win, textvariable=status_var,
+                              font=ctk.CTkFont(family="Segoe UI", size=11),
+                              text_color=C_TXT2, wraplength=460, anchor="w", justify="left")
+    cancel_btn2 = ctk.CTkButton(win, text="Cancel — Use Fast Mode",
                                 width=180, height=32,
                                 font=ctk.CTkFont(family="Segoe UI", size=12),
                                 fg_color=C_SURFACE, hover_color=C_ELEVATED,
                                 border_width=1, border_color=C_BORDER, text_color=C_TXT2)
-    # not packed yet — only shown on failure
+    # Not packed yet — appear only when needed
 
     win.update()
     _fade_in(win)
 
+    # ── Callbacks ─────────────────────────────────────────────────────────────
     def update_status(msg):
         app.after(0, lambda m=msg: status_var.set(m))
 
@@ -4400,16 +4664,37 @@ def _show_chatterbox_setup_modal(on_complete, on_cancel):
                 _fade_out(win, win.destroy)
                 on_cancel()
 
-            dismiss_btn.configure(command=_dismiss)
-            dismiss_btn.pack(pady=(10, 4))
+            cancel_btn2.configure(command=_dismiss)
+            cancel_btn2.pack(padx=20, pady=(6, 12))
             win.protocol("WM_DELETE_WINDOW", _dismiss)
         app.after(0, _ui)
 
-    threading.Thread(
-        target=_run_chatterbox_setup,
-        args=(update_status, _on_success, _on_failure),
-        daemon=True,
-    ).start()
+    def _start_setup():
+        # Transition to phase 2
+        confirm_frame.pack_forget()
+        btn_frame.pack_forget()
+        bar.pack(fill="x", padx=20, pady=(20, 6))
+        bar.start()
+        status_lbl.pack(padx=20, anchor="w")
+        win.protocol("WM_DELETE_WINDOW", lambda: None)  # lock close during download
+        threading.Thread(
+            target=_run_chatterbox_setup,
+            args=(update_status, _on_success, _on_failure),
+            daemon=True,
+        ).start()
+
+    def _cancel():
+        _fade_out(win, win.destroy)
+        on_cancel()
+
+    ctk.CTkButton(btn_frame, text="Set Up Natural Mode", command=_start_setup,
+                  height=36, font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                  fg_color=C_ACCENT, hover_color=C_ACCENT_H,
+                  text_color="#000000").pack(side="left", padx=(0, 10))
+    ctk.CTkButton(btn_frame, text="Cancel", command=_cancel,
+                  height=36, width=90,
+                  font=ctk.CTkFont(family="Segoe UI", size=12),
+                  **BTN_GHOST).pack(side="left")
 
 
 def _make_chatterbox_loading_modal():
@@ -4618,6 +4903,9 @@ def _load_chatterbox_bg(update_modal, close_modal):
     app.after(0, lambda: play_button.configure(state="disabled"))
     app.after(0, lambda: engine_toggle.configure(state="disabled"))
     try:
+        # Free RAM on low-memory machines — enhance worker holds torch in memory
+        if enhance_engine.is_ready:
+            enhance_engine.stop()
         chatterbox_engine.start(status_cb=_st)
         close_modal()
         app.after(0, lambda: engine_toggle.configure(state="normal"))
@@ -4628,7 +4916,7 @@ def _load_chatterbox_bg(update_modal, close_modal):
         _log_crash(e)
         err = _fmt_err(e)
         close_modal()
-        app.after(0, lambda: engine_var.set("⚡ Fast"))   # revert the toggle
+        app.after(0, lambda: engine_var.set("Fast"))   # revert the toggle
         app.after(0, lambda: engine_toggle.configure(state="normal"))
         app.after(0, lambda: play_button.configure(state="normal"))
         _raw = str(e).lower()
@@ -4736,7 +5024,7 @@ def _show_activation_modal(can_skip=True, remaining=0):
 
     def _open_store():
         import webbrowser
-        webbrowser.open(_lic.STORE_URL)
+        webbrowser.open(f"https://tagee1.github.io/tts-studio/")
 
     ctk.CTkButton(
         btn_row, text="Buy a License", width=110, height=34,
@@ -4759,7 +5047,7 @@ def _show_activation_modal(can_skip=True, remaining=0):
 
 _UPSELL_FEATURE_TEXT = {
     "natural": (
-        "🎙️ Natural Mode — free trial used up",
+        "Natural Mode — free trial used up",
         "You've used your 3 free Natural mode generations.\n\n"
         "Upgrade to Pro for unlimited Natural mode, unlimited\n"
         "AI Enhancement, and priority support.",
@@ -4874,10 +5162,24 @@ def _handle_license_on_startup():
         def _revalidate():
             valid = _lic.validate_license_silent(lic.get("key"))
             if not valid:
+                # Suspend locally so freemium limits kick in, but keep the key
+                # so next launch can re-validate (e.g. if access is restored).
+                lic["activated"] = False
+                _lic.save_license(lic)
                 app.after(0, lambda: status_label.configure(
-                    text="⚠️ License validation failed. Please re-activate via the 🔑 Activate button."))
+                    text="⚠️ License revoked or expired. Pro features are now limited."))
                 app.after(0, lambda: _activate_btn.pack(side="right", padx=(0, 6), pady=14))
         threading.Thread(target=_revalidate, daemon=True).start()
+    elif lic.get("key"):
+        # Suspended license — key exists but not activated. Re-check silently.
+        def _recheck():
+            valid = _lic.validate_license_silent(lic.get("key"))
+            if valid:
+                lic["activated"] = True
+                _lic.save_license(lic)
+                app.after(0, lambda: status_label.configure(
+                    text="✅ License re-activated. Welcome back!"))
+        threading.Thread(target=_recheck, daemon=True).start()
     # Free users: Activate button already visible in header — nothing else to do.
 
 # Seed Kokoro calibration on first-ever launch using a quick inference.
@@ -4981,7 +5283,7 @@ def _show_onboarding(on_done=None):
     fast_card.pack(fill="x", pady=(0, 10))
     fast_inner = ctk.CTkFrame(fast_card, fg_color="transparent")
     fast_inner.pack(fill="x", padx=14, pady=12)
-    ctk.CTkLabel(fast_inner, text="⚡  Fast Mode",
+    ctk.CTkLabel(fast_inner, text="Fast Mode",
                  font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
                  text_color=C_ACCENT).pack(anchor="w")
     ctk.CTkLabel(fast_inner,
@@ -4997,7 +5299,7 @@ def _show_onboarding(on_done=None):
     nat_card.pack(fill="x", pady=(0, 10))
     nat_inner = ctk.CTkFrame(nat_card, fg_color="transparent")
     nat_inner.pack(fill="x", padx=14, pady=12)
-    ctk.CTkLabel(nat_inner, text="🎙️  Natural Mode",
+    ctk.CTkLabel(nat_inner, text="Natural Mode",
                  font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
                  text_color=C_TXT).pack(anchor="w")
     ctk.CTkLabel(nat_inner,

@@ -12,7 +12,7 @@
 ;     /a installer_output\TTS-Studio-Setup.exe
 
 #define MyAppName      "TTS Studio"
-#define MyAppVersion   "1.0.1"
+#define MyAppVersion   "1.0.0"
 #define MyAppPublisher "Cookie Studios"
 #define MyAppURL       "https://cookiestudios.gumroad.com/l/TTSStudioPro"
 #define MyAppSupportURL "mailto:cookiestudios.dev@gmail.com"
@@ -83,17 +83,16 @@ Source: "{#MyBuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 Source: "CREDITS.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "PRIVACY.txt"; DestDir: "{app}"; Flags: ignoreversion
 
-; ── chatterbox_worker.py (alongside the exe, found via _res()) ───────────────
-; Already included above via recursesubdirs since it's in the PyInstaller output.
-; If you keep chatterbox_worker.py only in the source tree (not copied by PyInstaller),
-; uncomment the line below:
-; Source: "chatterbox_worker.py"; DestDir: "{app}"; Flags: ignoreversion
+; ── worker scripts (alongside the exe, found via _res()) ─────────────────────
+; Already included above via recursesubdirs since they're in the PyInstaller output.
+; chatterbox_worker.py — Natural mode (chatterbox_env / python_embed)
+; enhance_worker.py   — AI Enhancement (python_embed)
 
 
 [Icons]
-Name: "{group}\{#MyAppName}";          Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"
+Name: "{group}\{#MyAppName}";          Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\{#MyAppName}";   Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
+Name: "{commondesktop}\{#MyAppName}";   Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 
 [Run]
@@ -110,24 +109,18 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 
 
 [Code]
-// Warn if existing install found (offer to uninstall first)
+// Silently remove any existing installation before installing the new version.
+// /VERYSILENT + SW_HIDE means no uninstaller window appears — user only sees
+// the new installer, making upgrades feel like a single seamless install.
 function InitializeSetup(): Boolean;
 var
-  UninstExe:  String;
-  MsgResult:  Integer;
+  UninstExe: String;
+  ResultCode: Integer;
 begin
   Result := True;
   if RegQueryStringValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B3F2A1C4-7D8E-4F0A-9B2C-5E6D3A1F8C90}_is1',
                          'UninstallString', UninstExe) then
   begin
-    MsgResult := MsgBox(
-      'A previous version of TTS Studio is already installed.'#13#10 +
-      'It is recommended to uninstall it first.'#13#10#13#10 +
-      'Uninstall the previous version now?',
-      mbConfirmation, MB_YESNO);
-    if MsgResult = IDYES then
-    begin
-      Exec(RemoveQuotes(UninstExe), '/SILENT /NORESTART', '', SW_SHOW, ewWaitUntilTerminated, MsgResult);
-    end;
+    Exec(RemoveQuotes(UninstExe), '/VERYSILENT /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
