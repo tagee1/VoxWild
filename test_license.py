@@ -1103,6 +1103,93 @@ class TestVerifyLicense(unittest.TestCase):
         self.assertTrue(resp.get("_network_error"))
 
 
+# ── TestMachineActivationLimit ────────────────────────────────────────────────
+
+class TestMachineActivationLimit(unittest.TestCase):
+    """Tests for machine-based activation limit (MAX_MACHINES=2)."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.td.name, "license.json")
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    @patch("license._verify_license")
+    def test_first_machine_activates(self, mock_verify):
+        """Brand new key on first machine → uses=1, success."""
+        mock_verify.return_value = (True, {"success": True, "purchase": {}, "uses": 1})
+        ok, msg = activate_license("NEW-KEY", self.path)
+        self.assertTrue(ok, msg)
+        data = load_license(self.path)
+        self.assertTrue(data["activated"])
+        self.assertIsNotNone(data["machine_id"])
+        # New machine → should have called with increment="true"
+        self.assertEqual(mock_verify.call_args[0][2], "true")
+
+    @patch("license._verify_license")
+    def test_same_machine_reinstall_no_increment(self, mock_verify):
+        """Reinstall on same machine → increment=false, doesn't burn activation."""
+        # Pre-seed with matching machine_id
+        _write_license(self.path, {
+            "key": "MY-KEY",
+            "machine_id": lic._get_machine_id(),
+        })
+        mock_verify.return_value = (True, {"success": True, "purchase": {}, "uses": 1})
+        ok, msg = activate_license("MY-KEY", self.path)
+        self.assertTrue(ok, msg)
+        # Same machine → increment should be "false"
+        self.assertEqual(mock_verify.call_args[0][2], "false")
+
+    @patch("license._verify_license")
+    def test_second_machine_activates(self, mock_verify):
+        """Second machine → uses=2, still under limit, success."""
+        mock_verify.return_value = (True, {"success": True, "purchase": {}, "uses": 2})
+        ok, msg = activate_license("SHARED-KEY", self.path)
+        self.assertTrue(ok, msg)
+        self.assertTrue(load_license(self.path)["activated"])
+
+    @patch("license._verify_license")
+    def test_third_machine_rejected(self, mock_verify):
+        """Third machine → uses=3, over MAX_MACHINES=2, rejected."""
+        mock_verify.return_value = (True, {"success": True, "purchase": {}, "uses": 3})
+        ok, msg = activate_license("SHARED-KEY", self.path)
+        self.assertFalse(ok)
+        self.assertIn("already active on 2 machines", msg)
+        self.assertFalse(load_license(self.path).get("activated", False))
+
+    @patch("license._verify_license")
+    def test_same_machine_bypasses_limit_check(self, mock_verify):
+        """Same machine reinstall with uses=5 still works (limit check skipped)."""
+        _write_license(self.path, {
+            "key": "MY-KEY",
+            "machine_id": lic._get_machine_id(),
+        })
+        mock_verify.return_value = (True, {"success": True, "purchase": {}, "uses": 5})
+        ok, msg = activate_license("MY-KEY", self.path)
+        self.assertTrue(ok, msg)  # same machine → limit not checked
+
+    @patch("license._verify_license")
+    def test_different_key_same_machine_increments(self, mock_verify):
+        """Activating a DIFFERENT key on same machine → treated as new, increments."""
+        _write_license(self.path, {
+            "key": "OLD-KEY",
+            "machine_id": lic._get_machine_id(),
+        })
+        mock_verify.return_value = (True, {"success": True, "purchase": {}, "uses": 1})
+        ok, msg = activate_license("NEW-KEY", self.path)
+        self.assertTrue(ok, msg)
+        # Different key → increment should be "true"
+        self.assertEqual(mock_verify.call_args[0][2], "true")
+
+    def test_machine_id_is_stable(self):
+        """_get_machine_id returns the same value across calls."""
+        id1 = lic._get_machine_id()
+        id2 = lic._get_machine_id()
+        self.assertEqual(id1, id2)
+        self.assertEqual(len(id1), 16)  # 16-char hex hash prefix
+
+
 # ── TestLiveGumroadAPI — real API integration (skipped without network) ──────
 
 class TestLiveGumroadAPI(unittest.TestCase):
