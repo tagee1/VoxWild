@@ -1199,14 +1199,15 @@ class TestLiveGumroadAPI(unittest.TestCase):
     Skipped if the network is unreachable.
     """
 
-    TEST_KEY = "820BE1AD-944648C2-835D6427-C25DF9FD"
+    TEST_KEY = os.environ.get("TTS_TEST_LICENSE_KEY", "")
 
     @classmethod
     def setUpClass(cls):
-        """Skip all tests if Gumroad API is unreachable."""
+        """Skip if no test key or API unreachable."""
+        if not cls.TEST_KEY:
+            raise unittest.SkipTest("TTS_TEST_LICENSE_KEY not set — skipping live tests")
         try:
             import urllib.request
-            # Base URL returns 404, so just check we can connect (any HTTP response = reachable)
             urllib.request.urlopen("https://api.gumroad.com", timeout=5)
         except urllib.error.HTTPError:
             pass  # 404 is fine — server is reachable
