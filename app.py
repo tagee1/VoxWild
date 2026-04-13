@@ -3113,7 +3113,7 @@ ctk.CTkLabel(title_left, text=f" v{VERSION}",
              font=ctk.CTkFont(family="Segoe UI", size=11),
              text_color=C_TXT3).pack(side="left")
 
-# Right: action buttons
+# Right: action buttons (packed right-to-left)
 ctk.CTkButton(header, text="About", command=show_about,
               width=72, height=30,
               font=ctk.CTkFont(family="Segoe UI", size=12),
@@ -3122,6 +3122,20 @@ ctk.CTkButton(header, text="Settings", command=show_settings,
               width=84, height=30,
               font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_GHOST).pack(side="right", padx=(0, 6), pady=14)
+
+stop_button = ctk.CTkButton(
+    header, text="Stop", command=stop_audio,
+    width=60, height=30,
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    state="disabled", **BTN_GHOST, corner_radius=8)
+stop_button.pack(side="right", padx=(0, 6), pady=14)
+
+play_button = ctk.CTkButton(
+    header, text="Generate", command=generate_and_store,
+    width=100, height=30,
+    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+    corner_radius=8)
+play_button.pack(side="right", padx=(0, 6), pady=14)
 _activate_btn = ctk.CTkButton(
     header, text="🔑 Activate", command=lambda: _show_activation_modal(can_skip=True),
     width=98, height=30,
@@ -3255,21 +3269,7 @@ ctk.CTkButton(txt_btns, text="Dict",
               **BTN_GHOST).pack(side="left", padx=(0, 5))
 ctk.CTkButton(txt_btns, text="Clear", command=clear_text,
               width=54, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
-              **BTN_DARK).pack(side="left", padx=(0, 5))
-
-stop_button = ctk.CTkButton(
-    txt_btns, text="Stop", command=stop_audio,
-    width=54, height=30,
-    font=ctk.CTkFont(family="Segoe UI", size=12),
-    state="disabled", **BTN_GHOST, corner_radius=8)
-stop_button.pack(side="right", padx=(5, 0))
-
-play_button = ctk.CTkButton(
-    txt_btns, text="Generate", command=generate_and_store,
-    width=100, height=30,
-    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-    corner_radius=8)
-play_button.pack(side="right")
+              **BTN_DARK).pack(side="left")
 
 # ── Voice + Engine panel ──────────────────────────────────────────────────────
 mid_panel = _panel(studio, 1)
@@ -3787,7 +3787,7 @@ def _on_engine_change(*_):
 
 engine_var.trace_add("write", _on_engine_change)
 
-# Generate / Stop buttons are in the text input area (txt_btns row)
+# Generate / Stop buttons are in the header bar
 
 # ── Enhancement panel ─────────────────────────────────────────────────────────
 # Outer card sits in the grid; inner scrollable frame holds all controls so
