@@ -3263,7 +3263,21 @@ ctk.CTkButton(txt_btns, text="Dict",
               **BTN_GHOST).pack(side="left", padx=(0, 5))
 ctk.CTkButton(txt_btns, text="Clear", command=clear_text,
               width=54, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
-              **BTN_DARK).pack(side="left")
+              **BTN_DARK).pack(side="left", padx=(0, 5))
+
+stop_button = ctk.CTkButton(
+    txt_btns, text="Stop", command=stop_audio,
+    width=54, height=30,
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    state="disabled", **BTN_GHOST, corner_radius=8)
+stop_button.pack(side="right", padx=(5, 0))
+
+play_button = ctk.CTkButton(
+    txt_btns, text="Generate", command=generate_and_store,
+    width=100, height=30,
+    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+    corner_radius=8)
+play_button.pack(side="right")
 
 # ── Voice + Engine panel ──────────────────────────────────────────────────────
 mid_panel = _panel(studio, 1)
@@ -3781,28 +3795,7 @@ def _on_engine_change(*_):
 
 engine_var.trace_add("write", _on_engine_change)
 
-# Generate / Stop
-_sep(mid_panel)
-gen_btns = ctk.CTkFrame(mid_panel, fg_color="transparent")
-gen_btns.pack(fill="x", padx=14, pady=10)
-
-play_button = ctk.CTkButton(
-    gen_btns, text="Generate", command=generate_and_store,
-    height=46,
-    font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
-    corner_radius=10)
-play_button.pack(fill="x", pady=(0, 6))
-
-stop_button = ctk.CTkButton(
-    gen_btns, text="Stop", command=stop_audio,
-    height=30,
-    font=ctk.CTkFont(family="Segoe UI", size=12),
-    state="disabled", **BTN_GHOST, corner_radius=8)
-stop_button.pack(fill="x", pady=(0, 4))
-
-ctk.CTkLabel(mid_panel, text="Ctrl+Enter  ·  Esc to stop",
-             font=ctk.CTkFont(family="Segoe UI", size=10),
-             text_color=C_TXT3).pack(pady=(4, 8))
+# Generate / Stop buttons are in the text input area (txt_btns row)
 
 # ── Enhancement panel ─────────────────────────────────────────────────────────
 # Outer card sits in the grid; inner scrollable frame holds all controls so
@@ -5033,7 +5026,7 @@ def _show_activation_modal(can_skip=True, remaining=0):
 
     def _open_store():
         import webbrowser
-        webbrowser.open(_lic.STORE_URL)
+        webbrowser.open(f"https://tagee1.github.io/tts-studio/")
 
     ctk.CTkButton(
         btn_row, text="Buy a License", width=110, height=34,
