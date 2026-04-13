@@ -290,7 +290,7 @@ except Exception:
     pass
 
 app = ctk.CTk()
-app.title(f"AI Text to Speech Studio  v{VERSION}")
+app.title(f"TTS Studio  v{VERSION}")
 app.geometry("1380x860")
 app.minsize(1100, 720)
 
@@ -302,11 +302,28 @@ app.report_callback_exception = _on_tk_exception
 app.configure(fg_color=C_BG)
 app.withdraw()   # hidden until splash finishes
 
+# ── Windows taskbar identity ─────────────────────────────────────────────────
+# Set AppUserModelID so Windows shows our icon in the taskbar instead of the
+# generic Python icon. Must be called before the window is shown.
+try:
+    import ctypes
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CookieStudios.TTSStudio.1")
+except Exception:
+    pass
+
 # Set app icon (deferred slightly so taskbar picks it up after window is shown)
 _APP_DIR = _res(".")
 def _set_icon():
     try:
         app.iconbitmap(_res("icon.ico"))
+    except Exception:
+        pass
+    # Also set iconphoto for window managers that don't use iconbitmap
+    try:
+        from PIL import Image as _IconImg, ImageTk as _IconTk
+        _icon_img = _IconImg.open(_res("icon.ico"))
+        _icon_photo = _IconTk.PhotoImage(_icon_img)
+        app.iconphoto(True, _icon_photo)
     except Exception:
         pass
 app.after(100, _set_icon)
@@ -364,7 +381,7 @@ def _run_splash(on_done):
         ctk.CTkLabel(inner, image=LOGO_IMG_LG, text="").place(relx=0.5, rely=0.28, anchor="center")
 
     # App name
-    ctk.CTkLabel(inner, text="AI Text to Speech Studio",
+    ctk.CTkLabel(inner, text="TTS Studio",
                  font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
                  text_color=C_TXT).place(relx=0.5, rely=0.60, anchor="center")
     ctk.CTkLabel(inner, text=f"v{VERSION}  ·  Kokoro  ·  Chatterbox",
@@ -1461,9 +1478,8 @@ def _make_history_card(parent, idx, entry):
                 _toggle_history_pause(e, b, p))
         orig_stop_btn.configure(
             command=lambda b=orig_play_btn: _history_stop(b))
-        orig_play_btn.pack(side="left",  padx=(0, 2))
-        orig_pause_btn.pack(side="left", padx=(0, 2))
-        orig_stop_btn.pack(side="left",  padx=(0, 4))
+        orig_play_btn.pack(side="left",  padx=(0, 4))
+        # Pause/Stop hidden until playback starts (they look like empty boxes when disabled)
 
     return outer
 
@@ -1478,12 +1494,14 @@ def _reset_play_btn():
     pause_btn = _active_pause_btn[0]
     if pause_btn:
         try:
+            pause_btn.pack_forget()
             pause_btn.configure(text="Pause", state="disabled")
         except Exception:
             pass
     stop_btn = _active_stop_btn[0]
     if stop_btn:
         try:
+            stop_btn.pack_forget()
             stop_btn.configure(state="disabled")
         except Exception:
             pass
@@ -1531,11 +1549,13 @@ def _toggle_history_playback(entry, btn, pause_btn=None, stop_btn=None):
             pass
     if pause_btn:
         try:
+            pause_btn.pack(side="left", padx=(0, 2))
             pause_btn.configure(state="normal")
         except Exception:
             pass
     if stop_btn:
         try:
+            stop_btn.pack(side="left", padx=(0, 4))
             stop_btn.configure(state="normal")
         except Exception:
             pass
@@ -3094,7 +3114,7 @@ if LOGO_IMG_SM:
 else:
     ctk.CTkFrame(title_left, fg_color=C_ACCENT, width=10, height=10,
                  corner_radius=5).pack(side="left", padx=(0, 10))
-ctk.CTkLabel(title_left, text="AI Text to Speech Studio",
+ctk.CTkLabel(title_left, text="TTS Studio",
              font=ctk.CTkFont(family="Segoe UI", size=17, weight="bold"),
              text_color=C_TXT).pack(side="left")
 ctk.CTkLabel(title_left, text=f" v{VERSION}",
@@ -3768,17 +3788,17 @@ gen_btns.pack(fill="x", padx=14, pady=10)
 
 play_button = ctk.CTkButton(
     gen_btns, text="Generate", command=generate_and_store,
-    width=214, height=46,
+    height=46,
     font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
     corner_radius=10)
-play_button.pack(pady=(0, 6))
+play_button.pack(fill="x", pady=(0, 6))
 
 stop_button = ctk.CTkButton(
     gen_btns, text="Stop", command=stop_audio,
-    width=214, height=30,
+    height=30,
     font=ctk.CTkFont(family="Segoe UI", size=12),
     state="disabled", **BTN_GHOST, corner_radius=8)
-stop_button.pack(pady=(0, 4))
+stop_button.pack(fill="x", pady=(0, 4))
 
 ctk.CTkLabel(mid_panel, text="Ctrl+Enter  ·  Esc to stop",
              font=ctk.CTkFont(family="Segoe UI", size=10),
@@ -3795,6 +3815,48 @@ enh_panel = ctk.CTkScrollableFrame(
     scrollbar_button_hover_color=C_ACCENT_D)
 enh_panel.pack(fill="both", expand=True)
 
+# ── AI Enhancement (above FX so it's visible without scrolling) ───────────────
+_section_label(enh_panel, "AI ENHANCEMENT",
+    tooltip="Uses Resemble AI's enhancement model to improve audio quality — removes noise, "
+            "adds presence, and makes TTS sound more natural. "
+            "First use downloads ~450 MB of model weights. "
+            "Async mode runs in the background after generation.")
+
+enhance_var  = ctk.BooleanVar(value=False)
+enhance_mode = ctk.StringVar(value="Async")
+
+_enhance_row = ctk.CTkFrame(enh_panel, fg_color="transparent")
+_enhance_row.pack(fill="x", padx=14, pady=(0, 4))
+_enhance_cb = ctk.CTkCheckBox(_enhance_row, text="Resemble Enhance", variable=enhance_var,
+                              font=ctk.CTkFont(family="Segoe UI", size=11),
+                              text_color=C_TXT2, checkmark_color=C_ACCENT,
+                              fg_color=C_ACCENT_D, hover_color=C_ACCENT_D,
+                              border_color=C_BORDER)
+_enhance_cb.pack(side="left")
+
+_enhance_mode_btn = ctk.CTkSegmentedButton(
+    enh_panel,
+    values=["CPU", "GPU", "Async"],
+    variable=enhance_mode,
+    font=ctk.CTkFont(family="Segoe UI", size=11),
+    width=214,
+)
+_enhance_mode_btn.pack(padx=14, pady=(0, 4))
+
+# GPU hint (shown if CUDA not available)
+try:
+    import torch as _torch_check
+    if not _torch_check.cuda.is_available():
+        ctk.CTkLabel(enh_panel,
+                     text="GPU: no CUDA detected — use CPU or Async",
+                     font=ctk.CTkFont(family="Segoe UI", size=9),
+                     text_color=C_TXT3).pack(padx=14, anchor="w", pady=(0, 2))
+    del _torch_check
+except ImportError:
+    pass
+
+# ── Audio FX ──────────────────────────────────────────────────────────────────
+_sep(enh_panel)
 _section_label(enh_panel, "AUDIO FX",
     tooltip="Post-processing chain applied to every generated clip. "
             "Runs in order: Trim → High-pass → Low-pass → Noise Gate → Compressor → Reverb → Gain. "
@@ -3863,47 +3925,6 @@ ctk.CTkButton(enh_panel, text="Reset to defaults", command=reset_enhancements,
               width=214, height=30,
               font=ctk.CTkFont(family="Segoe UI", size=11),
               **BTN_GHOST).pack(padx=14, pady=(0, 8))
-
-# ── AI Enhancement ────────────────────────────────────────────────────────────
-_sep(enh_panel)
-_section_label(enh_panel, "AI ENHANCEMENT",
-    tooltip="Uses Resemble AI's enhancement model to improve audio quality — removes noise, "
-            "adds presence, and makes TTS sound more natural. "
-            "First use downloads ~450 MB of model weights. "
-            "Async mode runs in the background after generation.")
-
-enhance_var  = ctk.BooleanVar(value=False)
-enhance_mode = ctk.StringVar(value="Async")
-
-_enhance_row = ctk.CTkFrame(enh_panel, fg_color="transparent")
-_enhance_row.pack(fill="x", padx=14, pady=(0, 4))
-_enhance_cb = ctk.CTkCheckBox(_enhance_row, text="Resemble Enhance", variable=enhance_var,
-                              font=ctk.CTkFont(family="Segoe UI", size=11),
-                              text_color=C_TXT2, checkmark_color=C_ACCENT,
-                              fg_color=C_ACCENT_D, hover_color=C_ACCENT_D,
-                              border_color=C_BORDER)
-_enhance_cb.pack(side="left")
-
-_enhance_mode_btn = ctk.CTkSegmentedButton(
-    enh_panel,
-    values=["CPU", "GPU", "Async"],
-    variable=enhance_mode,
-    font=ctk.CTkFont(family="Segoe UI", size=11),
-    width=214,
-)
-_enhance_mode_btn.pack(padx=14, pady=(0, 4))
-
-# GPU hint (shown if CUDA not available)
-try:
-    import torch as _torch_check
-    if not _torch_check.cuda.is_available():
-        ctk.CTkLabel(enh_panel,
-                     text="GPU: no CUDA detected — use CPU or Async",
-                     font=ctk.CTkFont(family="Segoe UI", size=9),
-                     text_color=C_TXT3).pack(padx=14, anchor="w", pady=(0, 2))
-    del _torch_check
-except ImportError:
-    pass
 
 
 def _resemble_deps_without_deepspeed():
