@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.0.4"
+VERSION          = "1.0.5"
 GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
@@ -5224,11 +5224,22 @@ def _check_for_update():
         _log(f"Starting update check — current VERSION={VERSION}")
         import urllib.request
         import json as _json
+        import ssl as _ssl
+
+        # Use certifi's CA bundle — frozen PyInstaller apps don't have access
+        # to the system CA store, causing HTTPS requests to fail with
+        # CERTIFICATE_VERIFY_FAILED.
+        try:
+            import certifi
+            ctx = _ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            ctx = _ssl.create_default_context()
+
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         req = urllib.request.Request(
             api_url, headers={"User-Agent": f"TTS-Studio/{VERSION}"})
         _log(f"Fetching {api_url}")
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
             data = _json.loads(resp.read())
         tag = data.get("tag_name", "").lstrip("v")
         _log(f"GitHub returned tag_name='{data.get('tag_name')}' (parsed tag='{tag}')")
