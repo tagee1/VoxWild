@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.0.3"
+VERSION          = "1.0.4"
 GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
@@ -2834,24 +2834,27 @@ def show_settings():
 def show_about():
     win = ctk.CTkToplevel(app)
     win.title("About TTS Studio")
-    _center_window(win, 460, 660)
+    _center_window(win, 480, 640)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
     _fade_in(win)
 
     # ── Header ────────────────────────────────────────────────────────────────
-    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=150)
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=170)
     hdr.pack(fill="x")
     hdr.pack_propagate(False)
     if LOGO_IMG_LG:
-        ctk.CTkLabel(hdr, image=LOGO_IMG_LG, text="").pack(pady=(10, 4))
-    ctk.CTkLabel(hdr, text="AI TTS Studio",
-                 font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+        ctk.CTkLabel(hdr, image=LOGO_IMG_LG, text="").pack(pady=(16, 6))
+    ctk.CTkLabel(hdr, text="TTS Studio",
+                 font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
                  text_color=C_TXT).pack()
-    ctk.CTkLabel(hdr, text=f"Version {VERSION}  ·  100% local · no internet required",
+    ctk.CTkLabel(hdr, text=f"v{VERSION}",
                  font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_ACCENT).pack()
+                 text_color=C_ACCENT).pack(pady=(2, 0))
+    ctk.CTkLabel(hdr, text="Offline AI text-to-speech · Made by Cookie Studios",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT3).pack(pady=(2, 0))
 
     ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
 
@@ -2859,91 +2862,83 @@ def show_about():
     scroll = ctk.CTkScrollableFrame(win, fg_color="transparent",
                                     scrollbar_button_color=C_ELEVATED,
                                     scrollbar_button_hover_color=C_ACCENT_D)
-    scroll.pack(fill="both", expand=True, padx=20, pady=(12, 0))
+    scroll.pack(fill="both", expand=True, padx=24, pady=(16, 0))
 
     def _section(text):
         ctk.CTkLabel(scroll, text=text,
                      font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
-                     text_color=C_TXT3, anchor="w").pack(fill="x", pady=(10, 3))
-        ctk.CTkFrame(scroll, fg_color=C_BORDER, height=1,
-                     corner_radius=0).pack(fill="x", pady=(0, 6))
+                     text_color=C_TXT3, anchor="w").pack(fill="x", pady=(14, 6))
 
-    # ── Watermark notice ─────────────────────────────────────────────────────
-    notice = ctk.CTkFrame(scroll, fg_color=C_ACCENT_D, corner_radius=8)
-    notice.pack(fill="x", pady=(0, 10))
+    def _link_row(label, url):
+        row = ctk.CTkFrame(scroll, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+        ctk.CTkLabel(row, text=label, width=110, anchor="w",
+                     font=ctk.CTkFont(family="Segoe UI", size=11),
+                     text_color=C_TXT3).pack(side="left")
+        link = ctk.CTkLabel(row, text=url, anchor="w",
+                            font=ctk.CTkFont(family="Segoe UI", size=11, underline=True),
+                            text_color=C_ACCENT, cursor="hand2")
+        link.pack(side="left")
+        link.bind("<Button-1>", lambda e, u=url: webbrowser.open(
+            u if u.startswith("http") else f"mailto:{u}"))
+
+    # ── Watermark disclosure ──────────────────────────────────────────────────
+    notice = ctk.CTkFrame(scroll, fg_color=C_ELEVATED, corner_radius=8,
+                          border_width=1, border_color=C_ACCENT_D)
+    notice.pack(fill="x", pady=(0, 6))
     ctk.CTkLabel(notice,
-                 text="⚠  AI Watermark Disclosure — Natural Mode",
+                 text="Watermark Notice",
                  font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-                 text_color=C_ACCENT, anchor="w").pack(anchor="w", padx=12, pady=(10, 4))
+                 text_color=C_ACCENT, anchor="w").pack(anchor="w", padx=14, pady=(10, 4))
     ctk.CTkLabel(notice,
-                 text="Audio generated in Natural (Chatterbox) mode contains an\n"
-                      "inaudible AI watermark embedded by Resemble AI's Perth\n"
-                      "library. This watermark is present in all Natural mode output\n"
-                      "regardless of settings, and does not affect audio quality.",
+                 text="Natural mode audio contains an inaudible AI watermark "
+                      "(Resemble Perth). Fast mode audio has no watermark.",
                  font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT2, anchor="w", justify="left").pack(anchor="w", padx=12, pady=(0, 4))
-    ctk.CTkLabel(notice,
-                 text="Fast (Kokoro) mode output does not contain a watermark.",
-                 font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-                 text_color=C_TXT2, anchor="w", justify="left").pack(anchor="w", padx=12, pady=(0, 10))
+                 text_color=C_TXT2, anchor="w", justify="left",
+                 wraplength=400).pack(anchor="w", padx=14, pady=(0, 12))
 
-    # ── Keyboard shortcuts ────────────────────────────────────────────────────
+    # ── Shortcuts ─────────────────────────────────────────────────────────────
     _section("KEYBOARD SHORTCUTS")
     shortcuts = [
         ("Ctrl + Enter", "Generate audio"),
-        ("Ctrl + P",     "Play latest audio"),
-        ("Ctrl + S",     "Save latest audio"),
+        ("Ctrl + P",     "Play latest"),
+        ("Ctrl + S",     "Save latest"),
         ("Ctrl + I",     "Import text file"),
         ("Ctrl + Q",     "Add to queue"),
         ("Escape",       "Stop playback"),
         ("Ctrl + /",     "Open About"),
     ]
     for key, desc in shortcuts:
-        row = ctk.CTkFrame(scroll, fg_color=C_CARD, corner_radius=6)
-        row.pack(fill="x", pady=2)
-        ctk.CTkLabel(row, text=key, width=120, anchor="w",
-                     font=ctk.CTkFont(family="Consolas", size=11),
-                     text_color=C_ACCENT).pack(side="left", padx=10, pady=5)
+        row = ctk.CTkFrame(scroll, fg_color="transparent")
+        row.pack(fill="x", pady=1)
+        key_badge = ctk.CTkFrame(row, fg_color=C_CARD, corner_radius=4,
+                                 border_width=1, border_color=C_BORDER)
+        key_badge.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(key_badge, text=key,
+                     font=ctk.CTkFont(family="Consolas", size=10),
+                     text_color=C_ACCENT).pack(padx=8, pady=3)
         ctk.CTkLabel(row, text=desc, anchor="w",
                      font=ctk.CTkFont(family="Segoe UI", size=11),
                      text_color=C_TXT2).pack(side="left")
 
-    # ── Open source credits ───────────────────────────────────────────────────
-    _section("OPEN SOURCE CREDITS")
-    credits = [
-        ("Kokoro TTS v1.0",    "Apache 2.0",  "hexgrad/kokoro"),
-        ("Chatterbox TTS",     "MIT",          "ResembleAI/chatterbox"),
-        ("Perth Watermarker",  "MIT",          "resemble-ai/perth"),
-        ("CustomTkinter",      "MIT",          "TomSchimansky/CustomTkinter"),
-        ("ONNX Runtime",       "MIT",          "microsoft/onnxruntime"),
-        ("SciPy",              "BSD-3-Clause", "scipy/scipy"),
-        ("sounddevice",        "MIT",          "spatialaudio/python-sounddevice"),
-        ("soundfile",          "BSD-3-Clause", "bastibe/python-soundfile"),
-        ("NumPy",              "BSD-3-Clause", "numpy/numpy"),
-        ("PyTorch",            "BSD-3-Clause", "pytorch/pytorch"),
-        ("torchaudio",         "BSD-2-Clause", "pytorch/audio"),
-    ]
-    for lib, lic, repo in credits:
-        row = ctk.CTkFrame(scroll, fg_color="transparent")
-        row.pack(fill="x", pady=1)
-        ctk.CTkLabel(row, text=lib, width=190, anchor="w",
-                     font=ctk.CTkFont(family="Segoe UI", size=11),
-                     text_color=C_TXT).pack(side="left")
-        ctk.CTkLabel(row, text=lic, width=120, anchor="w",
-                     font=ctk.CTkFont(family="Segoe UI", size=10),
-                     text_color=C_TXT2).pack(side="left")
-        ctk.CTkLabel(row, text=repo, anchor="w",
-                     font=ctk.CTkFont(family="Consolas", size=10),
-                     text_color=C_TXT3).pack(side="left")
+    # ── Links ─────────────────────────────────────────────────────────────────
+    _section("SUPPORT & LINKS")
+    _link_row("Email",    "cookiestudios.dev@gmail.com")
+    _link_row("Website",  "https://tagee1.github.io/tts-studio-site/")
+    _link_row("Store",    "https://cookiestudios.gumroad.com")
+    _link_row("Updates",  "https://github.com/tagee1/tts-studio/releases")
 
-    # ── Support ───────────────────────────────────────────────────────────────
-    _section("SUPPORT")
-    ctk.CTkLabel(scroll, text="cookiestudios.dev@gmail.com",
-                 font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT2, anchor="w").pack(anchor="w", pady=(0, 2))
-    ctk.CTkLabel(scroll, text="cookiestudios.gumroad.com",
-                 font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT2, anchor="w").pack(anchor="w")
+    # ── Credits ───────────────────────────────────────────────────────────────
+    _section("BUILT WITH")
+    ctk.CTkLabel(scroll,
+                 text="Kokoro TTS · Chatterbox TTS · Resemble Perth · Resemble Enhance\n"
+                      "PyTorch · ONNX Runtime · CustomTkinter · NumPy · SciPy",
+                 font=ctk.CTkFont(family="Segoe UI", size=10),
+                 text_color=C_TXT3, anchor="w", justify="left").pack(anchor="w", pady=(0, 4))
+    ctk.CTkLabel(scroll,
+                 text="All open source. Full license list in CREDITS.txt.",
+                 font=ctk.CTkFont(family="Segoe UI", size=10),
+                 text_color=C_TXT3, anchor="w").pack(anchor="w")
 
     ctk.CTkLabel(scroll, text=" ", text_color=C_BG).pack()  # bottom padding
 
@@ -2952,6 +2947,9 @@ def show_about():
     foot = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=52)
     foot.pack(fill="x")
     foot.pack_propagate(False)
+    ctk.CTkLabel(foot, text=f"© 2026 Cookie Studios",
+                 font=ctk.CTkFont(family="Segoe UI", size=10),
+                 text_color=C_TXT3).pack(side="left", padx=20, pady=18)
     ctk.CTkButton(foot, text="Close", command=win.destroy,
                   width=100, height=32, **BTN_GHOST).pack(side="right", padx=16, pady=10)
 
