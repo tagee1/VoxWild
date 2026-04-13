@@ -83,11 +83,10 @@ Source: "{#MyBuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 Source: "CREDITS.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "PRIVACY.txt"; DestDir: "{app}"; Flags: ignoreversion
 
-; ── chatterbox_worker.py (alongside the exe, found via _res()) ───────────────
-; Already included above via recursesubdirs since it's in the PyInstaller output.
-; If you keep chatterbox_worker.py only in the source tree (not copied by PyInstaller),
-; uncomment the line below:
-; Source: "chatterbox_worker.py"; DestDir: "{app}"; Flags: ignoreversion
+; ── worker scripts (alongside the exe, found via _res()) ─────────────────────
+; Already included above via recursesubdirs since they're in the PyInstaller output.
+; chatterbox_worker.py — Natural mode (chatterbox_env / python_embed)
+; enhance_worker.py   — AI Enhancement (python_embed)
 
 
 [Icons]

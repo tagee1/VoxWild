@@ -597,6 +597,147 @@ class ChatterboxEngine:
 
 chatterbox_engine = ChatterboxEngine()
 
+
+class EnhanceEngine:
+    """Manages a persistent enhance_worker.py subprocess."""
+
+    WORKER = _res("enhance_worker.py")
+
+    # Same Python paths as ChatterboxEngine — enhancement runs in python_embed
+    _CB_BASE_DIR   = os.path.join(
+        os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio"
+    )
+    _CB_PYTHON_DIR = os.path.join(_CB_BASE_DIR, "python_embed")
+    _PYTHON_USER   = os.path.join(_CB_PYTHON_DIR, "python.exe")
+    _PYTHON_DEV    = _res(os.path.join("chatterbox_env", "Scripts", "python.exe"))
+
+    def __init__(self):
+        self._proc = None
+        self._lock = threading.Lock()
+
+    @property
+    def PYTHON(self):
+        if os.path.exists(self._PYTHON_DEV):
+            return self._PYTHON_DEV
+        return self._PYTHON_USER
+
+    def start(self, status_cb=None):
+        """Start worker and block until ready. Raises on failure."""
+        with self._lock:
+            if self.is_ready:
+                return
+            if not os.path.exists(self.PYTHON):
+                raise FileNotFoundError(
+                    "python_embed not found — set up Natural mode first.\n"
+                    f"Expected: {self.PYTHON}"
+                )
+
+            python_dir  = os.path.dirname(self.PYTHON)
+            scripts_dir = os.path.join(python_dir, "Scripts")
+            env = os.environ.copy()
+            env["PATH"] = (
+                python_dir + os.pathsep +
+                scripts_dir + os.pathsep +
+                env.get("PATH", "")
+            )
+            env["PYTHONIOENCODING"] = "utf-8"
+
+            _stderr_log = os.path.join(
+                os.environ.get("APPDATA", ""), "TTS Studio",
+                "enhance_startup_crash.log",
+            )
+            _stderr_fh = open(_stderr_log, "w", encoding="utf-8")
+
+            proc = subprocess.Popen(
+                [self.PYTHON, self.WORKER],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=_stderr_fh,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                env=env,
+            )
+            for raw_bytes in proc.stdout:
+                raw = raw_bytes.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if msg["type"] == "status":
+                    if status_cb:
+                        status_cb(msg["msg"])
+                elif msg["type"] == "ready":
+                    self._proc = proc
+                    _stderr_fh.close()
+                    return
+                elif msg["type"] == "error":
+                    proc.kill()
+                    _stderr_fh.close()
+                    raise RuntimeError(msg["msg"])
+            proc.kill()
+            _stderr_fh.close()
+            _stderr = ""
+            try:
+                with open(_stderr_log, encoding="utf-8") as _f:
+                    _stderr = _f.read()
+            except Exception:
+                pass
+            _tail = _stderr.strip().splitlines()[-3:] if _stderr.strip() else []
+            _hint = "\n".join(_tail)
+            raise RuntimeError(
+                f"Enhance worker exited during startup.\n{_hint}".strip()
+                + "  [E013]"
+            )
+
+    def stop(self):
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.stdin.write(
+                    (json.dumps({"cmd": "quit"}) + "\n").encode("utf-8")
+                )
+                self._proc.stdin.flush()
+                self._proc.wait(timeout=5)
+            except Exception:
+                self._proc.kill()
+        self._proc = None
+
+    @property
+    def is_ready(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    def enhance(self, input_path, output_path, device="cpu", status_cb=None):
+        """Enhance one audio file; returns (sample_rate, rms_delta_db)."""
+        req = {
+            "cmd": "enhance",
+            "input_path": input_path,
+            "output_path": output_path,
+            "device": device,
+        }
+        self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
+        self._proc.stdin.flush()
+        for raw_bytes in self._proc.stdout:
+            raw = raw_bytes.decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if msg["type"] == "status":
+                if status_cb:
+                    status_cb(msg["msg"])
+            elif msg["type"] == "done":
+                return msg.get("sr", 44100), msg.get("rms_delta_db", 0.0)
+            elif msg["type"] == "error":
+                self.stop()
+                raise RuntimeError(msg["msg"])
+        self.stop()
+        raise RuntimeError("Enhance worker closed unexpectedly.")
+
+
+enhance_engine = EnhanceEngine()
+
 # ── Chatterbox auto-setup helpers ─────────────────────────────────────────────
 
 def _cb_env_exists():
@@ -1050,19 +1191,15 @@ def add_to_history(samples, sample_rate, text, voice_name, segments=None):
             app.after(0, lambda e=entry: _prepend_history_card(e))
             return
 
-        # Always show card immediately then enhance in background regardless of mode.
-        # CPU/GPU/Async only controls which device the enhance thread uses.
+        # Always show card immediately then enhance in background.
+        # CPU/GPU/Async controls which device the worker uses.
         mode = enhance_mode.get()
         if mode == "GPU":
             device = "cuda"
         elif mode == "CPU":
             device = "cpu"
-        else:  # Async — auto-detect
-            try:
-                import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                device = "cpu"
+        else:  # Async — worker auto-detects
+            device = "cpu"
         entry["enhancing"] = True
         app.after(0, lambda e=entry: _prepend_history_card(e))
         threading.Thread(target=_enhance_async, args=(entry, device), daemon=True).start()
@@ -1071,41 +1208,50 @@ def add_to_history(samples, sample_rate, text, voice_name, segments=None):
 
 
 def _enhance_async(entry, device="cpu"):
-    """Background thread: run Resemble Enhance, verify it worked, refresh the card."""
+    """Background thread: enhance audio via subprocess worker, refresh the card."""
     app.after(0, lambda: status_label.configure(
         text="✨ Enhancing audio... (first run downloads ~450 MB of model weights)"))
     try:
         original_samples = entry["samples"].copy()
         original_sr      = entry["sample_rate"]
 
-        enhanced, new_sr = enhance_audio(original_samples, original_sr, device=device)
-        enhanced_clipped = np.clip(enhanced, -1.0, 1.0)
+        # Write input audio to temp file for the worker
+        input_tmp  = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        output_tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        input_tmp.close()
+        output_tmp.close()
 
-        # ── Verify enhancement actually changed the audio ─────────────────────
-        # Resample original to the output sr for a fair comparison
-        from scipy.signal import resample_poly
-        from math import gcd
-        g = gcd(original_sr, new_sr)
-        orig_resampled = resample_poly(original_samples, new_sr // g, original_sr // g).astype(np.float32)
-        min_len = min(len(orig_resampled), len(enhanced_clipped))
-        rms_orig     = float(np.sqrt(np.mean(orig_resampled[:min_len] ** 2)))
-        rms_enhanced = float(np.sqrt(np.mean(enhanced_clipped[:min_len] ** 2)))
-        mad = float(np.mean(np.abs(orig_resampled[:min_len] - enhanced_clipped[:min_len])))
+        sf.write(input_tmp.name, original_samples, original_sr)
 
-        if mad < 1e-6:
-            raise RuntimeError(
-                "Enhancement produced no change — the model output is identical to the input. "
-                "This usually means the model weights failed to load or the library isn't "
-                "working correctly. Try: pip install resemble-enhance --no-deps --force-reinstall  [E013]"
-            )
+        # Start worker if not already running
+        def _status(msg):
+            app.after(0, lambda m=msg: status_label.configure(text=f"✨ {m}"))
 
-        rms_delta_db = 20 * np.log10(rms_enhanced / rms_orig) if rms_orig > 1e-9 else 0.0
+        enhance_engine.start(status_cb=_status)
+
+        # Send enhance request
+        new_sr, rms_delta_db = enhance_engine.enhance(
+            input_tmp.name, output_tmp.name, device=device, status_cb=_status,
+        )
+
+        # Read back enhanced audio
+        enhanced, _ = sf.read(output_tmp.name, dtype="float32")
+
+        # Clean up temp files
+        try:
+            os.unlink(input_tmp.name)
+        except OSError:
+            pass
+        try:
+            os.unlink(output_tmp.name)
+        except OSError:
+            pass
 
         entry["original_samples"] = original_samples
         entry["original_sr"]      = original_sr
-        entry["samples"]          = enhanced_clipped
+        entry["samples"]          = enhanced
         entry["sample_rate"]      = new_sr
-        entry["duration"]         = len(enhanced_clipped) / new_sr
+        entry["duration"]         = len(enhanced) / new_sr
 
         _lic.record_enhance_use()
 
@@ -1113,18 +1259,21 @@ def _enhance_async(entry, device="cpu"):
             text=f"✅ Enhancement done  ({db:+.1f} dB RMS) — use Orig button to A/B compare"))
 
     except Exception as e:
-        # Use the raw error string — enhance_audio now writes descriptive messages.
-        # _fmt_err would compress these into a generic E013 line, losing the detail.
         _log_crash(e)
         raw_msg = str(e)
-        # Strip the [E013] tag from the display — it's noise for the status bar
         display_msg = raw_msg.replace("  [E013]", "").replace(" [E013]", "")
         app.after(0, lambda m=display_msg: status_label.configure(
             text=f"⚠️ Enhancement failed: {m}"))
+        # Clean up temp files on error
+        for _t in (input_tmp, output_tmp):
+            try:
+                os.unlink(_t.name)
+            except Exception:
+                pass
     finally:
         entry["enhancing"] = False
         app.after(0, refresh_history_panel)
-        app.after(0, _save_history)   # re-save with enhanced audio (or failed state)
+        app.after(0, _save_history)
 
 def _prepend_history_card(entry):
     """Add entry to the top of the history panel and rebuild."""
@@ -3785,58 +3934,54 @@ def _resemble_deps_without_deepspeed():
 
 
 def _install_resemble_enhance():
-    """Background thread: install resemble-enhance without deepspeed.
+    """Background thread: install resemble-enhance into python_embed.
 
     Strategy
     --------
-    1. pip install resemble-enhance --no-deps  (avoids deepspeed build failure)
-    2. Stub deepspeed via sys.meta_path so it never causes an ImportError
-    3. Iteratively: try to import resemble_enhance, catch the exact missing
-       module name from the ImportError, pip install just that package, repeat.
-       This installs only what inference actually needs — not demo deps like
-       gradio or profiling deps like ptflops.
-    4. Once the import succeeds, declare done.
+    1. pip install numpy<2 (resemble-enhance 0.0.1 incompatible with numpy 2.x)
+    2. pip install resemble-enhance --no-deps  (avoids deepspeed build failure)
+    3. Iteratively: try to import in python_embed subprocess, catch the missing
+       module name, pip install just that package, repeat.
+    4. Once the subprocess import succeeds, declare done.
+
+    All imports run in python_embed (subprocess) — never in the frozen app.
     """
-    # Packages that are demo/training-only — skip installing them if they come up
-    _SKIP_PKGS = {"deepspeed", "gradio", "celluloid", "ptflops", "tabulate"}
+    _SKIP_PKGS = {"deepspeed", "gradio", "celluloid", "ptflops"}
 
     app.after(0, lambda: _enhance_cb.configure(state="disabled"))
     app.after(0, lambda: _enhance_mode_btn.configure(state="disabled"))
 
+    _py = enhance_engine.PYTHON
+
     def _pip(*args):
-        if getattr(sys, "frozen", False):
-            # Frozen PyInstaller app: sys.executable is the .exe itself.
-            # Use python_embed's interpreter for pip operations.
-            _py = os.path.join(
-                os.environ.get("APPDATA", ""),
-                "TTS Studio", "python_embed", "python.exe",
-            )
-            if not os.path.exists(_py):
-                raise RuntimeError(
-                    "Natural mode must be set up before Enhancement — "
-                    "switch to Natural mode first."
-                )
-        else:
-            _py = sys.executable
         return subprocess.run(
             [_py, "-m", "pip", "install", *args],
             capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
     def _pip_error(r):
         lines = (r.stderr or r.stdout or "pip failed").strip().splitlines()
         return lines[-1] if lines else "pip failed"
 
-    def _clear_resemble_cache():
-        for key in list(sys.modules.keys()):
-            if key == "resemble_enhance" or key.startswith("resemble_enhance."):
-                del sys.modules[key]
+    def _try_import():
+        """Try importing resemble-enhance via enhance_worker.py --check.
+
+        Uses the real worker's deepspeed stub + PosixPath fix — no
+        duplicated logic, tests the exact code path that runs at runtime.
+        Returns (ok, error_msg).
+        """
+        r = subprocess.run(
+            [_py, enhance_engine.WORKER, "--check"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if r.returncode == 0:
+            return True, ""
+        return False, (r.stderr or r.stdout or "").strip()
 
     try:
-        # ── Step 1: install the package itself + numpy pin ────────────────────
-        # resemble-enhance 0.0.1 is incompatible with numpy 2.x (scalar API
-        # changed). Pin to numpy<2 before anything else so subsequent dep
-        # installs don't pull in a newer numpy.
+        # ── Step 1: numpy pin + resemble-enhance ─────────────────────────────
         app.after(0, lambda: status_label.configure(
             text="📦 Installing Resemble Enhance..."))
         r = _pip("numpy<2", "--upgrade")
@@ -3846,55 +3991,39 @@ def _install_resemble_enhance():
         if r.returncode != 0:
             raise RuntimeError(f"Could not install resemble-enhance: {_pip_error(r)}")
 
-        # ── Step 2: stub deepspeed ────────────────────────────────────────────
-        from audio_utils import _stub_deepspeed
-        _stub_deepspeed()
-
-        # ── Step 3: iteratively resolve missing deps ──────────────────────────
-        import importlib
+        # ── Step 2: iteratively resolve missing deps via subprocess ───────────
         skipped = []
-        for attempt in range(20):   # safety cap — should never need more than ~10
-            _clear_resemble_cache()
-            try:
-                importlib.import_module("resemble_enhance")
-                from resemble_enhance.enhancer.inference import enhance  # noqa: F401
-                break   # import clean — done
-            except ImportError as exc:
-                raw = str(exc)
-                # Extract the top-level missing package name
-                # e.g. "No module named 'pandas'" → "pandas"
-                #      "No module named 'torchvision.transforms'" → "torchvision"
-                missing = raw.replace("No module named", "").strip(" '\"")
-                pkg = missing.split(".")[0].strip()
+        for attempt in range(20):
+            ok, err = _try_import()
+            if ok:
+                break
 
-                if not pkg:
-                    raise RuntimeError(f"Unrecognised ImportError: {raw}")
+            # Extract missing module: "No module named 'pandas'" → "pandas"
+            missing = ""
+            for line in err.splitlines():
+                if "No module named" in line:
+                    missing = line.split("No module named")[-1].strip(" '\"")
+                    break
+            if not missing:
+                # ModuleNotFoundError isn't the only possible failure —
+                # surface the last line of stderr to the user.
+                last_line = err.splitlines()[-1] if err else "unknown error"
+                raise RuntimeError(f"Import check failed: {last_line}")
 
-                if pkg.lower() in _SKIP_PKGS:
-                    # Demo/training dep — skip installing, stub if deepspeed
-                    if pkg.lower() == "deepspeed":
-                        _stub_deepspeed()
-                    else:
-                        skipped.append(pkg)
-                        # Stub this package too so the import can proceed
-                        import types
-                        if pkg not in sys.modules:
-                            stub = types.ModuleType(pkg)
-                            stub.__path__ = []
-                            stub.__getattr__ = lambda n: type("_S", (), {
-                                "__call__": lambda s, *a, **k: s,
-                                "__getattr__": lambda s, n: type("_S", (), {})()
-                            })()
-                            sys.modules[pkg] = stub
-                    continue
+            pkg = missing.split(".")[0].strip()
+            if not pkg:
+                raise RuntimeError(f"Unrecognised ImportError: {missing}")
 
-                app.after(0, lambda p=pkg: status_label.configure(
-                    text=f"📦 Installing missing dep: {p}..."))
-                r = _pip(pkg)
-                if r.returncode != 0:
-                    raise RuntimeError(
-                        f"Failed to install '{pkg}': {_pip_error(r)}"
-                    )
+            if pkg.lower() in _SKIP_PKGS:
+                skipped.append(pkg)
+                # enhance_worker.py --check stubs these automatically
+                continue
+
+            app.after(0, lambda p=pkg: status_label.configure(
+                text=f"📦 Installing missing dep: {p}..."))
+            r = _pip(pkg)
+            if r.returncode != 0:
+                raise RuntimeError(f"Failed to install '{pkg}': {_pip_error(r)}")
         else:
             raise RuntimeError("Dependency resolution did not converge after 20 attempts.")
 
@@ -3912,22 +4041,43 @@ def _install_resemble_enhance():
         app.after(0, lambda: _enhance_mode_btn.configure(state="normal"))
 
 
+def _enhance_deps_installed():
+    """Check if resemble-enhance is importable in python_embed.
+
+    Runs enhance_worker.py --check, which uses the same deepspeed stub
+    and PosixPath fix as the real worker — no duplicated logic.
+    """
+    _py = enhance_engine.PYTHON
+    if not os.path.exists(_py):
+        return False
+    try:
+        r = subprocess.run(
+            [_py, enhance_engine.WORKER, "--check"],
+            capture_output=True, timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _on_enhance_toggle(*_):
     if not enhance_var.get():
         return
-    from audio_utils import _stub_deepspeed
-    _stub_deepspeed()
-    try:
-        import resemble_enhance  # noqa: F401
-        # Import succeeded — check for missing transitive deps by doing a deeper probe
-        from resemble_enhance.enhancer.inference import enhance  # noqa: F401
-    except ImportError as exc:
-        missing = str(exc)
-        # Always trigger install — covers both "not installed" and "dep missing"
+    if not os.path.exists(enhance_engine.PYTHON):
         enhance_var.set(False)
-        app.after(0, lambda m=missing: status_label.configure(
-            text=f"📦 Missing dependency ({m}) — auto-installing..."))
-        threading.Thread(target=_install_resemble_enhance, daemon=True).start()
+        app.after(0, lambda: status_label.configure(
+            text="⚠️ Natural mode must be set up before Enhancement — switch to Natural mode first."))
+        return
+    # Check in a thread to avoid blocking UI (subprocess call)
+    def _check():
+        if _enhance_deps_installed():
+            return  # deps ready, checkbox stays on
+        app.after(0, lambda: enhance_var.set(False))
+        app.after(0, lambda: status_label.configure(
+            text="📦 Resemble Enhance not installed — auto-installing..."))
+        _install_resemble_enhance()
+    threading.Thread(target=_check, daemon=True).start()
 
 
 enhance_var.trace_add("write", _on_enhance_toggle)
@@ -4741,6 +4891,9 @@ def _load_chatterbox_bg(update_modal, close_modal):
     app.after(0, lambda: play_button.configure(state="disabled"))
     app.after(0, lambda: engine_toggle.configure(state="disabled"))
     try:
+        # Free RAM on low-memory machines — enhance worker holds torch in memory
+        if enhance_engine.is_ready:
+            enhance_engine.stop()
         chatterbox_engine.start(status_cb=_st)
         close_modal()
         app.after(0, lambda: engine_toggle.configure(state="normal"))
