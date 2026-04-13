@@ -40,10 +40,13 @@ _ALL_PERMALINKS = (PRODUCT_PERMALINK, PRODUCT_PERMALINK_LIFETIME)
 
 # Gumroad internal product IDs — required for products created after Jan 2023.
 # The API rejects product_permalink and demands product_id instead.
-# Both products share the same internal ID on Gumroad.
-_GUMROAD_PRODUCT_ID = "cwSJcg1w4rgcNO-T6K732w=="
+# If a product is recreated on Gumroad, these IDs will change — update here.
+_GUMROAD_PRODUCT_IDS = {
+    PRODUCT_PERMALINK:          "ghVoskCN35w2iOJaTL25NQ==",  # monthly
+    PRODUCT_PERMALINK_LIFETIME: "cwSJcg1w4rgcNO-T6K732w==",  # lifetime
+}
 
-# Fallback cache for runtime discovery (if hardcoded ID ever changes)
+# Runtime discovery cache (if hardcoded ID is wrong, we extract from error)
 _PRODUCT_IDS = {}  # permalink -> internal product_id
 
 # Store URLs
@@ -212,7 +215,7 @@ def _verify_license(permalink, key, increment):
 
     Gumroad products created after Jan 2023 require the internal product_id
     (not the permalink slug) for license verification.  We try:
-      1. The hardcoded _GUMROAD_PRODUCT_ID (fastest, no extra round-trip)
+      1. The hardcoded product_id for this permalink (fastest)
       2. Any previously discovered ID in _PRODUCT_IDS cache
       3. product_permalink as a fallback — if Gumroad's error contains
          the real product_id, we extract it and retry.
@@ -220,15 +223,18 @@ def _verify_license(permalink, key, increment):
     Returns (ok: bool, response: dict).
     """
     params_base = {"license_key": key, "increment_uses_count": increment}
+    hardcoded_id = _GUMROAD_PRODUCT_IDS.get(permalink)
 
-    # 1. Try the hardcoded product_id first (covers both monthly & lifetime)
-    ok, resp = _gr_post({**params_base, "product_id": _GUMROAD_PRODUCT_ID})
-    if ok and resp.get("success") is True:
-        return ok, resp
+    # 1. Try the hardcoded product_id for this permalink
+    if hardcoded_id:
+        ok, resp = _gr_post({**params_base, "product_id": hardcoded_id})
+        if ok and resp.get("success") is True:
+            return ok, resp
 
     # 2. Try cached discovered ID (if different from hardcoded)
-    if permalink in _PRODUCT_IDS and _PRODUCT_IDS[permalink] != _GUMROAD_PRODUCT_ID:
-        ok, resp = _gr_post({**params_base, "product_id": _PRODUCT_IDS[permalink]})
+    cached_id = _PRODUCT_IDS.get(permalink)
+    if cached_id and cached_id != hardcoded_id:
+        ok, resp = _gr_post({**params_base, "product_id": cached_id})
         if ok and resp.get("success") is True:
             return ok, resp
 
