@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.0.0"
+VERSION          = "1.0.1"
 GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
@@ -2488,6 +2488,7 @@ def queue_generate_all():
     est_total   = estimate_processing_time(" ".join(i["text"] for i in queue_items))
 
     queue_gen_btn.configure(state="disabled")
+    play_button.configure(state="disabled")
     smooth.start(est_total)
     _cancel_event.clear()
 
@@ -2551,6 +2552,7 @@ def queue_generate_all():
             app.after(0, lambda t=total_items, d=out_dir, f=fmt_str: status_label.configure(
                 text=f"✅ Queue complete! {t} {f} files saved to {d}"))
         app.after(0, lambda: queue_gen_btn.configure(state="normal"))
+        app.after(0, lambda: play_button.configure(state="normal", text="Generate"))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -2609,6 +2611,7 @@ def generate_and_store():
     stop_button.configure(state="normal", text="Cancel",
                           fg_color="#2a0f0f", hover_color="#3d1515",
                           text_color=C_DANGER, border_width=1, border_color="#3d1515")
+    queue_gen_btn.configure(state="disabled")
     smooth.start(est)
     is_generating = True
 
@@ -2644,6 +2647,7 @@ def generate_and_store():
                 state="disabled", text="Stop",
                 fg_color="transparent", hover_color=C_ELEVATED,
                 text_color=C_TXT2, border_width=1, border_color=C_BORDER))
+            app.after(0, lambda: queue_gen_btn.configure(state="normal"))
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -4492,6 +4496,8 @@ def dlg_generate():
     _dlg_cancel_event.clear()
     dlg_gen_btn.configure(state="disabled", text="Generating...")
     dlg_detect_btn.configure(state="disabled")
+    play_button.configure(state="disabled")
+    queue_gen_btn.configure(state="disabled")
     dlg_cancel_btn.configure(command=lambda: _dlg_cancel_event.set())
     dlg_cancel_btn.pack(pady=(0, 4))
     smooth.start(est)
@@ -4529,6 +4535,8 @@ def dlg_generate():
             app.after(0, lambda: dlg_gen_btn.configure(state="normal", text="Generate Dialogue"))
             app.after(0, lambda: dlg_detect_btn.configure(state="normal"))
             app.after(0, lambda: dlg_cancel_btn.pack_forget())
+            app.after(0, lambda: play_button.configure(state="normal", text="Generate"))
+            app.after(0, lambda: queue_gen_btn.configure(state="normal"))
 
     threading.Thread(target=run, daemon=True).start()
 
