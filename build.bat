@@ -16,6 +16,16 @@ echo  TTS Studio Build Script
 echo ============================================================
 echo.
 
+REM ── Step 0: Sync version from app.py into installer.iss ──────────────────────
+echo [0/3] Syncing version from app.py to installer.iss...
+for /f "tokens=2 delims==" %%v in ('findstr /r "^VERSION *= *" "%APP_DIR%app.py"') do (
+    set "APP_VERSION=%%v"
+)
+set "APP_VERSION=%APP_VERSION: =%"
+set "APP_VERSION=%APP_VERSION:"=%"
+echo       Version: %APP_VERSION%
+powershell -NoProfile -Command "(Get-Content '%APP_DIR%installer.iss') -replace '#define MyAppVersion   \".*\"', '#define MyAppVersion   \"%APP_VERSION%\"' | Set-Content '%APP_DIR%installer.iss'"
+
 REM ── Step 1: Clean previous build ─────────────────────────────────────────────
 echo [1/3] Cleaning previous build...
 if exist "%APP_DIR%dist" rmdir /s /q "%APP_DIR%dist"
