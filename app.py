@@ -3123,19 +3123,6 @@ ctk.CTkButton(header, text="Settings", command=show_settings,
               font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_GHOST).pack(side="right", padx=(0, 6), pady=14)
 
-stop_button = ctk.CTkButton(
-    header, text="Stop", command=stop_audio,
-    width=60, height=30,
-    font=ctk.CTkFont(family="Segoe UI", size=12),
-    state="disabled", **BTN_GHOST, corner_radius=8)
-stop_button.pack(side="right", padx=(0, 6), pady=14)
-
-play_button = ctk.CTkButton(
-    header, text="Generate", command=generate_and_store,
-    width=100, height=30,
-    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
-    corner_radius=8)
-play_button.pack(side="right", padx=(0, 6), pady=14)
 _activate_btn = ctk.CTkButton(
     header, text="🔑 Activate", command=lambda: _show_activation_modal(can_skip=True),
     width=98, height=30,
@@ -3192,6 +3179,22 @@ tabs.add("  Studio  ")
 tabs.add("  Queue  ")
 tabs.add("  Dialogue  ")
 tabs.add("  Profiles  ")
+
+# Generate / Stop buttons in the tab bar row
+_tab_bar = tabs._segmented_button.master  # frame that holds the segmented button
+stop_button = ctk.CTkButton(
+    _tab_bar, text="Stop", command=stop_audio,
+    width=60, height=28,
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    state="disabled", **BTN_GHOST, corner_radius=8)
+stop_button.pack(side="right", padx=(0, 10), pady=6)
+
+play_button = ctk.CTkButton(
+    _tab_bar, text="Generate", command=generate_and_store,
+    width=100, height=28,
+    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+    corner_radius=8)
+play_button.pack(side="right", padx=(0, 4), pady=6)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STUDIO TAB
