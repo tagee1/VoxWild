@@ -142,6 +142,16 @@ def _extract_error(resp):
     return "Activation failed. Check your key and try again."
 
 
+def _get_ssl_context():
+    """Use certifi's CA bundle — frozen PyInstaller apps can't verify HTTPS
+    certs otherwise (CERTIFICATE_VERIFY_FAILED)."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def _gr_post(params):
     """
     POST to Gumroad /v2/licenses/verify.
@@ -151,7 +161,7 @@ def _gr_post(params):
         data = urllib.parse.urlencode(params).encode()
         req  = urllib.request.Request(_GR_VERIFY, data=data, method="POST")
         req.add_header("Accept", "application/json")
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT, context=_get_ssl_context()) as resp:
             try:
                 return True, json.loads(resp.read())
             except (json.JSONDecodeError, ValueError):

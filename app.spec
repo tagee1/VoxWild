@@ -35,6 +35,9 @@ _datas = [
     ("enhance_worker.py",     "."),  # run by python_embed python, not imported
     ("vcomp140.dll",          "."),  # OpenMP runtime — copied to torchaudio\lib during Natural mode setup
 
+    # ── certifi CA bundle — HTTPS verification in frozen app ────────────────
+    (os.path.join(SP, "certifi", "cacert.pem"), "certifi"),
+
     # ── customtkinter (themes, images, assets) ─────────────────────────────
     (os.path.join(SP, "customtkinter"), "customtkinter"),
 
@@ -104,6 +107,9 @@ _hidden = [
     # Tkinter dialogs used at runtime
     "tkinter.filedialog",
     "tkinter.messagebox",
+
+    # SSL CA bundle — needed for HTTPS in frozen app (GitHub API, Gumroad)
+    "certifi",
 
     # Standard library bits the analyser sometimes misses
     "ctypes.wintypes",
