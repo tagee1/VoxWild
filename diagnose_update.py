@@ -23,7 +23,7 @@ def log(msg):
         f.write(line + "\n")
 
 VERSION = "1.0.0"  # pretend we're v1.0.0
-GITHUB_REPO = "tagee1/voxwild"
+GITHUB_REPO = "tagee1/VoxWild"
 
 log("=" * 60)
 log(f"Update diagnostic — pretending to be v{VERSION}")

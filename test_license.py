@@ -789,7 +789,7 @@ class TestFreemiumUsage(unittest.TestCase):
 class TestDualPermalink(unittest.TestCase):
     """
     activate_license and validate_license_silent must try both Gumroad
-    permalinks (monthly TTSStudioPro, lifetime TTSStudioProLifetime) because
+    permalinks (monthly VoxWildPro, lifetime VoxWildProLifetime) because
     each product generates keys tied only to its own permalink.
     """
 
@@ -1019,14 +1019,14 @@ class TestVerifyLicense(unittest.TestCase):
     def test_hardcoded_id_succeeds_first_try(self, mock_post):
         """When hardcoded product_id works, only one API call is made."""
         mock_post.return_value = (True, {"success": True, "purchase": {}})
-        ok, resp = _verify_license("TTSStudioProLifetime", "KEY", "false")
+        ok, resp = _verify_license("VoxWildProLifetime", "KEY", "false")
         self.assertTrue(ok)
         self.assertTrue(resp["success"])
         self.assertEqual(mock_post.call_count, 1)
         # Verify it used the hardcoded product_id
         call_params = mock_post.call_args[0][0]
         self.assertEqual(call_params["product_id"],
-                         lic._GUMROAD_PRODUCT_IDS["TTSStudioProLifetime"])
+                         lic._GUMROAD_PRODUCT_IDS["VoxWildProLifetime"])
 
     # ── hardcoded fails, permalink fallback works ────────────────────────────
 
@@ -1037,7 +1037,7 @@ class TestVerifyLicense(unittest.TestCase):
             (True, {"success": False, "message": "Not found."}),  # hardcoded
             (True, {"success": True, "purchase": {}}),             # permalink
         ]
-        ok, resp = _verify_license("TTSStudioPro", "KEY", "false")
+        ok, resp = _verify_license("VoxWildPro", "KEY", "false")
         self.assertTrue(ok)
         self.assertEqual(mock_post.call_count, 2)
         call_params = mock_post.call_args_list[1][0][0]
@@ -1057,11 +1057,11 @@ class TestVerifyLicense(unittest.TestCase):
             # retry with discovered ID succeeds
             (True, {"success": True, "purchase": {}}),
         ]
-        ok, resp = _verify_license("TTSStudioPro", "KEY", "true")
+        ok, resp = _verify_license("VoxWildPro", "KEY", "true")
         self.assertTrue(ok)
         self.assertEqual(mock_post.call_count, 3)
         # Discovered ID should be cached
-        self.assertEqual(lic._PRODUCT_IDS["TTSStudioPro"], "abc123XYZ==")
+        self.assertEqual(lic._PRODUCT_IDS["VoxWildPro"], "abc123XYZ==")
         # Third call should use discovered ID
         call_params = mock_post.call_args_list[2][0][0]
         self.assertEqual(call_params["product_id"], "abc123XYZ==")
@@ -1069,12 +1069,12 @@ class TestVerifyLicense(unittest.TestCase):
     @patch("license._gr_post")
     def test_cached_id_used_on_subsequent_calls(self, mock_post):
         """Once a product_id is discovered, it's used directly next time."""
-        lic._PRODUCT_IDS["TTSStudioPro"] = "cached-id-123"
+        lic._PRODUCT_IDS["VoxWildPro"] = "cached-id-123"
         mock_post.side_effect = [
             (True, {"success": False}),  # hardcoded fails
             (True, {"success": True}),   # cached works
         ]
-        ok, resp = _verify_license("TTSStudioPro", "KEY", "false")
+        ok, resp = _verify_license("VoxWildPro", "KEY", "false")
         self.assertTrue(ok)
         call_params = mock_post.call_args_list[1][0][0]
         self.assertEqual(call_params["product_id"], "cached-id-123")
@@ -1088,7 +1088,7 @@ class TestVerifyLicense(unittest.TestCase):
             "success": False,
             "message": "That license does not exist for the provided product.",
         })
-        ok, resp = _verify_license("TTSStudioPro", "BAD-KEY", "false")
+        ok, resp = _verify_license("VoxWildPro", "BAD-KEY", "false")
         self.assertFalse(resp["success"])
         self.assertIn("does not exist", resp["message"])
 
@@ -1098,7 +1098,7 @@ class TestVerifyLicense(unittest.TestCase):
     def test_network_error_propagates(self, mock_post):
         """Network error on hardcoded ID check propagates up."""
         mock_post.return_value = (False, {"_network_error": True, "error": "timeout"})
-        ok, resp = _verify_license("TTSStudioPro", "KEY", "false")
+        ok, resp = _verify_license("VoxWildPro", "KEY", "false")
         self.assertFalse(ok)
         # On network error, hardcoded fails, permalink fails, no hint → return error
         self.assertTrue(resp.get("_network_error"))
@@ -1224,7 +1224,7 @@ class TestLiveGumroadAPI(unittest.TestCase):
     def _require_active_key(self):
         """Skip test if the test key has been revoked/disabled on Gumroad."""
         ok, resp = _gr_post({
-            "product_id": lic._GUMROAD_PRODUCT_IDS["TTSStudioProLifetime"],
+            "product_id": lic._GUMROAD_PRODUCT_IDS["VoxWildProLifetime"],
             "license_key": self.TEST_KEY,
             "increment_uses_count": "false",
         })
@@ -1242,7 +1242,7 @@ class TestLiveGumroadAPI(unittest.TestCase):
     def test_product_permalink_returns_product_id_hint(self):
         """Sending product_permalink returns error with real product_id."""
         ok, resp = _gr_post({
-            "product_permalink": "TTSStudioProLifetime",
+            "product_permalink": "VoxWildProLifetime",
             "license_key": self.TEST_KEY,
             "increment_uses_count": "false",
         })
@@ -1250,18 +1250,18 @@ class TestLiveGumroadAPI(unittest.TestCase):
         msg = resp.get("message", "")
         m = _PRODUCT_ID_RE.search(msg)
         self.assertIsNotNone(m, f"No product_id in error: {msg}")
-        self.assertEqual(m.group(1), lic._GUMROAD_PRODUCT_IDS["TTSStudioProLifetime"])
+        self.assertEqual(m.group(1), lic._GUMROAD_PRODUCT_IDS["VoxWildProLifetime"])
 
     def test_verify_license_end_to_end(self):
         """_verify_license finds the right product and validates the key."""
         self._require_active_key()
-        ok, resp = _verify_license("TTSStudioProLifetime", self.TEST_KEY, "false")
+        ok, resp = _verify_license("VoxWildProLifetime", self.TEST_KEY, "false")
         self.assertTrue(ok)
         self.assertTrue(resp.get("success"))
 
     def test_verify_license_bad_key_returns_failure(self):
         """Invalid key returns success=False, not an exception."""
-        ok, resp = _verify_license("TTSStudioProLifetime", "FAKE-KEY-1234", "false")
+        ok, resp = _verify_license("VoxWildProLifetime", "FAKE-KEY-1234", "false")
         self.assertFalse(resp.get("success", True))
 
     def test_full_activate_flow(self):
