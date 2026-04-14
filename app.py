@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.0.7"
+VERSION          = "1.0.8"
 GITHUB_REPO      = "tagee1/tts-studio"
 MAX_HISTORY      = 10
 
@@ -5112,14 +5112,14 @@ def _show_upsell_modal(feature):
                  corner_radius=0).pack(fill="x", side="top")
 
     ctk.CTkButton(
-        btn_row, text="Monthly — $5/mo", width=130, height=34,
+        btn_row, text="Monthly — $12/mo", width=140, height=34,
         font=ctk.CTkFont(family="Segoe UI", size=13),
         fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
         command=lambda: webbrowser.open(_lic.STORE_URL_MONTHLY),
     ).pack(side="left", padx=(14, 4), pady=9)
 
     ctk.CTkButton(
-        btn_row, text="Lifetime — $45", width=120, height=34,
+        btn_row, text="Lifetime — $89", width=130, height=34,
         font=ctk.CTkFont(family="Segoe UI", size=13),
         fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#000000",
         command=lambda: webbrowser.open(_lic.STORE_URL_LIFETIME),
