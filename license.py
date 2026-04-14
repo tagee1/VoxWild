@@ -34,8 +34,8 @@ FREE_ENHANCE_USES = 3   # lifetime free Resemble Enhance uses
 MAX_MACHINES      = 2   # max simultaneous machine activations per key
 
 # Gumroad product permalinks — one per product (monthly vs lifetime)
-PRODUCT_PERMALINK          = "TTSStudioPro"          # monthly
-PRODUCT_PERMALINK_LIFETIME = "TTSStudioProLifetime"  # lifetime
+PRODUCT_PERMALINK          = "VoxWildPro"          # monthly
+PRODUCT_PERMALINK_LIFETIME = "VoxWildProLifetime"  # lifetime
 _ALL_PERMALINKS = (PRODUCT_PERMALINK, PRODUCT_PERMALINK_LIFETIME)
 
 # Gumroad internal product IDs — required for products created after Jan 2023.
@@ -51,8 +51,8 @@ _PRODUCT_IDS = {}  # permalink -> internal product_id
 
 # Store URLs
 STORE_URL          = "https://cookiestudios.gumroad.com"
-STORE_URL_MONTHLY  = "https://cookiestudios.gumroad.com/l/TTSStudioPro"
-STORE_URL_LIFETIME = "https://cookiestudios.gumroad.com/l/TTSStudioProLifetime"
+STORE_URL_MONTHLY  = "https://cookiestudios.gumroad.com/l/VoxWildPro"
+STORE_URL_LIFETIME = "https://cookiestudios.gumroad.com/l/VoxWildProLifetime"
 
 _GR_VERIFY = "https://api.gumroad.com/v2/licenses/verify"
 

@@ -111,8 +111,8 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.1.0"
-GITHUB_REPO      = "tagee1/voxwild"
+VERSION          = "1.1.1"
+GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
 # ── User data directory (%APPDATA%\TTS Studio) ────────────────────────────────
@@ -2926,7 +2926,7 @@ def show_about():
     _link_row("Email",    "cookiestudios.dev@gmail.com")
     _link_row("Website",  "https://voxwild.com")
     _link_row("Store",    "https://cookiestudios.gumroad.com")
-    _link_row("Updates",  "https://github.com/tagee1/voxwild/releases")
+    _link_row("Updates",  "https://github.com/tagee1/VoxWild/releases")
 
     # ── Credits ───────────────────────────────────────────────────────────────
     _section("BUILT WITH")
