@@ -1,5 +1,5 @@
 """
-license.py — Gumroad license key validation for TTS Studio.
+license.py — Gumroad license key validation for VoxWild.
 
 Flow:
   - First GRACE_LAUNCHES launches: app runs freely, status bar shows a countdown.

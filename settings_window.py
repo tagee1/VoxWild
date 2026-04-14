@@ -26,15 +26,15 @@ SETTINGS_FILE = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio", "settings.json"
 )
 
-# ── Studio Gold palette (must match app.py) ───────────────────────────────────
+# ── Wild Emerald palette (must match app.py) ──────────────────────────────────
 C_BG        = "#0d0d0d"
 C_SURFACE   = "#171717"
 C_CARD      = "#1f1f1f"
 C_ELEVATED  = "#2a2a2a"
 C_BORDER    = "#383838"
-C_ACCENT    = "#e8940a"
-C_ACCENT_H  = "#f5aa2a"
-C_ACCENT_D  = "#3d2200"
+C_ACCENT    = "#00d98b"
+C_ACCENT_H  = "#2ee5a0"
+C_ACCENT_D  = "#0a3d28"
 C_TXT       = "#f0ece4"
 C_TXT2      = "#9a9290"
 C_TXT3      = "#4e4a48"

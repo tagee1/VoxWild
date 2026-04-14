@@ -483,7 +483,7 @@ class TestGrPost(unittest.TestCase):
     def test_success_returns_true_and_json(self, mock_urlopen):
         payload = {"success": True, "purchase": {}}
         mock_urlopen.return_value = _make_urlopen_mock(payload)
-        ok, resp = _gr_post({"license_key": "KEY", "product_id": "tts-studio"})
+        ok, resp = _gr_post({"license_key": "KEY", "product_id": "voxwild"})
         self.assertTrue(ok)
         self.assertTrue(resp["success"])
 
@@ -1235,7 +1235,9 @@ class TestLiveGumroadAPI(unittest.TestCase):
     def test_hardcoded_product_id_validates_lifetime_key(self):
         """Hardcoded lifetime product_id successfully validates a real key."""
         resp = self._require_active_key()
-        self.assertEqual(resp["purchase"]["product_name"], "TTS Studio Pro Lifetime")
+        # Product name on Gumroad — update after renaming the product there
+        self.assertIn(resp["purchase"].get("product_name", ""),
+                      ("TTS Studio Pro Lifetime", "VoxWild Pro Lifetime"))
 
     def test_product_permalink_returns_product_id_hint(self):
         """Sending product_permalink returns error with real product_id."""

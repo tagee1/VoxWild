@@ -1,5 +1,5 @@
 @echo off
-REM build.bat — Build TTS Studio installer in one step
+REM build.bat — Build VoxWild installer in one step
 REM
 REM Requirements:
 REM   - PyInstaller installed in the active Python env (pip install pyinstaller)
@@ -12,7 +12,7 @@ set "APP_DIR=%~dp0"
 
 echo.
 echo ============================================================
-echo  TTS Studio Build Script
+echo  VoxWild Build Script
 echo ============================================================
 echo.
 
@@ -46,9 +46,9 @@ if errorlevel 1 (
 echo       PyInstaller complete.
 
 REM ── Verify the exe was produced ───────────────────────────────────────────────
-if not exist "%APP_DIR%dist\TTS Studio\TTS Studio.exe" (
+if not exist "%APP_DIR%dist\VoxWild\VoxWild.exe" (
     echo.
-    echo ERROR: Expected exe not found at dist\TTS Studio\TTS Studio.exe
+    echo ERROR: Expected exe not found at dist\VoxWild\VoxWild.exe
     exit /b 1
 )
 
@@ -87,11 +87,11 @@ echo ============================================================
 echo  Build complete!
 echo ============================================================
 echo.
-echo  Installer: installer_output\TTS-Studio-Setup.exe
+echo  Installer: installer_output\VoxWild-Setup.exe
 echo.
 
 REM Show installer size
-for %%F in ("%APP_DIR%installer_output\TTS-Studio-Setup.exe") do (
+for %%F in ("%APP_DIR%installer_output\VoxWild-Setup.exe") do (
     set /a "SIZE_MB=%%~zF / 1048576"
     echo  Size: !SIZE_MB! MB
 )
@@ -99,8 +99,8 @@ for %%F in ("%APP_DIR%installer_output\TTS-Studio-Setup.exe") do (
 echo.
 echo  Next steps:
 echo    1. Test the installer on a clean Windows machine
-echo    2. Sign with: signtool sign /tr http://timestamp.sectigo.com /td sha256 /fd sha256 /a installer_output\TTS-Studio-Setup.exe
-echo    3. Upload installer_output\TTS-Studio-Setup.exe as a GitHub Release asset
+echo    2. Sign with: signtool sign /tr http://timestamp.sectigo.com /td sha256 /fd sha256 /a installer_output\VoxWild-Setup.exe
+echo    3. Upload installer_output\VoxWild-Setup.exe as a GitHub Release asset
 echo.
 
 endlocal

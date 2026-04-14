@@ -1,4 +1,4 @@
-TTS Studio — Privacy Policy
+VoxWild — Privacy Policy
 ============================
 Cookie Studios | Last updated: April 2026
 
@@ -6,7 +6,7 @@ Cookie Studios | Last updated: April 2026
 THE SHORT VERSION
 ────────────────────────────────────────────────────────────────────────────
 
-TTS Studio collects no personal data. All audio generation runs entirely on
+VoxWild collects no personal data. All audio generation runs entirely on
 your computer. Nothing you type or record ever leaves your machine.
 
 ────────────────────────────────────────────────────────────────────────────
@@ -15,7 +15,7 @@ WHAT WE COLLECT
 
 We collect nothing. Specifically:
 
-  - No text you enter into TTS Studio is transmitted anywhere.
+  - No text you enter into VoxWild is transmitted anywhere.
   - No audio you generate or record is transmitted anywhere.
   - No voice clone samples are uploaded to any server.
   - No usage statistics, telemetry, or crash reports are sent to us.
@@ -25,7 +25,7 @@ We collect nothing. Specifically:
 LICENSE ACTIVATION
 ────────────────────────────────────────────────────────────────────────────
 
-When you activate your license key, TTS Studio makes a single HTTPS request
+When you activate your license key, VoxWild makes a single HTTPS request
 to the Gumroad API to validate your key. This request includes:
 
   - Your license key (so it can be verified)
@@ -39,7 +39,9 @@ If you have not activated a license key, no network requests are made at all.
 LOCAL DATA STORAGE
 ────────────────────────────────────────────────────────────────────────────
 
-TTS Studio stores the following files on your computer only:
+VoxWild stores the following files on your computer only (legacy folder
+name "TTS Studio" preserved from earlier versions so existing user data
+and model installs are not disrupted):
 
   %APPDATA%\TTS Studio\settings.json   — your app preferences
   %APPDATA%\TTS Studio\tts_profiles.json — saved EQ/voice presets
@@ -63,8 +65,8 @@ CONTACT
 ────────────────────────────────────────────────────────────────────────────
 
 Questions about this policy? Contact Cookie Studios through the store page
-where you purchased TTS Studio.
+where you purchased VoxWild.
 
 ────────────────────────────────────────────────────────────────────────────
 Cookie Studios is an individual software developer, not a corporation.
-This policy applies to TTS Studio version 1.0 and later.
+This policy applies to VoxWild version 1.1 and later.
