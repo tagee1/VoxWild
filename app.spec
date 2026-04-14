@@ -170,7 +170,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,   # disabled — UPX-packed exes trigger false positives in Windows Defender
     upx_exclude=[
         # Don't UPX-compress DLLs that self-verify their layout at runtime
         "onnxruntime.dll",
@@ -192,7 +192,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,   # disabled — UPX-packed exes trigger false positives in Windows Defender
     upx_exclude=[
         "onnxruntime.dll",
         "libportaudio64bit.dll",
