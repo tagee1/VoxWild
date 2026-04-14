@@ -341,7 +341,7 @@ def main():
     # Its C extension silently fails on some machines (missing native deps),
     # causing perth.PerthImplicitWatermarker to be set to None by perth itself.
     # chatterbox-tts 0.1.7 calls it without a None check → TypeError.
-    # We don't use watermarking in TTS Studio, so inject a no-op stub.
+    # We don't use watermarking in VoxWild, so inject a no-op stub.
     try:
         import perth as _perth
         if not callable(getattr(_perth, "PerthImplicitWatermarker", None)):

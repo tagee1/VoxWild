@@ -18,3 +18,9 @@ __pycache__/
 # User-specific data (optional — remove lines below to include in repo)
 # calibration.json
 # tts_profiles.json
+
+# Build output — never commit these
+build/
+dist/
+installer_output/
+*.spec.bak

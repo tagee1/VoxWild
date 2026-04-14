@@ -1,24 +1,24 @@
-; installer.iss — Inno Setup script for TTS Studio
+; installer.iss — Inno Setup script for VoxWild
 ;
 ; Prerequisites:
 ;   1. Run PyInstaller:  pyinstaller app.spec
-;      Output must be in:  dist\TTS Studio\
+;      Output must be in:  dist\VoxWild\
 ;   2. Install Inno Setup 6:  https://jrsoftware.org/isinfo.php
 ;   3. Compile:  iscc installer.iss
-;      Output: installer_output\TTS-Studio-Setup.exe
+;      Output: installer_output\VoxWild-Setup.exe
 ;
 ; Signing (after you have a code signing cert):
 ;   signtool sign /tr http://timestamp.sectigo.com /td sha256 /fd sha256 ^
-;     /a installer_output\TTS-Studio-Setup.exe
+;     /a installer_output\VoxWild-Setup.exe
 
-#define MyAppName      "TTS Studio"
-#define MyAppVersion   "1.0.8"
+#define MyAppName      "VoxWild"
+#define MyAppVersion   "1.1.0"
 #define MyAppPublisher "Cookie Studios"
 #define MyAppURL       "https://cookiestudios.gumroad.com/l/TTSStudioPro"
 #define MyAppSupportURL "mailto:cookiestudios.dev@gmail.com"
-#define MyAppUpdatesURL "https://github.com/tagee1/tts-studio/releases/latest"
-#define MyAppExeName   "TTS Studio.exe"
-#define MyBuildDir     "dist\TTS Studio"
+#define MyAppUpdatesURL "https://github.com/tagee1/voxwild/releases/latest"
+#define MyAppExeName   "VoxWild.exe"
+#define MyBuildDir     "dist\VoxWild"
 
 [Setup]
 AppId={{B3F2A1C4-7D8E-4F0A-9B2C-5E6D3A1F8C90}
@@ -37,7 +37,7 @@ AllowNoIcons=yes
 
 ; Output
 OutputDir=installer_output
-OutputBaseFilename=TTS-Studio-Setup
+OutputBaseFilename=VoxWild-Setup
 SetupIconFile=icon.ico
 
 ; Compression (LZMA2 is best ratio for large binaries)
@@ -101,7 +101,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 
 
 [UninstallRun]
-; Nothing special needed — user data lives in %APPDATA%\TTS Studio, not here
+; Nothing special needed — user data lives in %APPDATA%\TTS Studio (legacy path preserved for upgrades), not here
 
 
 [Registry]

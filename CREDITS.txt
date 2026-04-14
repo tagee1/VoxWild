@@ -1,8 +1,8 @@
-TTS Studio — Open Source Credits
+VoxWild — Open Source Credits
 ==================================
 Copyright (c) 2025-2026 Cookie Studios. All rights reserved.
 
-TTS Studio is built on the shoulders of the following open-source projects.
+VoxWild is built on the shoulders of the following open-source projects.
 We are grateful to their authors and contributors.
 
 ────────────────────────────────────────────────────────────────────────────
@@ -160,7 +160,7 @@ Apache 2.0 and BSD licenses permit commercial use with attribution, which
 this file provides.
 
 GPL-3.0 libraries (phonemizer-fork, eSpeak-NG) are used as unmodified
-runtime dependencies; TTS Studio does not modify their source code. Source
+runtime dependencies; VoxWild does not modify their source code. Source
 code for these libraries is available at the URLs listed above.
 
 LGPL-3.0 libraries (lameenc) are distributed as unmodified compiled modules.
@@ -168,5 +168,5 @@ Source code is available at the URL listed above, allowing users to re-link
 with a modified version of the library per LGPL-3.0 Section 4(d)(0).
 
 ────────────────────────────────────────────────────────────────────────────
-TTS Studio itself is proprietary software. See EULA.rtf for terms of use.
+VoxWild itself is proprietary software. See EULA.rtf for terms of use.
 Copyright (c) 2025-2026 Cookie Studios. All rights reserved.

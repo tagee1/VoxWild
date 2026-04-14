@@ -1,8 +1,8 @@
 $WshShell = New-Object -ComObject WScript.Shell
 $Desktop = [System.Environment]::GetFolderPath("Desktop")
-$Shortcut = $WshShell.CreateShortcut("$Desktop\TTS Studio.lnk")
+$Shortcut = $WshShell.CreateShortcut("$Desktop\VoxWild.lnk")
 $Shortcut.TargetPath = "C:\tts-app\launch.vbs"
 $Shortcut.WorkingDirectory = "C:\tts-app"
-$Shortcut.Description = "TTS Studio"
+$Shortcut.Description = "VoxWild"
 $Shortcut.Save()
-Write-Host "Shortcut created at $Desktop\TTS Studio.lnk"
+Write-Host "Shortcut created at $Desktop\VoxWild.lnk"

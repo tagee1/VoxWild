@@ -1,9 +1,9 @@
-# app.spec — PyInstaller build spec for TTS Studio (Fast mode only)
+# app.spec — PyInstaller build spec for VoxWild (Fast mode only)
 #
 # Build command (from C:\tts-app):
 #   pyinstaller app.spec
 #
-# Output: dist\TTS Studio\TTS Studio.exe  (one-dir build)
+# Output: dist\VoxWild\VoxWild.exe  (one-dir build)
 #
 # Chatterbox (Natural mode) is NOT bundled here. The chatterbox_env folder
 # and chatterbox_worker.py are deployed by the Inno Setup installer alongside
@@ -166,7 +166,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="TTS Studio",
+    name="VoxWild",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -198,5 +198,5 @@ coll = COLLECT(
         "libportaudio64bit.dll",
         "libsndfile_x64.dll",
     ],
-    name="TTS Studio",
+    name="VoxWild",
 )
