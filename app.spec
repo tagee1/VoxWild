@@ -111,6 +111,9 @@ _hidden = [
     # SSL CA bundle — needed for HTTPS in frozen app (GitHub API, Gumroad)
     "certifi",
 
+    # In-app updater — patches bypass SmartScreen by not executing a new .exe
+    "update_patcher",
+
     # Standard library bits the analyser sometimes misses
     "ctypes.wintypes",
     "ctypes.windll",

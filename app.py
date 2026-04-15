@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.1.2"
+VERSION          = "1.2.0"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
@@ -5204,9 +5204,154 @@ def _run_kokoro_benchmark():
 def _show_update_banner(latest_tag: str):
     """Show the amber update banner below the header. Called from main thread only."""
     _update_banner_label.configure(text=f"🔔 Update available: {latest_tag}")
-    url = f"https://github.com/{GITHUB_REPO}/releases/latest"
-    _update_banner_link.configure(command=lambda: webbrowser.open(url))
+    _update_banner_link.configure(
+        text="Install ↻",
+        command=lambda v=latest_tag: _start_in_app_update(v),
+    )
     _update_banner.pack(fill="x", before=prog_row)
+
+
+def _start_in_app_update(latest_tag: str):
+    """Begin the in-app patch update flow with a progress modal."""
+    target_version = latest_tag.lstrip("v")
+
+    # Progress modal
+    win = ctk.CTkToplevel(app)
+    win.title("Updating VoxWild")
+    _center_window(win, 420, 200)
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+    # Prevent closing mid-update
+    win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    ctk.CTkLabel(win, text=f"Installing VoxWild {latest_tag}",
+                 font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+                 text_color=C_TXT).pack(pady=(24, 4))
+    status_lbl = ctk.CTkLabel(win, text="Preparing...",
+                              font=ctk.CTkFont(family="Segoe UI", size=12),
+                              text_color=C_TXT2)
+    status_lbl.pack(pady=(0, 16))
+
+    pb = ctk.CTkProgressBar(win, width=340, height=6, corner_radius=3,
+                            progress_color=C_ACCENT)
+    pb.pack(pady=(0, 6))
+    pb.set(0)
+
+    detail_lbl = ctk.CTkLabel(win, text="",
+                              font=ctk.CTkFont(family="Consolas", size=10),
+                              text_color=C_TXT3)
+    detail_lbl.pack(pady=(0, 10))
+
+    cancel_btn = ctk.CTkButton(win, text="Cancel", width=90, height=28,
+                               **BTN_GHOST, command=win.destroy)
+    cancel_btn.pack(pady=(0, 14))
+
+    def _set_status(msg):
+        app.after(0, lambda m=msg: status_lbl.configure(text=m))
+
+    def _set_progress(frac, detail=""):
+        app.after(0, lambda f=frac, d=detail: (pb.set(f), detail_lbl.configure(text=d)))
+
+    def _fail(msg, offer_github=True):
+        app.after(0, lambda: status_lbl.configure(text=f"⚠️ {msg}", text_color=C_DANGER))
+        app.after(0, lambda: pb.configure(progress_color=C_DANGER))
+        if offer_github:
+            app.after(0, lambda: cancel_btn.configure(
+                text="Open GitHub instead",
+                command=lambda: (webbrowser.open(
+                    f"https://github.com/{GITHUB_REPO}/releases/latest"), win.destroy())
+            ))
+        else:
+            app.after(0, lambda: cancel_btn.configure(text="Close", command=win.destroy))
+
+    def _run():
+        try:
+            import update_patcher
+            from pathlib import Path
+            update_patcher.cleanup_old_patches()
+
+            # 1. Find patch url
+            _set_status("Checking for patch...")
+            _set_progress(0.05)
+            try:
+                patch_url = update_patcher.fetch_patch_url(GITHUB_REPO, target_version)
+            except Exception as e:
+                _fail(f"Could not reach GitHub ({e}).")
+                return
+            if not patch_url:
+                _fail("No patch available for this release. Use the full installer.")
+                return
+
+            # 2. Download with progress
+            import tempfile
+            import os as _os
+            tmp_zip = Path(tempfile.gettempdir()) / f"VoxWild-Patch-{target_version}.zip"
+
+            _set_status("Downloading update...")
+            def on_progress(read, total):
+                if total > 0:
+                    frac = 0.05 + (read / total) * 0.75
+                    mb_read  = read / 1024 / 1024
+                    mb_total = total / 1024 / 1024
+                    _set_progress(frac, f"{mb_read:.1f} / {mb_total:.1f} MB")
+                else:
+                    _set_progress(0.4, f"{read / 1024 / 1024:.1f} MB")
+
+            try:
+                update_patcher.download_patch(patch_url, tmp_zip, progress=on_progress)
+            except Exception as e:
+                _fail(f"Download failed: {e}")
+                return
+
+            # 3. Verify
+            _set_status("Verifying...")
+            _set_progress(0.85)
+            ok, msg = update_patcher.verify_patch(tmp_zip)
+            if not ok:
+                _fail(f"Patch verification failed ({msg}).")
+                try: _os.unlink(tmp_zip)
+                except Exception: pass
+                return
+
+            # 4. Disable cancel — from here we're committed
+            app.after(0, lambda: cancel_btn.configure(state="disabled"))
+
+            # 5. Extract + spawn apply script
+            _set_status("Installing...")
+            _set_progress(0.95)
+            ok, msg = update_patcher.apply_patch(tmp_zip, status_cb=_set_status)
+            if not ok:
+                _fail(f"Could not apply update ({msg}).", offer_github=False)
+                return
+
+            _set_progress(1.0, "VoxWild will restart...")
+            _set_status("Restarting to finish...")
+
+            # 6. Clean shutdown
+            def _quit():
+                try: sd.stop()
+                except Exception: pass
+                try: chatterbox_engine.stop()
+                except Exception: pass
+                try: enhance_engine.stop()
+                except Exception: pass
+                app.after(500, app.destroy)
+
+            app.after(800, _quit)
+
+        except Exception as e:
+            import traceback as _tb
+            _fail(f"Unexpected error: {e}")
+            _log_crash(e)
+            try:
+                with open(os.path.join(_USER_DIR, "update_check.log"), "a", encoding="utf-8") as f:
+                    f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] UPDATE EXCEPTION:\n{_tb.format_exc()}\n")
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _check_for_update():
