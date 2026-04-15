@@ -81,26 +81,41 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM ── Step 4: Build patch zip (for in-app updates) ─────────────────────────────
+echo.
+echo [4/4] Building patch zip for in-app updates...
+python "%APP_DIR%_build_patch.py" %APP_VERSION%
+if errorlevel 1 (
+    echo.
+    echo WARNING: Patch zip build failed. Full installer still available.
+)
+
 REM ── Report sizes ─────────────────────────────────────────────────────────────
 echo.
 echo ============================================================
 echo  Build complete!
 echo ============================================================
 echo.
-echo  Installer: installer_output\VoxWild-Setup.exe
+echo  Full installer: installer_output\VoxWild-Setup.exe
+echo  Patch zip:      installer_output\VoxWild-Patch-%APP_VERSION%.zip
 echo.
 
-REM Show installer size
+REM Show sizes
 for %%F in ("%APP_DIR%installer_output\VoxWild-Setup.exe") do (
     set /a "SIZE_MB=%%~zF / 1048576"
-    echo  Size: !SIZE_MB! MB
+    echo  Installer: !SIZE_MB! MB
+)
+for %%F in ("%APP_DIR%installer_output\VoxWild-Patch-%APP_VERSION%.zip") do (
+    set /a "SIZE_MB=%%~zF / 1048576"
+    echo  Patch:     !SIZE_MB! MB
 )
 
 echo.
 echo  Next steps:
 echo    1. Test the installer on a clean Windows machine
-echo    2. Sign with: signtool sign /tr http://timestamp.sectigo.com /td sha256 /fd sha256 /a installer_output\VoxWild-Setup.exe
-echo    3. Upload installer_output\VoxWild-Setup.exe as a GitHub Release asset
+echo    2. Upload BOTH files to the GitHub Release:
+echo       - VoxWild-Setup.exe     (fresh installs)
+echo       - VoxWild-Patch-X.Y.Z.zip   (in-app updates)
 echo.
 
 endlocal

@@ -12,7 +12,7 @@
 ;     /a installer_output\VoxWild-Setup.exe
 
 #define MyAppName      "VoxWild"
-#define MyAppVersion   "1.1.2"
+#define MyAppVersion   "1.2.0"
 #define MyAppPublisher "Cookie Studios"
 #define MyAppURL       "https://cookiestudios.gumroad.com/l/VoxWildPro"
 #define MyAppSupportURL "mailto:cookiestudios.dev@gmail.com"
@@ -30,8 +30,9 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppSupportURL}
 AppUpdatesURL={#MyAppUpdatesURL}
 
-; Install to Program Files by default (requires UAC elevation)
-DefaultDirName={autopf}\{#MyAppName}
+; Install to %LOCALAPPDATA%\Programs\VoxWild — user-writable, no UAC required.
+; Enables silent in-app patch updates (bypasses SmartScreen on updates since no new .exe is executed).
+DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 
@@ -55,9 +56,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; Show a license page during installation
 LicenseFile=EULA.rtf
 
-; Require admin for install (so it goes into Program Files)
-PrivilegesRequired=admin
-PrivilegesRequiredOverridesAllowed=dialog
+; User-level install — no admin required. This is what Chrome, Discord, VS Code do.
+; Allows the app to self-update without UAC prompts.
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog commandline
 
 ; Uninstall
 Uninstallable=yes
@@ -92,7 +94,7 @@ Source: "PRIVACY.txt"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{group}\{#MyAppName}";          Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\{#MyAppName}";   Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{userdesktop}\{#MyAppName}";    Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 
 [Run]
@@ -112,14 +114,22 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 // Silently remove any existing installation before installing the new version.
 // /VERYSILENT + SW_HIDE means no uninstaller window appears — user only sees
 // the new installer, making upgrades feel like a single seamless install.
+// Checks both HKCU (user install — current default) and HKLM (legacy Program Files install).
 function InitializeSetup(): Boolean;
 var
   UninstExe: String;
   ResultCode: Integer;
 begin
   Result := True;
-  if RegQueryStringValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B3F2A1C4-7D8E-4F0A-9B2C-5E6D3A1F8C90}_is1',
+  // Try user-level install first (current default).
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B3F2A1C4-7D8E-4F0A-9B2C-5E6D3A1F8C90}_is1',
                          'UninstallString', UninstExe) then
+  begin
+    Exec(RemoveQuotes(UninstExe), '/VERYSILENT /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end
+  // Fall back to admin-level install (legacy Program Files install from v1.1.2 and earlier).
+  else if RegQueryStringValue(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B3F2A1C4-7D8E-4F0A-9B2C-5E6D3A1F8C90}_is1',
+                              'UninstallString', UninstExe) then
   begin
     Exec(RemoveQuotes(UninstExe), '/VERYSILENT /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
