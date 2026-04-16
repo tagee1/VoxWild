@@ -131,54 +131,94 @@ def verify_patch(zip_path: Path) -> tuple[bool, str]:
 
 def _write_apply_script(script_path: Path, extract_dir: Path,
                        install_dir: Path, exe_path: Path, log_file: Path) -> None:
-    """Write a .bat file that waits for VoxWild to exit, copies files, restarts.
+    """Write a .bat that waits for VoxWild to exit, replaces files, restarts.
 
-    Why a .bat and not a Python script: the Python runtime is inside the
-    install dir being updated. Using cmd.exe keeps the updater independent
-    of any file we're replacing.
+    Strategy:
+      1. Wait up to 30s for VoxWild.exe to fully exit
+      2. Sleep 2s extra to let AV real-time scans release file handles
+      3. Rename the running VoxWild.exe → VoxWild.exe.old (renaming doesn't
+         require the file to be unlocked, unlike replacement; defeats most
+         AV scan locks)
+      4. Robocopy the extracted files over the install dir with generous retries
+      5. Relaunch VoxWild.exe
+      6. Best-effort clean up .old files and temp dirs
+
+    Written without any `^` escapes — f-string writes literal content to disk,
+    batch interprets `>` and `&` as operators normally. `{}` for Python
+    substitution; real braces (none needed here) would double as `{{ }}`.
     """
-    # Use robocopy for reliable file replacement even if target is locked.
-    # Batch quoting: double percent signs are for batch's own use; real percent
-    # signs in paths need escaping too. We keep paths simple via variables.
+    # Uses delayed expansion (!VAR!) for variables modified mid-script.
     script = f"""@echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 set "LOG={log_file}"
-echo [%%DATE%% %%TIME%%] Patch apply starting >> "%%LOG%%"
+set "EXTRACT_DIR={extract_dir}"
+set "INSTALL_DIR={install_dir}"
+set "EXE_PATH={exe_path}"
+set "EXE_OLD={exe_path}.old"
 
-REM Wait for VoxWild.exe to fully exit (up to 30 seconds)
+echo ========================================= >> "!LOG!"
+echo [%DATE% %TIME%] Patch apply starting (pid=%RANDOM%) >> "!LOG!"
+echo   extract = !EXTRACT_DIR! >> "!LOG!"
+echo   install = !INSTALL_DIR! >> "!LOG!"
+
+REM Step 1 — wait for VoxWild.exe to exit (up to 30 seconds)
 set /a TRIES=0
 :wait_loop
-tasklist /fi "imagename eq VoxWild.exe" 2^>nul | find /i "VoxWild.exe" ^>nul
-if errorlevel 1 goto ready
+tasklist /fi "imagename eq VoxWild.exe" 2>nul | find /i "VoxWild.exe" >nul
+if errorlevel 1 goto process_gone
 set /a TRIES+=1
-if %%TRIES%% gtr 30 (
-  echo [%%DATE%% %%TIME%%] ERROR: VoxWild.exe did not exit in time >> "%%LOG%%"
-  exit /b 1
+if !TRIES! gtr 30 (
+    echo [%DATE% %TIME%] ERROR: VoxWild.exe still running after 30s >> "!LOG!"
+    exit /b 1
 )
-timeout /t 1 /nobreak ^>nul
+timeout /t 1 /nobreak >nul
 goto wait_loop
 
-:ready
-echo [%%DATE%% %%TIME%%] Copying files >> "%%LOG%%"
+:process_gone
+echo [%DATE% %TIME%] Process exited after !TRIES!s >> "!LOG!"
 
-REM Mirror the extracted directory over the install directory.
-REM /E = include subdirs (empty ones too), /IS /IT = overwrite same/older,
-REM /NFL /NDL /NJH /NJS = less log noise, /R:3 /W:1 = retry locked files briefly
-robocopy "{extract_dir}" "{install_dir}" /E /IS /IT /NFL /NDL /NJH /NJS /R:3 /W:1 ^>^> "%%LOG%%" 2^>^&1
+REM Step 2 — extra settle time for AV scans
+timeout /t 2 /nobreak >nul
 
-if errorlevel 8 (
-  echo [%%DATE%% %%TIME%%] ERROR: robocopy returned %%errorlevel%% >> "%%LOG%%"
-  exit /b 1
+REM Step 3 — rename old exe out of the way (handles AV holding file locks)
+REM Renaming works even when the file can't be overwritten.
+if exist "!EXE_OLD!" del /f /q "!EXE_OLD!" >nul 2>&1
+move /y "!EXE_PATH!" "!EXE_OLD!" >> "!LOG!" 2>&1
+if errorlevel 1 (
+    echo [%DATE% %TIME%] WARN: could not rename old exe — robocopy may still work >> "!LOG!"
 )
 
-echo [%%DATE%% %%TIME%%] Copy complete, launching app >> "%%LOG%%"
-start "" "{exe_path}"
+REM Step 4 — robocopy with generous retry settings
+echo [%DATE% %TIME%] Starting robocopy (/R:15 /W:1) >> "!LOG!"
+robocopy "!EXTRACT_DIR!" "!INSTALL_DIR!" /E /IS /IT /NFL /NDL /NJH /NJS /R:15 /W:1 >> "!LOG!" 2>&1
+set "RC=!ERRORLEVEL!"
+echo [%DATE% %TIME%] robocopy exit code=!RC! >> "!LOG!"
 
-REM Clean up temp dirs
-rmdir /s /q "{extract_dir}" 2^>nul
+REM Robocopy exit codes: 0-7 = success variants, 8+ = failures
+if !RC! geq 8 (
+    echo [%DATE% %TIME%] ERROR: robocopy returned !RC! (failure) >> "!LOG!"
+    REM Restore old exe so at least the app still runs
+    if exist "!EXE_OLD!" (
+        echo [%DATE% %TIME%] Restoring old exe >> "!LOG!"
+        move /y "!EXE_OLD!" "!EXE_PATH!" >> "!LOG!" 2>&1
+    )
+    start "" "!EXE_PATH!"
+    exit /b 1
+)
 
-REM Delete this script
-(goto) 2^>nul ^& del "%%~f0"
+REM Step 5 — launch updated app
+echo [%DATE% %TIME%] Update complete, launching app >> "!LOG!"
+start "" "!EXE_PATH!"
+
+REM Step 6 — best-effort cleanup (don't block launch on cleanup failures)
+if exist "!EXE_OLD!" del /f /q "!EXE_OLD!" >nul 2>&1
+rmdir /s /q "!EXTRACT_DIR!" 2>nul
+
+echo [%DATE% %TIME%] Done >> "!LOG!"
+echo. >> "!LOG!"
+
+REM Self-delete: goto with invalid target errors; & chains the del
+(goto) 2>nul & del "%~f0"
 """
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(script)

@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.2.1"
+VERSION          = "1.2.2"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
@@ -5329,7 +5329,7 @@ def _start_in_app_update(latest_tag: str):
             _set_progress(1.0, "VoxWild will restart...")
             _set_status("Restarting to finish...")
 
-            # 6. Clean shutdown
+            # 6. Clean shutdown — force-exit so the batch can replace VoxWild.exe
             def _quit():
                 try: sd.stop()
                 except Exception: pass
@@ -5337,7 +5337,13 @@ def _start_in_app_update(latest_tag: str):
                 except Exception: pass
                 try: enhance_engine.stop()
                 except Exception: pass
-                app.after(500, app.destroy)
+                def _final():
+                    try: app.destroy()
+                    except Exception: pass
+                    # Hammer exit — Tkinter's destroy sometimes doesn't fully
+                    # terminate the process, leaving VoxWild.exe locked.
+                    os._exit(0)
+                app.after(500, _final)
 
             app.after(800, _quit)
 
@@ -5525,6 +5531,27 @@ app.after(0, _load_history)
 _splash = _run_splash(_on_splash_done)
 # Kokoro is already loaded at this point — complete the splash bar
 app.after(100, _splash._finish)
+
+# Clean up leftover .old files from a previous in-app update (best effort).
+def _cleanup_stale_old_files():
+    try:
+        if getattr(sys, "frozen", False):
+            install_dir = os.path.dirname(sys.executable)
+            for name in os.listdir(install_dir):
+                if name.lower().endswith(".old"):
+                    try:
+                        os.remove(os.path.join(install_dir, name))
+                    except OSError:
+                        pass  # file might still be locked; harmless
+        try:
+            import update_patcher
+            update_patcher.cleanup_old_patches()
+        except Exception:
+            pass
+    except Exception:
+        pass
+app.after(3000, _cleanup_stale_old_files)
+
 # Check for updates in the background — 2 s delay so the UI is fully settled first
 app.after(2000, lambda: threading.Thread(target=_check_for_update, daemon=True).start())
 
