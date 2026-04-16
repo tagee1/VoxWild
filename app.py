@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.2.0"
+VERSION          = "1.2.1"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
