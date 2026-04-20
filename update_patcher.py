@@ -1,30 +1,32 @@
 """
 update_patcher.py — In-app update mechanism for VoxWild.
 
-Downloads a patch zip from a GitHub release, extracts it, and spawns a
-tiny batch script that waits for the app to exit, copies the new files
-over the install directory, and relaunches the app.
+Downloads a patch zip from a GitHub release, copies most files in-process
+(while the app is running), and spawns a tiny batch script to swap the
+exe after the app exits.
 
-Why this exists:
-  - Avoids forcing users to download a full 377MB installer every update
-  - Avoids SmartScreen prompts on updates (we're writing files from an
-    already-trusted process, not executing a newly downloaded .exe)
-  - Typical patch is ~20MB
+Architecture:
+  Phase A (Python, in-process):
+    - Download + verify patch zip
+    - Copy ALL files except VoxWild.exe to install dir via shutil.copy2
+    - Stage the new exe as VoxWild_update.exe
 
-The patch zip contains files (relative paths match the install layout):
-  VoxWild.exe
-  _internal/chatterbox_worker.py
-  _internal/enhance_worker.py
-  _internal/icon.ico
-  _internal/logo.png
-  _internal/theme.json
-  ... etc
-  manifest.json  (version + per-file sha256)
+  Phase B (batch, ~10 lines, after app exits):
+    - Wait 2s for process to fully release file locks
+    - Delete old VoxWild.exe (retry 3x)
+    - Rename VoxWild_update.exe → VoxWild.exe
+    - Launch the new exe
+
+Why Phase A works while the app runs:
+  On Windows, only the running .exe process image is locked. Worker .py
+  files, theme.json, icon.ico, logo.png etc. are loaded into memory at
+  startup and the file handles are released — shutil.copy2 succeeds.
 """
 
 import hashlib
 import json
 import os
+import shutil
 import ssl
 import subprocess
 import sys
@@ -38,7 +40,6 @@ def _install_dir() -> Path:
     """Directory containing VoxWild.exe (the install root)."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
-    # Dev fallback — running from source
     return Path(__file__).parent
 
 
@@ -52,7 +53,6 @@ def _ssl_context():
 
 
 def _log(path: Path, msg: str):
-    """Append to patch diagnostic log."""
     try:
         from datetime import datetime
         with open(path, "a", encoding="utf-8") as f:
@@ -61,12 +61,10 @@ def _log(path: Path, msg: str):
         pass
 
 
-def fetch_patch_url(github_repo: str, target_version: str) -> str | None:
-    """Look up the patch zip asset URL in a GitHub release.
+# ── Download + verify (unchanged from previous version) ─────────────────────
 
-    Returns None if the release or the patch asset doesn't exist
-    (older releases only shipped the full installer).
-    """
+def fetch_patch_url(github_repo: str, target_version: str) -> str | None:
+    """Look up the patch zip asset URL in a GitHub release."""
     api = f"https://api.github.com/repos/{github_repo}/releases/tags/v{target_version}"
     req = urllib.request.Request(api, headers={"User-Agent": "VoxWild-Patcher"})
     with urllib.request.urlopen(req, timeout=10, context=_ssl_context()) as resp:
@@ -99,10 +97,7 @@ def download_patch(url: str, dest: Path, progress=None) -> None:
 
 
 def verify_patch(zip_path: Path) -> tuple[bool, str]:
-    """Verify the manifest.json inside the zip matches every file's SHA256.
-
-    Returns (ok, message). On failure we do NOT apply the patch.
-    """
+    """Verify the manifest.json inside the zip matches every file's SHA256."""
     try:
         with zipfile.ZipFile(zip_path) as zf:
             try:
@@ -129,146 +124,106 @@ def verify_patch(zip_path: Path) -> tuple[bool, str]:
         return False, f"Unexpected error: {e}"
 
 
-def _write_apply_script(script_path: Path, extract_dir: Path,
-                       install_dir: Path, exe_path: Path, log_file: Path) -> None:
-    """Write a .bat that waits for VoxWild to exit, replaces files, restarts.
-
-    Strategy:
-      1. Wait up to 30s for VoxWild.exe to fully exit
-      2. Sleep 2s extra to let AV real-time scans release file handles
-      3. Rename the running VoxWild.exe → VoxWild.exe.old (renaming doesn't
-         require the file to be unlocked, unlike replacement; defeats most
-         AV scan locks)
-      4. Robocopy the extracted files over the install dir with generous retries
-      5. Relaunch VoxWild.exe
-      6. Best-effort clean up .old files and temp dirs
-
-    Written without any `^` escapes — f-string writes literal content to disk,
-    batch interprets `>` and `&` as operators normally. `{}` for Python
-    substitution; real braces (none needed here) would double as `{{ }}`.
-    """
-    # Uses delayed expansion (!VAR!) for variables modified mid-script.
-    script = f"""@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-set "LOG={log_file}"
-set "EXTRACT_DIR={extract_dir}"
-set "INSTALL_DIR={install_dir}"
-set "EXE_PATH={exe_path}"
-set "EXE_OLD={exe_path}.old"
-
-echo ========================================= >> "!LOG!"
-echo [%DATE% %TIME%] Patch apply starting (pid=%RANDOM%) >> "!LOG!"
-echo   extract = !EXTRACT_DIR! >> "!LOG!"
-echo   install = !INSTALL_DIR! >> "!LOG!"
-
-REM Step 1 — wait for VoxWild.exe to exit (up to 30 seconds)
-set /a TRIES=0
-:wait_loop
-tasklist /fi "imagename eq VoxWild.exe" 2>nul | find /i "VoxWild.exe" >nul
-if errorlevel 1 goto process_gone
-set /a TRIES+=1
-if !TRIES! gtr 30 (
-    echo [%DATE% %TIME%] ERROR: VoxWild.exe still running after 30s >> "!LOG!"
-    exit /b 1
-)
-ping -n 2 127.0.0.1 >nul
-goto wait_loop
-
-:process_gone
-echo [%DATE% %TIME%] Process exited after !TRIES!s >> "!LOG!"
-
-REM Step 2 — extra settle time for AV scans
-ping -n 3 127.0.0.1 >nul
-
-REM Step 3 — rename old exe out of the way (handles AV holding file locks)
-REM Renaming works even when the file can't be overwritten.
-if exist "!EXE_OLD!" del /f /q "!EXE_OLD!" >nul 2>&1
-move /y "!EXE_PATH!" "!EXE_OLD!" >> "!LOG!" 2>&1
-if errorlevel 1 (
-    echo [%DATE% %TIME%] WARN: could not rename old exe — robocopy may still work >> "!LOG!"
-)
-
-REM Step 4 — robocopy with generous retry settings
-echo [%DATE% %TIME%] Starting robocopy (/R:15 /W:1) >> "!LOG!"
-robocopy "!EXTRACT_DIR!" "!INSTALL_DIR!" /E /IS /IT /NFL /NDL /NJH /NJS /R:15 /W:1 >> "!LOG!" 2>&1
-set "RC=!ERRORLEVEL!"
-echo [%DATE% %TIME%] robocopy exit code=!RC! >> "!LOG!"
-
-REM Robocopy exit codes: 0-7 = success variants, 8+ = failures
-if !RC! geq 8 (
-    echo [%DATE% %TIME%] ERROR: robocopy returned !RC! (failure) >> "!LOG!"
-    REM Restore old exe so at least the app still runs
-    if exist "!EXE_OLD!" (
-        echo [%DATE% %TIME%] Restoring old exe >> "!LOG!"
-        move /y "!EXE_OLD!" "!EXE_PATH!" >> "!LOG!" 2>&1
-    )
-    start "" "!EXE_PATH!"
-    exit /b 1
-)
-
-REM Step 5 — launch updated app
-echo [%DATE% %TIME%] Update complete, launching app >> "!LOG!"
-start "" "!EXE_PATH!"
-
-REM Step 6 — best-effort cleanup (don't block launch on cleanup failures)
-if exist "!EXE_OLD!" del /f /q "!EXE_OLD!" >nul 2>&1
-rmdir /s /q "!EXTRACT_DIR!" 2>nul
-
-echo [%DATE% %TIME%] Done >> "!LOG!"
-echo. >> "!LOG!"
-
-REM Self-delete: goto with invalid target errors; & chains the del
-(goto) 2>nul & del "%~f0"
-"""
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(script)
-
+# ── Phase A: in-process file copy ────────────────────────────────────────────
 
 def apply_patch(zip_path: Path, status_cb=None) -> tuple[bool, str]:
-    """Extract patch and spawn the apply script. Caller should exit immediately after.
+    """Copy patch files in-process, stage new exe, spawn swap batch.
 
-    Returns (ok, message). On success, caller must exit the process so the
-    spawned script can replace VoxWild.exe.
+    Caller must exit the process immediately after this returns True
+    so the batch can replace VoxWild.exe.
     """
     install_dir = _install_dir()
     log_file    = install_dir.parent / "patch_apply.log"
+    exe_name    = "VoxWild.exe"
+    staged_name = "VoxWild_update.exe"
 
-    _log(log_file, f"apply_patch start: zip={zip_path}  install={install_dir}")
+    _log(log_file, f"=== apply_patch start ===")
+    _log(log_file, f"  zip={zip_path}")
+    _log(log_file, f"  install={install_dir}")
 
-    # 1. Verify integrity
+    # 1. Verify
     if status_cb: status_cb("Verifying patch...")
     ok, msg = verify_patch(zip_path)
     if not ok:
         _log(log_file, f"VERIFY FAILED: {msg}")
         return False, msg
 
-    # 2. Extract to a temp dir (atomic once fully written)
+    # 2. Extract to temp
     if status_cb: status_cb("Extracting...")
     extract_dir = Path(tempfile.mkdtemp(prefix="voxwild_patch_"))
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            # Drop manifest.json from extraction; it's not part of the install
             members = [n for n in zf.namelist() if n != "manifest.json"]
             zf.extractall(extract_dir, members)
     except Exception as e:
         _log(log_file, f"EXTRACT FAILED: {e}")
         return False, f"Failed to extract patch: {e}"
 
-    # 3. Build the apply script
-    if status_cb: status_cb("Preparing installer...")
-    script_path = Path(tempfile.gettempdir()) / f"voxwild_apply_{os.getpid()}.bat"
-    exe_path    = install_dir / "VoxWild.exe"
+    _log(log_file, f"  extracted {len(members)} files to {extract_dir}")
+
+    # 3. Phase A — copy everything except the exe, IN PROCESS
+    if status_cb: status_cb("Copying files...")
+    copied = 0
+    errors = []
+    for root, dirs, files in os.walk(extract_dir):
+        for fname in files:
+            src = Path(root) / fname
+            rel = src.relative_to(extract_dir)
+            rel_str = str(rel).replace("\\", "/")
+
+            if rel_str == exe_name:
+                # Stage the new exe — don't try to overwrite the running one
+                dst = install_dir / staged_name
+                try:
+                    if dst.exists():
+                        dst.unlink()
+                    shutil.copy2(src, dst)
+                    _log(log_file, f"  staged: {rel_str} -> {staged_name}")
+                except Exception as e:
+                    _log(log_file, f"  STAGE FAILED: {rel_str}: {e}")
+                    errors.append(f"Failed to stage {exe_name}: {e}")
+                continue
+
+            # Regular file — copy directly to install dir
+            dst = install_dir / rel
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                copied += 1
+            except Exception as e:
+                _log(log_file, f"  COPY FAILED: {rel_str}: {e}")
+                errors.append(f"{rel_str}: {e}")
+
+    _log(log_file, f"  copied {copied} files, {len(errors)} errors")
+
+    if errors:
+        _log(log_file, f"  ABORTING due to copy errors")
+        # Clean up staged exe if copy failed
+        staged = install_dir / staged_name
+        if staged.exists():
+            try: staged.unlink()
+            except: pass
+        return False, f"Failed to copy files: {errors[0]}"
+
+    # Verify staged exe exists
+    staged = install_dir / staged_name
+    if not staged.exists():
+        _log(log_file, "  ERROR: staged exe not found after extraction")
+        return False, "Patch zip did not contain VoxWild.exe"
+
+    # 4. Write the tiny swap batch
+    if status_cb: status_cb("Preparing restart...")
+    script_path = Path(tempfile.gettempdir()) / f"voxwild_swap_{os.getpid()}.bat"
+    exe_path = install_dir / exe_name
     try:
-        _write_apply_script(script_path, extract_dir, install_dir, exe_path, log_file)
+        _write_swap_script(script_path, exe_path, staged, log_file)
     except Exception as e:
         _log(log_file, f"SCRIPT WRITE FAILED: {e}")
         return False, f"Could not prepare updater: {e}"
 
-    # 4. Spawn the script hidden — it runs after we exit
+    # 5. Spawn batch hidden
     if status_cb: status_cb("Restarting to finish update...")
     try:
-        # STARTUPINFO with SW_HIDE keeps the console invisible.
-        # CREATE_NEW_PROCESS_GROUP so the batch survives our exit.
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0  # SW_HIDE
@@ -283,21 +238,127 @@ def apply_patch(zip_path: Path, status_cb=None) -> tuple[bool, str]:
         _log(log_file, f"SPAWN FAILED: {e}")
         return False, f"Could not start updater: {e}"
 
-    _log(log_file, "apply_patch: updater spawned, caller should exit")
+    # 6. Clean up temp extract dir (patch files already copied)
+    try:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    _log(log_file, "apply_patch: swap batch spawned, caller should exit now")
     return True, "Update will finish after restart"
 
 
-def cleanup_old_patches(tmp_dir: Path | None = None) -> None:
-    """Remove leftover patch temp dirs from previous update cycles."""
+# ── Phase B: exe swap batch ──────────────────────────────────────────────────
+
+def _write_swap_script(script_path: Path, exe_path: Path,
+                      staged_path: Path, log_file: Path) -> None:
+    """Write a tiny batch that deletes old exe, renames staged, relaunches.
+
+    This is ~15 lines. The heavy lifting (copying all other files) already
+    happened in Python. This batch only handles the one file we can't
+    overwrite while the app is running: VoxWild.exe.
+    """
+    script = f"""@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+set "LOG={log_file}"
+set "EXE={exe_path}"
+set "STAGED={staged_path}"
+
+echo [%DATE% %TIME%] Swap script started >> "!LOG!"
+
+REM Wait for app to exit
+ping -n 3 127.0.0.1 >nul
+
+REM Try to delete old exe (retry up to 5 times)
+set /a TRIES=0
+:retry_del
+del /f /q "!EXE!" >nul 2>&1
+if not exist "!EXE!" goto del_ok
+set /a TRIES+=1
+if !TRIES! geq 5 (
+    echo [%DATE% %TIME%] ERROR: could not delete exe after 5 tries >> "!LOG!"
+    REM Leave staged exe for startup recovery
+    start "" "!EXE!"
+    exit /b 1
+)
+echo [%DATE% %TIME%] Retry !TRIES!/5 >> "!LOG!"
+ping -n 2 127.0.0.1 >nul
+goto retry_del
+
+:del_ok
+echo [%DATE% %TIME%] Old exe deleted >> "!LOG!"
+
+REM Rename staged exe
+move /y "!STAGED!" "!EXE!" >> "!LOG!" 2>&1
+if errorlevel 1 (
+    echo [%DATE% %TIME%] ERROR: rename failed >> "!LOG!"
+    exit /b 1
+)
+
+echo [%DATE% %TIME%] Swap complete, launching >> "!LOG!"
+start "" "!EXE!"
+
+REM Self-delete
+(goto) 2>nul & del "%~f0"
+"""
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script)
+
+
+# ── Startup recovery ─────────────────────────────────────────────────────────
+
+def check_interrupted_update() -> bool:
+    """Return True if a staged VoxWild_update.exe exists (previous update
+    completed Phase A but Phase B failed)."""
+    staged = _install_dir() / "VoxWild_update.exe"
+    return staged.exists()
+
+
+def retry_exe_swap() -> tuple[bool, str]:
+    """Try to swap VoxWild_update.exe → VoxWild.exe from within the running app.
+
+    On Windows, renaming a running exe IS allowed (unlike deleting or
+    overwriting). So we rename the current exe to .old, rename staged to
+    the real name, then the user restarts to pick up the new exe.
+    """
+    d = _install_dir()
+    staged = d / "VoxWild_update.exe"
+    exe    = d / "VoxWild.exe"
+    backup = d / "VoxWild.exe.old"
+
+    if not staged.exists():
+        return False, "No staged update found"
+
+    try:
+        # Remove old backup if exists
+        if backup.exists():
+            backup.unlink()
+        # Rename running exe → .old (allowed on Windows)
+        exe.rename(backup)
+        # Move staged into place
+        staged.rename(exe)
+        # Clean up backup (best effort)
+        try:
+            backup.unlink()
+        except OSError:
+            pass  # still locked, cleanup on next launch
+        return True, "Update applied. Restart to use the new version."
+    except Exception as e:
+        return False, f"Retry failed: {e}"
+
+
+# ── Cleanup ──────────────────────────────────────────────────────────────────
+
+def cleanup_old_patches() -> None:
+    """Remove leftover temp dirs and stale batch scripts from previous updates."""
     try:
         import glob
-        import shutil
         for d in glob.glob(str(Path(tempfile.gettempdir()) / "voxwild_patch_*")):
             try:
                 shutil.rmtree(d, ignore_errors=True)
             except Exception:
                 pass
-        for f in glob.glob(str(Path(tempfile.gettempdir()) / "voxwild_apply_*.bat")):
+        for f in glob.glob(str(Path(tempfile.gettempdir()) / "voxwild_swap_*.bat")):
             try:
                 os.unlink(f)
             except Exception:

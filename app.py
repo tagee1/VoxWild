@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.2.4"
+VERSION          = "1.2.5"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
@@ -5537,12 +5537,23 @@ def _cleanup_stale_old_files():
     try:
         if getattr(sys, "frozen", False):
             install_dir = os.path.dirname(sys.executable)
+            # Remove .old files from a previous update
             for name in os.listdir(install_dir):
                 if name.lower().endswith(".old"):
                     try:
                         os.remove(os.path.join(install_dir, name))
                     except OSError:
-                        pass  # file might still be locked; harmless
+                        pass
+            # Check for interrupted update (Phase A completed, Phase B failed)
+            try:
+                import update_patcher
+                if update_patcher.check_interrupted_update():
+                    ok, msg = update_patcher.retry_exe_swap()
+                    if ok:
+                        app.after(0, lambda: status_label.configure(
+                            text="Update installed. Restart VoxWild to use the new version."))
+            except Exception:
+                pass
         try:
             import update_patcher
             update_patcher.cleanup_old_patches()
