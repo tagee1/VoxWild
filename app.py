@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.2.6"
+VERSION          = "1.2.7"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
@@ -5212,59 +5212,92 @@ def _show_update_banner(latest_tag: str):
 
 
 def _start_in_app_update(latest_tag: str):
-    """Begin the in-app patch update flow with a progress modal."""
+    """Begin the in-app patch update flow with a polished progress modal."""
     target_version = latest_tag.lstrip("v")
 
-    # Progress modal
+    # ── Modal window ─────────────────────────────────────────────────────────
     win = ctk.CTkToplevel(app)
-    win.title("Updating VoxWild")
-    _center_window(win, 420, 200)
+    win.title("VoxWild Update")
+    _center_window(win, 440, 240)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
     win.transient(app)
-    # Prevent closing mid-update
     win.protocol("WM_DELETE_WINDOW", lambda: None)
 
-    ctk.CTkLabel(win, text=f"Installing VoxWild {latest_tag}",
-                 font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
-                 text_color=C_TXT).pack(pady=(24, 4))
-    status_lbl = ctk.CTkLabel(win, text="Preparing...",
-                              font=ctk.CTkFont(family="Segoe UI", size=12),
-                              text_color=C_TXT2)
-    status_lbl.pack(pady=(0, 16))
+    # Header
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=52)
+    hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    ctk.CTkLabel(hdr, text=f"Updating to {latest_tag}",
+                 font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+                 text_color=C_TXT).pack(side="left", padx=20)
 
-    pb = ctk.CTkProgressBar(win, width=340, height=6, corner_radius=3,
-                            progress_color=C_ACCENT)
-    pb.pack(pady=(0, 6))
+    # Body
+    body = ctk.CTkFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=24, pady=(20, 0))
+
+    phase_lbl = ctk.CTkLabel(body, text="Preparing...",
+                             font=ctk.CTkFont(family="Segoe UI", size=13),
+                             text_color=C_TXT, anchor="w")
+    phase_lbl.pack(fill="x")
+
+    detail_lbl = ctk.CTkLabel(body, text="",
+                              font=ctk.CTkFont(family="Consolas", size=11),
+                              text_color=C_TXT3, anchor="w")
+    detail_lbl.pack(fill="x", pady=(2, 10))
+
+    # Progress bar — thicker, emerald, with percentage
+    bar_row = ctk.CTkFrame(body, fg_color="transparent")
+    bar_row.pack(fill="x")
+    pb = ctk.CTkProgressBar(bar_row, height=10, corner_radius=5,
+                            progress_color=C_ACCENT, fg_color=C_ELEVATED)
+    pb.pack(side="left", fill="x", expand=True)
     pb.set(0)
+    pct_lbl = ctk.CTkLabel(bar_row, text="0%", width=42,
+                           font=ctk.CTkFont(family="Consolas", size=11),
+                           text_color=C_ACCENT)
+    pct_lbl.pack(side="right", padx=(8, 0))
 
-    detail_lbl = ctk.CTkLabel(win, text="",
-                              font=ctk.CTkFont(family="Consolas", size=10),
-                              text_color=C_TXT3)
-    detail_lbl.pack(pady=(0, 10))
-
-    cancel_btn = ctk.CTkButton(win, text="Cancel", width=90, height=28,
+    # Footer
+    foot = ctk.CTkFrame(win, fg_color="transparent")
+    foot.pack(fill="x", padx=24, pady=(10, 16))
+    cancel_btn = ctk.CTkButton(foot, text="Cancel", width=80, height=28,
                                **BTN_GHOST, command=win.destroy)
-    cancel_btn.pack(pady=(0, 14))
+    cancel_btn.pack(side="right")
 
-    def _set_status(msg):
-        app.after(0, lambda m=msg: status_lbl.configure(text=m))
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _set_phase(msg):
+        app.after(0, lambda m=msg: phase_lbl.configure(text=m))
 
-    def _set_progress(frac, detail=""):
-        app.after(0, lambda f=frac, d=detail: (pb.set(f), detail_lbl.configure(text=d)))
+    def _set_detail(msg):
+        app.after(0, lambda m=msg: detail_lbl.configure(text=m))
+
+    def _set_pct(frac):
+        frac = max(0.0, min(1.0, frac))
+        pct = int(frac * 100)
+        app.after(0, lambda f=frac, p=pct: (pb.set(f), pct_lbl.configure(text=f"{p}%")))
 
     def _fail(msg, offer_github=True):
-        app.after(0, lambda: status_lbl.configure(text=f"⚠️ {msg}", text_color=C_DANGER))
+        app.after(0, lambda: phase_lbl.configure(text=msg, text_color=C_DANGER))
         app.after(0, lambda: pb.configure(progress_color=C_DANGER))
+        app.after(0, lambda: pct_lbl.configure(text_color=C_DANGER))
         if offer_github:
             app.after(0, lambda: cancel_btn.configure(
-                text="Open GitHub instead",
+                text="Open GitHub",
                 command=lambda: (webbrowser.open(
                     f"https://github.com/{GITHUB_REPO}/releases/latest"), win.destroy())
             ))
         else:
             app.after(0, lambda: cancel_btn.configure(text="Close", command=win.destroy))
+
+    # ── Update thread ─────────────────────────────────────────────────────────
+    # Progress budget:
+    #   0-5%    : checking for patch
+    #   5-80%   : downloading (proportional to bytes)
+    #   80-88%  : verifying
+    #   88-98%  : copying files + staging exe
+    #   98-100% : preparing restart
 
     def _run():
         try:
@@ -5272,64 +5305,76 @@ def _start_in_app_update(latest_tag: str):
             from pathlib import Path
             update_patcher.cleanup_old_patches()
 
-            # 1. Find patch url
-            _set_status("Checking for patch...")
-            _set_progress(0.05)
+            # ── Check ────────────────────────────────────────────────────────
+            _set_phase("Checking for update...")
+            _set_pct(0.02)
             try:
                 patch_url = update_patcher.fetch_patch_url(GITHUB_REPO, target_version)
             except Exception as e:
-                _fail(f"Could not reach GitHub ({e}).")
+                _fail(f"Could not reach GitHub: {e}")
                 return
             if not patch_url:
-                _fail("No patch available for this release. Use the full installer.")
+                _fail("No patch for this release. Use the full installer.")
                 return
+            _set_pct(0.05)
 
-            # 2. Download with progress
+            # ── Download ─────────────────────────────────────────────────────
             import tempfile
             import os as _os
             tmp_zip = Path(tempfile.gettempdir()) / f"VoxWild-Patch-{target_version}.zip"
 
-            _set_status("Downloading update...")
+            _set_phase("Downloading...")
             def on_progress(read, total):
                 if total > 0:
                     frac = 0.05 + (read / total) * 0.75
-                    mb_read  = read / 1024 / 1024
-                    mb_total = total / 1024 / 1024
-                    _set_progress(frac, f"{mb_read:.1f} / {mb_total:.1f} MB")
+                    mb_r = read / 1024 / 1024
+                    mb_t = total / 1024 / 1024
+                    _set_pct(frac)
+                    _set_detail(f"{mb_r:.1f} / {mb_t:.1f} MB")
                 else:
-                    _set_progress(0.4, f"{read / 1024 / 1024:.1f} MB")
+                    _set_pct(0.4)
+                    _set_detail(f"{read / 1024 / 1024:.1f} MB")
 
             try:
                 update_patcher.download_patch(patch_url, tmp_zip, progress=on_progress)
             except Exception as e:
                 _fail(f"Download failed: {e}")
                 return
+            _set_detail("")
 
-            # 3. Verify
-            _set_status("Verifying...")
-            _set_progress(0.85)
+            # ── Verify ───────────────────────────────────────────────────────
+            _set_phase("Verifying integrity...")
+            _set_pct(0.82)
+            import time as _time
+            _time.sleep(0.3)  # brief pause so "Verifying" is visible
             ok, msg = update_patcher.verify_patch(tmp_zip)
             if not ok:
-                _fail(f"Patch verification failed ({msg}).")
+                _fail(f"Verification failed: {msg}")
                 try: _os.unlink(tmp_zip)
                 except Exception: pass
                 return
+            _set_pct(0.88)
 
-            # 4. Disable cancel — from here we're committed
+            # ── Install ──────────────────────────────────────────────────────
             app.after(0, lambda: cancel_btn.configure(state="disabled"))
+            _set_phase("Installing files...")
 
-            # 5. Extract + spawn apply script
-            _set_status("Installing...")
-            _set_progress(0.95)
-            ok, msg = update_patcher.apply_patch(tmp_zip, status_cb=_set_status)
+            def _install_status(msg):
+                _set_detail(msg)
+                # Inch progress from 88% → 98% during install
+                cur = pb.get() if hasattr(pb, 'get') else 0.88
+                _set_pct(min(0.98, cur + 0.01))
+
+            ok, msg = update_patcher.apply_patch(tmp_zip, status_cb=_install_status)
             if not ok:
-                _fail(f"Could not apply update ({msg}).", offer_github=False)
+                _fail(f"Install failed: {msg}", offer_github=False)
                 return
 
-            _set_progress(1.0, "VoxWild will restart...")
-            _set_status("Restarting to finish...")
+            # ── Restart ──────────────────────────────────────────────────────
+            _set_pct(1.0)
+            _set_phase("Restarting VoxWild...")
+            _set_detail("Update will apply on restart")
 
-            # 6. Clean shutdown — force-exit so the batch can replace VoxWild.exe
             def _quit():
                 try: sd.stop()
                 except Exception: pass
@@ -5340,12 +5385,10 @@ def _start_in_app_update(latest_tag: str):
                 def _final():
                     try: app.destroy()
                     except Exception: pass
-                    # Hammer exit — Tkinter's destroy sometimes doesn't fully
-                    # terminate the process, leaving VoxWild.exe locked.
                     os._exit(0)
                 app.after(500, _final)
 
-            app.after(800, _quit)
+            app.after(1200, _quit)
 
         except Exception as e:
             import traceback as _tb
