@@ -94,9 +94,9 @@ def draw_medium(size: int) -> Image.Image:
 
 # ─── Large (64-256): 5 bars, glossy highlights, subtle glow ──────────────────
 def draw_large(size: int) -> Image.Image:
-    # Build into a larger canvas then downsize? No — draw at exact size for
-    # pixel fidelity on all sizes. Supersample only for 64+.
-    ss = 2 if size <= 128 else 1
+    # Supersample small-to-mid sizes for smoother anti-aliasing.
+    # Desktop icons render at 48-256px — these need crisp, glossy detail.
+    ss = 3 if size <= 64 else (2 if size <= 128 else 1)
     s  = size * ss
 
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
@@ -210,8 +210,7 @@ def _glossy_bar(width: int, height: int) -> Image.Image:
 def draw_for_size(size: int) -> Image.Image:
     if size <= 24:
         return draw_small(size)
-    if size <= 48:
-        return draw_medium(size)
+    # Use glossy large design for 32px+ (desktop icons render at 48-256px)
     return draw_large(size)
 
 
