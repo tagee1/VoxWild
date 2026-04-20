@@ -171,14 +171,14 @@ if !TRIES! gtr 30 (
     echo [%DATE% %TIME%] ERROR: VoxWild.exe still running after 30s >> "!LOG!"
     exit /b 1
 )
-timeout /t 1 /nobreak >nul
+ping -n 2 127.0.0.1 >nul
 goto wait_loop
 
 :process_gone
 echo [%DATE% %TIME%] Process exited after !TRIES!s >> "!LOG!"
 
 REM Step 2 — extra settle time for AV scans
-timeout /t 2 /nobreak >nul
+ping -n 3 127.0.0.1 >nul
 
 REM Step 3 — rename old exe out of the way (handles AV holding file locks)
 REM Renaming works even when the file can't be overwritten.
@@ -264,15 +264,19 @@ def apply_patch(zip_path: Path, status_cb=None) -> tuple[bool, str]:
         _log(log_file, f"SCRIPT WRITE FAILED: {e}")
         return False, f"Could not prepare updater: {e}"
 
-    # 4. Spawn the script detached — it runs after we exit
+    # 4. Spawn the script hidden — it runs after we exit
     if status_cb: status_cb("Restarting to finish update...")
     try:
-        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so it survives our exit
-        DETACHED_PROCESS = 0x00000008
+        # STARTUPINFO with SW_HIDE keeps the console invisible.
+        # CREATE_NEW_PROCESS_GROUP so the batch survives our exit.
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         subprocess.Popen(
             ["cmd.exe", "/c", str(script_path)],
-            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            startupinfo=si,
+            creationflags=CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )
     except Exception as e:
