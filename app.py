@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.2.5"
+VERSION          = "1.2.6"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
@@ -5360,9 +5360,14 @@ def _start_in_app_update(latest_tag: str):
     threading.Thread(target=_run, daemon=True).start()
 
 
+_update_check_done = [False]  # guard against double-fire
+
 def _check_for_update():
     """Background thread: check GitHub releases API on every launch.
     Writes diagnostic log so silent failures can be debugged."""
+    if _update_check_done[0]:
+        return
+    _update_check_done[0] = True
     _log_path = os.path.join(
         os.environ.get("APPDATA", ""), "TTS Studio", "update_check.log")
     def _log(msg):
