@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.2.8"
+VERSION          = "1.2.9"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
@@ -758,8 +758,33 @@ enhance_engine = EnhanceEngine()
 # ── Chatterbox auto-setup helpers ─────────────────────────────────────────────
 
 def _cb_env_exists():
-    """Return True if a usable Natural mode Python is already installed."""
-    return os.path.exists(chatterbox_engine.PYTHON)
+    """Return True if Natural mode Python + chatterbox are fully installed.
+
+    Just checking for python.exe isn't enough — the setup could have
+    downloaded Python but failed to pip install chatterbox (network error,
+    disk full, etc.). In that case we need to re-trigger the setup.
+    """
+    py = chatterbox_engine.PYTHON
+    if not os.path.exists(py):
+        return False
+    # Verify chatterbox is actually installed in python_embed's site-packages
+    py_dir = os.path.dirname(py)
+    # Check both possible layouts: regular venv and embeddable Python
+    for sp_path in [
+        os.path.join(py_dir, "Lib", "site-packages", "chatterbox"),
+        os.path.join(py_dir, "lib", "site-packages", "chatterbox"),
+    ]:
+        if os.path.isdir(sp_path):
+            return True
+    # Also check via sysconfig-style path (python_embed layout)
+    try:
+        import sysconfig
+        purelib = sysconfig.get_path("purelib", vars={"base": py_dir, "platbase": py_dir})
+        if purelib and os.path.isdir(os.path.join(purelib, "chatterbox")):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _run_chatterbox_setup(update_status, on_success, on_failure):
