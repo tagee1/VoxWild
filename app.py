@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.3.0"
+VERSION          = "1.3.1"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
@@ -5382,11 +5382,22 @@ def _start_in_app_update(latest_tag: str):
 
             # ── Install ──────────────────────────────────────────────────────
             app.after(0, lambda: cancel_btn.configure(state="disabled"))
+            _set_phase("Stopping workers...")
+            _set_detail("Releasing file locks")
+
+            # Stop any running workers BEFORE copying — their loaded DLLs
+            # (vcomp140.dll, torch libs) will block shutil.copy2.
+            try: chatterbox_engine.stop()
+            except Exception: pass
+            try: enhance_engine.stop()
+            except Exception: pass
+            import time as _time
+            _time.sleep(1)  # brief settle for file handles to release
+
             _set_phase("Installing files...")
 
             def _install_status(msg):
                 _set_detail(msg)
-                # Inch progress from 88% → 98% during install
                 cur = pb.get() if hasattr(pb, 'get') else 0.88
                 _set_pct(min(0.98, cur + 0.01))
 
