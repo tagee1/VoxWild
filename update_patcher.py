@@ -195,7 +195,7 @@ def apply_patch(zip_path: Path, status_cb=None) -> tuple[bool, str]:
             except PermissionError:
                 # File is locked (loaded DLL, open handle) — defer to batch
                 _log(log_file, f"  DEFERRED (locked): {rel_str}")
-                deferred.append((src, rel))
+                deferred.append((str(src), str(install_dir / rel)))
             except Exception as e:
                 _log(log_file, f"  COPY FAILED: {rel_str}: {e}")
                 return False, f"Failed to copy {rel_str}: {e}"
@@ -262,11 +262,10 @@ def _write_swap_script(script_path: Path, exe_path: Path,
     """
     # Build deferred copy commands
     deferred_cmds = ""
-    if deferred_files and install_dir:
+    if deferred_files:
         deferred_cmds = "\nREM Copy deferred locked files\n"
-        for src, rel in deferred_files:
-            dst = install_dir / rel
-            deferred_cmds += f'copy /y "{src}" "{dst}" >> "!LOG!" 2>&1\n'
+        for src_str, dst_str in deferred_files:
+            deferred_cmds += f'copy /y "{src_str}" "{dst_str}" >> "!LOG!" 2>&1\n'
         deferred_cmds += f'echo [%DATE% %TIME%] Copied {len(deferred_files)} deferred file(s) >> "!LOG!"\n'
 
     script = f"""@echo off
@@ -360,17 +359,25 @@ def retry_exe_swap() -> tuple[bool, str]:
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 
 def cleanup_old_patches() -> None:
-    """Remove leftover temp dirs and stale batch scripts from previous updates."""
+    """Remove leftover temp dirs and batch scripts from previous updates.
+
+    Only removes items older than 1 hour — avoids deleting files that a
+    currently-running batch script still needs (deferred DLL copies).
+    """
     try:
         import glob
+        import time
+        cutoff = time.time() - 3600  # 1 hour ago
         for d in glob.glob(str(Path(tempfile.gettempdir()) / "voxwild_patch_*")):
             try:
-                shutil.rmtree(d, ignore_errors=True)
+                if os.path.getmtime(d) < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
             except Exception:
                 pass
         for f in glob.glob(str(Path(tempfile.gettempdir()) / "voxwild_swap_*.bat")):
             try:
-                os.unlink(f)
+                if os.path.getmtime(f) < cutoff:
+                    os.unlink(f)
             except Exception:
                 pass
     except Exception:
