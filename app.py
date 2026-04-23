@@ -111,7 +111,7 @@ def _invalidate_clone_cache():
     _clone_cache = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VERSION          = "1.3.1"
+VERSION          = "1.3.2"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
@@ -767,23 +767,17 @@ def _cb_env_exists():
     py = chatterbox_engine.PYTHON
     if not os.path.exists(py):
         return False
-    # Verify chatterbox is actually installed in python_embed's site-packages
+    # Verify chatterbox is actually installed in python_embed's site-packages.
+    # Check both capitalization variants (Windows is case-insensitive but we
+    # want to be explicit). Don't use sysconfig — it returns incorrect paths
+    # when called from the frozen parent process for a different interpreter.
     py_dir = os.path.dirname(py)
-    # Check both possible layouts: regular venv and embeddable Python
     for sp_path in [
         os.path.join(py_dir, "Lib", "site-packages", "chatterbox"),
         os.path.join(py_dir, "lib", "site-packages", "chatterbox"),
     ]:
         if os.path.isdir(sp_path):
             return True
-    # Also check via sysconfig-style path (python_embed layout)
-    try:
-        import sysconfig
-        purelib = sysconfig.get_path("purelib", vars={"base": py_dir, "platbase": py_dir})
-        if purelib and os.path.isdir(os.path.join(purelib, "chatterbox")):
-            return True
-    except Exception:
-        pass
     return False
 
 

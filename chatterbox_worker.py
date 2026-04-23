@@ -406,20 +406,25 @@ def main():
             HEARTBEAT_SECS = 15
             model = None
 
-            for attempt in range(1, MAX_RETRIES + 1):
-                _alive = True
+            # Use a threading.Event so ALL heartbeat threads stop cleanly
+            # (a plain bool variable creates a new closure per loop iteration,
+            # leaving old heartbeat threads running forever).
+            _stop_heartbeat = threading.Event()
 
-                def _heartbeat():
+            for attempt in range(1, MAX_RETRIES + 1):
+                _stop_heartbeat.clear()
+
+                def _heartbeat(_att=attempt):
                     """Emit status every 15s so the parent knows we're alive."""
                     _start = time.time()
-                    while _alive:
+                    while not _stop_heartbeat.is_set():
                         elapsed = int(time.time() - _start)
                         mins, secs = divmod(elapsed, 60)
                         emit({"type": "status",
                               "msg": f"Downloading Chatterbox model... "
                                      f"{mins}m {secs:02d}s elapsed "
-                                     f"(attempt {attempt}/{MAX_RETRIES})"})
-                        time.sleep(HEARTBEAT_SECS)
+                                     f"(attempt {_att}/{MAX_RETRIES})"})
+                        _stop_heartbeat.wait(HEARTBEAT_SECS)
 
                 hb = threading.Thread(target=_heartbeat, daemon=True)
                 hb.start()
@@ -429,11 +434,13 @@ def main():
                           "msg": f"Downloading Chatterbox model (~3 GB, first run only)... "
                                  f"attempt {attempt}/{MAX_RETRIES}"})
                     local_dir = _snap_dl("ResembleAI/chatterbox", resume_download=True)
-                    _alive = False
+                    _stop_heartbeat.set()
+                    hb.join(timeout=2)
                     model = load_model_from_local(local_dir)
                     break  # success
                 except Exception as _dl_err:
-                    _alive = False
+                    _stop_heartbeat.set()
+                    hb.join(timeout=2)
                     if attempt < MAX_RETRIES:
                         emit({"type": "status",
                               "msg": f"Download interrupted ({_dl_err}). "
