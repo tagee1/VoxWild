@@ -162,9 +162,11 @@ def apply_patch(zip_path: Path, status_cb=None) -> tuple[bool, str]:
     _log(log_file, f"  extracted {len(members)} files to {extract_dir}")
 
     # 3. Phase A — copy everything except the exe, IN PROCESS
+    #    Files that can't be copied (locked DLLs etc.) get deferred to the
+    #    batch script alongside VoxWild.exe.
     if status_cb: status_cb("Copying files...")
     copied = 0
-    errors = []
+    deferred = []  # (src, rel) pairs for files that need post-exit copy
     for root, dirs, files in os.walk(extract_dir):
         for fname in files:
             src = Path(root) / fname
@@ -181,29 +183,24 @@ def apply_patch(zip_path: Path, status_cb=None) -> tuple[bool, str]:
                     _log(log_file, f"  staged: {rel_str} -> {staged_name}")
                 except Exception as e:
                     _log(log_file, f"  STAGE FAILED: {rel_str}: {e}")
-                    errors.append(f"Failed to stage {exe_name}: {e}")
+                    return False, f"Failed to stage {exe_name}: {e}"
                 continue
 
-            # Regular file — copy directly to install dir
+            # Regular file — try to copy directly
             dst = install_dir / rel
             try:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
                 copied += 1
+            except PermissionError:
+                # File is locked (loaded DLL, open handle) — defer to batch
+                _log(log_file, f"  DEFERRED (locked): {rel_str}")
+                deferred.append((src, rel))
             except Exception as e:
                 _log(log_file, f"  COPY FAILED: {rel_str}: {e}")
-                errors.append(f"{rel_str}: {e}")
+                return False, f"Failed to copy {rel_str}: {e}"
 
-    _log(log_file, f"  copied {copied} files, {len(errors)} errors")
-
-    if errors:
-        _log(log_file, f"  ABORTING due to copy errors")
-        # Clean up staged exe if copy failed
-        staged = install_dir / staged_name
-        if staged.exists():
-            try: staged.unlink()
-            except: pass
-        return False, f"Failed to copy files: {errors[0]}"
+    _log(log_file, f"  copied {copied} files, {len(deferred)} deferred")
 
     # Verify staged exe exists
     staged = install_dir / staged_name
@@ -211,12 +208,13 @@ def apply_patch(zip_path: Path, status_cb=None) -> tuple[bool, str]:
         _log(log_file, "  ERROR: staged exe not found after extraction")
         return False, "Patch zip did not contain VoxWild.exe"
 
-    # 4. Write the tiny swap batch
+    # 4. Write the swap batch (handles exe + any deferred locked files)
     if status_cb: status_cb("Preparing restart...")
     script_path = Path(tempfile.gettempdir()) / f"voxwild_swap_{os.getpid()}.bat"
     exe_path = install_dir / exe_name
     try:
-        _write_swap_script(script_path, exe_path, staged, log_file)
+        _write_swap_script(script_path, exe_path, staged, log_file,
+                          deferred_files=deferred, install_dir=install_dir)
     except Exception as e:
         _log(log_file, f"SCRIPT WRITE FAILED: {e}")
         return False, f"Could not prepare updater: {e}"
@@ -238,11 +236,14 @@ def apply_patch(zip_path: Path, status_cb=None) -> tuple[bool, str]:
         _log(log_file, f"SPAWN FAILED: {e}")
         return False, f"Could not start updater: {e}"
 
-    # 6. Clean up temp extract dir (patch files already copied)
-    try:
-        shutil.rmtree(extract_dir, ignore_errors=True)
-    except Exception:
-        pass
+    # 6. Clean up temp extract dir (only if no deferred files need it)
+    if not deferred:
+        try:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        except Exception:
+            pass
+    else:
+        _log(log_file, f"  keeping extract dir for {len(deferred)} deferred file(s)")
 
     _log(log_file, "apply_patch: swap batch spawned, caller should exit now")
     return True, "Update will finish after restart"
@@ -251,13 +252,23 @@ def apply_patch(zip_path: Path, status_cb=None) -> tuple[bool, str]:
 # ── Phase B: exe swap batch ──────────────────────────────────────────────────
 
 def _write_swap_script(script_path: Path, exe_path: Path,
-                      staged_path: Path, log_file: Path) -> None:
-    """Write a tiny batch that deletes old exe, renames staged, relaunches.
+                      staged_path: Path, log_file: Path,
+                      deferred_files=None, install_dir=None) -> None:
+    """Write a batch that swaps the exe + copies any deferred locked files.
 
-    This is ~15 lines. The heavy lifting (copying all other files) already
-    happened in Python. This batch only handles the one file we can't
-    overwrite while the app is running: VoxWild.exe.
+    Deferred files are ones that couldn't be copied in Phase A because
+    they were locked (loaded DLLs like vcomp140.dll). After the app exits
+    and releases all handles, we copy them here.
     """
+    # Build deferred copy commands
+    deferred_cmds = ""
+    if deferred_files and install_dir:
+        deferred_cmds = "\nREM Copy deferred locked files\n"
+        for src, rel in deferred_files:
+            dst = install_dir / rel
+            deferred_cmds += f'copy /y "{src}" "{dst}" >> "!LOG!" 2>&1\n'
+        deferred_cmds += f'echo [%DATE% %TIME%] Copied {len(deferred_files)} deferred file(s) >> "!LOG!"\n'
+
     script = f"""@echo off
 setlocal EnableExtensions EnableDelayedExpansion
 set "LOG={log_file}"
@@ -268,7 +279,7 @@ echo [%DATE% %TIME%] Swap script started >> "!LOG!"
 
 REM Wait for app to exit
 ping -n 3 127.0.0.1 >nul
-
+{deferred_cmds}
 REM Try to delete old exe (retry up to 5 times)
 set /a TRIES=0
 :retry_del
@@ -277,7 +288,6 @@ if not exist "!EXE!" goto del_ok
 set /a TRIES+=1
 if !TRIES! geq 5 (
     echo [%DATE% %TIME%] ERROR: could not delete exe after 5 tries >> "!LOG!"
-    REM Leave staged exe for startup recovery
     start "" "!EXE!"
     exit /b 1
 )
