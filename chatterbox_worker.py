@@ -371,6 +371,22 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────
 
     try:
+        # ── HTTP timeout patch ───────────────────────────────────────────────
+        # HuggingFace's downloader uses requests with no default timeout.
+        # If the connection stalls mid-download, the process hangs forever.
+        # Monkey-patch requests.Session.send to enforce a 120s timeout on
+        # any stalled read — the download will raise an exception instead
+        # of hanging, and our retry loop will resume where it left off.
+        try:
+            import requests as _req
+            _orig_send = _req.Session.send
+            def _timeout_send(self, request, **kwargs):
+                kwargs.setdefault("timeout", 120)
+                return _orig_send(self, request, **kwargs)
+            _req.Session.send = _timeout_send
+        except Exception:
+            pass  # if requests isn't available, we still proceed without timeout
+
         import torchaudio
         from chatterbox.tts import ChatterboxTTS
 
@@ -379,8 +395,63 @@ def main():
             local_dir = snapshot_download("ResembleAI/chatterbox", local_files_only=True)
             model = load_model_from_local(local_dir)
         except Exception:
-            emit({"type": "status", "msg": "Local cache not found — downloading model (first run only)..."})
-            model = ChatterboxTTS.from_pretrained("cpu")
+            # ── Download with retry + heartbeat ──────────────────────────────
+            # The model is ~3GB. On slow/flaky connections the download can
+            # stall. We retry up to 3 times (resume_download=True means each
+            # attempt picks up where the last left off, not from zero).
+            import threading, time
+            from huggingface_hub import snapshot_download as _snap_dl
+
+            MAX_RETRIES    = 3
+            HEARTBEAT_SECS = 15
+            model = None
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                _alive = True
+
+                def _heartbeat():
+                    """Emit status every 15s so the parent knows we're alive."""
+                    _start = time.time()
+                    while _alive:
+                        elapsed = int(time.time() - _start)
+                        mins, secs = divmod(elapsed, 60)
+                        emit({"type": "status",
+                              "msg": f"Downloading Chatterbox model... "
+                                     f"{mins}m {secs:02d}s elapsed "
+                                     f"(attempt {attempt}/{MAX_RETRIES})"})
+                        time.sleep(HEARTBEAT_SECS)
+
+                hb = threading.Thread(target=_heartbeat, daemon=True)
+                hb.start()
+
+                try:
+                    emit({"type": "status",
+                          "msg": f"Downloading Chatterbox model (~3 GB, first run only)... "
+                                 f"attempt {attempt}/{MAX_RETRIES}"})
+                    local_dir = _snap_dl("ResembleAI/chatterbox", resume_download=True)
+                    _alive = False
+                    model = load_model_from_local(local_dir)
+                    break  # success
+                except Exception as _dl_err:
+                    _alive = False
+                    if attempt < MAX_RETRIES:
+                        emit({"type": "status",
+                              "msg": f"Download interrupted ({_dl_err}). "
+                                     f"Retrying in 5s... ({attempt}/{MAX_RETRIES})"})
+                        time.sleep(5)
+                    else:
+                        emit({"type": "error",
+                              "msg": f"Could not download the Chatterbox model after "
+                                     f"{MAX_RETRIES} attempts. Check your internet "
+                                     f"connection and try again. "
+                                     f"Last error: {_dl_err}  [E099]"})
+                        return
+
+            if model is None:
+                emit({"type": "error",
+                      "msg": "Model download failed. Please check your internet "
+                             "connection and restart VoxWild.  [E099]"})
+                return
 
     except MemoryError as e:
         emit({"type": "error", "msg": f"Not enough RAM to load model: {e}"})
