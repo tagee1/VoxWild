@@ -115,6 +115,15 @@ VERSION          = "1.3.4"
 GITHUB_REPO      = "tagee1/VoxWild"
 MAX_HISTORY      = 10
 
+# ── Dev-run branding ──────────────────────────────────────────────────────────
+# True when running from source (python app.py); frozen user installs are
+# never IS_DEV. Dev runs get a badged icon, a "DEV" title, and their own
+# taskbar identity so they never group with the installed app.
+IS_DEV            = not getattr(sys, "frozen", False)
+APP_NAME          = "VoxWild DEV" if IS_DEV else "VoxWild"
+APP_USER_MODEL_ID = ("CookieStudios.VoxWild.Dev" if IS_DEV
+                     else "CookieStudios.VoxWild.1")
+
 # ── User data directory (%APPDATA%\TTS Studio) ────────────────────────────────
 _USER_DIR        = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio")
 os.makedirs(_USER_DIR, exist_ok=True)
@@ -284,13 +293,13 @@ ctk.set_default_color_theme(_res("theme.json"))
 try:
     import ctypes
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-        "CookieStudios.VoxWild.1"
+        APP_USER_MODEL_ID
     )
 except Exception:
     pass
 
 app = ctk.CTk()
-app.title(f"VoxWild  v{VERSION}")
+app.title(f"{APP_NAME}  v{VERSION}")
 app.geometry("1380x860")
 app.minsize(1100, 720)
 
@@ -307,21 +316,23 @@ app.withdraw()   # hidden until splash finishes
 # generic Python icon. Must be called before the window is shown.
 try:
     import ctypes
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CookieStudios.VoxWild.1")
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
 except Exception:
     pass
 
 # Set app icon (deferred slightly so taskbar picks it up after window is shown)
 _APP_DIR = _res(".")
+_ICON_FILE = _res("icon_dev.ico") if IS_DEV and os.path.exists(_res("icon_dev.ico")) \
+             else _res("icon.ico")
 def _set_icon():
     try:
-        app.iconbitmap(_res("icon.ico"))
+        app.iconbitmap(_ICON_FILE)
     except Exception:
         pass
     # Also set iconphoto for window managers that don't use iconbitmap
     try:
         from PIL import Image as _IconImg, ImageTk as _IconTk
-        _icon_img = _IconImg.open(_res("icon.ico"))
+        _icon_img = _IconImg.open(_ICON_FILE)
         _icon_photo = _IconTk.PhotoImage(_icon_img)
         app.iconphoto(True, _icon_photo)
     except Exception:
@@ -330,7 +341,9 @@ app.after(100, _set_icon)
 
 # ── Logo image (shared across UI) ────────────────────────────────────────────
 from PIL import Image as _PILImage
-_LOGO_PATH = os.path.join(_APP_DIR, "logo.png")
+_LOGO_PATH = os.path.join(_APP_DIR, "logo_dev.png" if IS_DEV else "logo.png")
+if not os.path.exists(_LOGO_PATH):
+    _LOGO_PATH = os.path.join(_APP_DIR, "logo.png")
 try:
     _logo_pil = _PILImage.open(_LOGO_PATH).convert("RGBA")
     LOGO_IMG_LG = ctk.CTkImage(_logo_pil, size=(120, 120))  # splash / about
@@ -381,7 +394,7 @@ def _run_splash(on_done):
         ctk.CTkLabel(inner, image=LOGO_IMG_LG, text="").place(relx=0.5, rely=0.28, anchor="center")
 
     # App name
-    ctk.CTkLabel(inner, text="VoxWild",
+    ctk.CTkLabel(inner, text=APP_NAME,
                  font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
                  text_color=C_TXT).place(relx=0.5, rely=0.60, anchor="center")
     ctk.CTkLabel(inner, text=f"v{VERSION}  ·  Kokoro  ·  Chatterbox",
@@ -2890,7 +2903,7 @@ def show_about():
     hdr.pack_propagate(False)
     if LOGO_IMG_LG:
         ctk.CTkLabel(hdr, image=LOGO_IMG_LG, text="").pack(pady=(16, 6))
-    ctk.CTkLabel(hdr, text="VoxWild",
+    ctk.CTkLabel(hdr, text=APP_NAME,
                  font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
                  text_color=C_TXT).pack()
     ctk.CTkLabel(hdr, text=f"v{VERSION}",
@@ -3152,7 +3165,7 @@ if LOGO_IMG_SM:
 else:
     ctk.CTkFrame(title_left, fg_color=C_ACCENT, width=10, height=10,
                  corner_radius=5).pack(side="left", padx=(0, 10))
-ctk.CTkLabel(title_left, text="VoxWild",
+ctk.CTkLabel(title_left, text=APP_NAME,
              font=ctk.CTkFont(family="Segoe UI", size=17, weight="bold"),
              text_color=C_TXT).pack(side="left")
 ctk.CTkLabel(title_left, text=f" v{VERSION}",
@@ -5463,6 +5476,8 @@ _update_check_done = [False]  # guard against double-fire
 def _check_for_update():
     """Background thread: check GitHub releases API on every launch.
     Writes diagnostic log so silent failures can be debugged."""
+    if IS_DEV:
+        return  # dev runs from source — never offer to patch the git checkout
     if _update_check_done[0]:
         return
     _update_check_done[0] = True

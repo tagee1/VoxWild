@@ -1,5 +1,7 @@
 # Python environments — recreate with requirements files
 chatterbox_env/
+venv/
+.venv/
 
 # Large model files — transfer via OneDrive (too big for GitHub)
 *.onnx

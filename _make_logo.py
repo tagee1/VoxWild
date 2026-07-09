@@ -147,10 +147,12 @@ def make_icon_ico(path: Path):
     """Windows .ico with size-specific images."""
     sizes = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256]
     imgs = [draw_icon(s) for s in sizes]
-    imgs[0].save(
+    # Pillow drops any ICO size larger than the base image, so the largest
+    # frame must be the one .save() is called on.
+    imgs[-1].save(
         path, format="ICO",
         sizes=[(s, s) for s in sizes],
-        append_images=imgs[1:],
+        append_images=imgs[:-1],
     )
     print(f"Saved {path.name}  (ICO: {sizes})")
 
