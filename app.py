@@ -8,13 +8,16 @@ multiprocessing.freeze_support()
 # resemble-enhance (and future pip-installed packages) live in python_embed's
 # site-packages. Append (not prepend) so PyInstaller-bundled packages keep
 # priority and only packages NOT in the bundle are resolved from python_embed.
-_embed_sp = os.path.join(
-    os.environ.get("APPDATA", ""), "TTS Studio",
-    "python_embed", "Lib", "site-packages",
-)
-if os.path.isdir(_embed_sp) and _embed_sp not in sys.path:
-    sys.path.append(_embed_sp)
-del _embed_sp
+# Frozen builds only: python_embed's binary packages (torch, etc.) target the
+# embedded interpreter's Python version and crash under a source run's Python.
+if getattr(sys, "frozen", False):
+    _embed_sp = os.path.join(
+        os.environ.get("APPDATA", ""), "TTS Studio",
+        "python_embed", "Lib", "site-packages",
+    )
+    if os.path.isdir(_embed_sp) and _embed_sp not in sys.path:
+        sys.path.append(_embed_sp)
+    del _embed_sp
 
 # ── Suppress console windows for ALL subprocesses (torch, resemble-enhance, etc.) ──
 # Any library that calls subprocess.Popen without CREATE_NO_WINDOW would pop a
@@ -3902,7 +3905,9 @@ try:
                      font=ctk.CTkFont(family="Segoe UI", size=9),
                      text_color=C_TXT3).pack(padx=14, anchor="w", pady=(0, 2))
     del _torch_check
-except ImportError:
+except Exception:
+    # torch missing OR broken (e.g. OSError from a DLL built for another
+    # Python) — either way the hint label is optional, never fatal.
     pass
 
 # ── Audio FX ──────────────────────────────────────────────────────────────────
