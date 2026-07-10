@@ -5263,14 +5263,217 @@ def _run_kokoro_benchmark():
     except Exception:
         pass  # non-critical; never block startup
 
+# Release notes for the pending update, keyed by tag ("v1.3.5" → markdown body).
+# Filled by _check_for_update so the What's New modal can show real notes.
+_pending_update_notes = {}
+_whats_new_open  = [None]   # live What's New window, if any (singleton guard)
+_whats_new_shown = [False]  # True once the modal has appeared by any path
+
+
 def _show_update_banner(latest_tag: str):
     """Show the amber update banner below the header. Called from main thread only."""
     _update_banner_label.configure(text=f"🔔 Update available: {latest_tag}")
     _update_banner_link.configure(
         text="Install ↻",
-        command=lambda v=latest_tag: _start_in_app_update(v),
+        command=lambda v=latest_tag: _show_whats_new(v),
     )
     _update_banner.pack(fill="x", before=prog_row)
+
+
+def _on_update_available(latest_tag: str, notes: str):
+    """Entry point when the update check finds a newer version.
+
+    Shows the persistent banner, then opens the What's New modal as the
+    first thing the user sees. While another modal holds the grab
+    (onboarding, license) or the main window isn't visible yet (splash),
+    it waits; after ~2 minutes it gives up quietly — the banner stays as
+    the reminder and routes through the same modal.
+    """
+    _pending_update_notes[latest_tag] = notes
+    _show_update_banner(latest_tag)
+
+    def _try_show(attempts=0):
+        if _whats_new_shown[0]:
+            return  # user already saw it via the banner — never re-open uninvited
+        try:
+            busy = app.grab_current() is not None or not app.winfo_viewable()
+        except Exception:
+            return  # app is shutting down
+        if busy:
+            if attempts < 40:
+                app.after(3000, lambda: _try_show(attempts + 1))
+            return  # cap reached: give up rather than steal a live grab
+        _show_whats_new(latest_tag)
+    _try_show()
+
+
+def _md_lite(notes: str):
+    """Parse GitHub-release markdown into (kind, text) blocks for display.
+
+    kind: "h" heading, "b" bullet, "p" paragraph, "c" verbatim code line.
+    Inline markers (**bold**, *italic*, [text](url), images, HTML tags)
+    are reduced to plain text — good enough for release notes without a
+    real markdown widget. `code spans` keep their contents literally, and
+    fenced ``` blocks pass through as "c" lines.
+    """
+    def _inline(s):
+        code = []
+        def _stash(m):
+            code.append(m.group(1))
+            return "\x00%d\x00" % (len(code) - 1)
+        s = re.sub(r"`([^`]*)`", _stash, s)                   # protect code spans
+        s = re.sub(r"<!--.*?-->", "", s)                      # HTML comments
+        s = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", s)       # ![alt](url) → alt
+        s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", s)      # [text](url) → text
+        s = re.sub(r"<[^>]+>", "", s)                         # bare HTML tags
+        s = re.sub(r"(\*\*|__)(.+?)\1", r"\2", s)             # bold
+        s = re.sub(r"(?<![\w*])\*([^*]+)\*(?![\w*])", r"\1", s)  # italic
+        s = re.sub(r"\x00(\d+)\x00", lambda m: code[int(m.group(1))], s)
+        s = s.replace("`", "")
+        return s.strip()
+
+    blocks = []
+    in_fence = False
+    for raw in (notes or "").splitlines():
+        line = raw.strip()
+        if line.startswith("```") or line.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            if line:
+                blocks.append(("c", raw.rstrip()))  # verbatim, keep indent
+            continue
+        line = re.sub(r"^(?:>\s?)+", "", line)                # unwrap blockquotes
+        if not line or line in ("---", "***") or re.fullmatch(r"#{1,6}", line):
+            continue
+        m = re.match(r"^#{1,6}\s+(\S.*)$", line)
+        if m:                                                 # real ATX heading —
+            kind, text = "h", _inline(m.group(1))             # "#123 fixed" stays prose
+        elif re.match(r"^[-*+]\s+", line):
+            text = re.sub(r"^[-*+]\s+", "", line)
+            text = _inline(re.sub(r"^\[[ xX]\]\s*", "", text))  # drop task-list box
+            kind = "b"
+        elif re.match(r"^\d+[.)]\s+", line):
+            kind, text = "b", _inline(re.sub(r"^\d+[.)]\s+", "", line))
+        else:
+            kind, text = "p", _inline(line)
+        if text:  # inline stripping can leave nothing (e.g. pure-HTML lines)
+            blocks.append((kind, text))
+    return blocks
+
+
+def _show_whats_new(latest_tag: str):
+    """What's New modal — release notes + Update Now / Later.
+
+    Every download starts here: the banner's Install button and the
+    automatic popup both route through this modal, so users always see
+    what's changing before anything is downloaded.
+    """
+    existing = _whats_new_open[0]
+    if existing is not None and existing.winfo_exists():
+        existing.lift()          # already open — surface it, never stack a second
+        existing.focus_force()
+        return
+    _whats_new_shown[0] = True   # any path counts: the auto-open loop stands down
+
+    notes  = _pending_update_notes.get(latest_tag, "")
+    blocks = _md_lite(notes) or [("p", "Bug fixes and improvements.")]
+
+    win = ctk.CTkToplevel(app)
+    _whats_new_open[0] = win
+    win.title("What's New")
+    _center_window(win, 520, 500)
+    win.resizable(False, False)
+    win.configure(fg_color=C_BG)
+    win.grab_set()
+    win.transient(app)
+    win.lift()
+    _fade_in(win)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=64)
+    hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    hdr_inner = ctk.CTkFrame(hdr, fg_color="transparent")
+    hdr_inner.pack(side="left", padx=20, pady=12)
+    ctk.CTkFrame(hdr_inner, fg_color=C_ACCENT, width=4, height=28,
+                 corner_radius=2).pack(side="left", padx=(0, 12))
+    title_col = ctk.CTkFrame(hdr_inner, fg_color="transparent")
+    title_col.pack(side="left")
+    ctk.CTkLabel(title_col, text=f"What's New in {latest_tag}",
+                 font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+                 text_color=C_TXT).pack(anchor="w")
+    ctk.CTkLabel(title_col, text=f"You're on v{VERSION} — here's what this update brings",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_TXT3).pack(anchor="w")
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+
+    # ── Footer (packed before body so it keeps its height) ───────────────────
+    footer = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=54)
+    footer.pack(fill="x", side="bottom")
+    footer.pack_propagate(False)
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1,
+                 corner_radius=0).pack(fill="x", side="bottom")
+
+    # ── Scrollable notes ──────────────────────────────────────────────────────
+    body = ctk.CTkScrollableFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=16, pady=(12, 8))
+
+    first = True
+    for kind, text in blocks:
+        if kind == "h":
+            ctk.CTkLabel(body, text=text,
+                         font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                         text_color=C_ACCENT, anchor="w", justify="left",
+                         wraplength=440).pack(fill="x", padx=8,
+                                              pady=((0 if first else 12), 4))
+        elif kind == "b":
+            row = ctk.CTkFrame(body, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=2)
+            ctk.CTkLabel(row, text="•", width=14,
+                         font=ctk.CTkFont(family="Segoe UI", size=12),
+                         text_color=C_ACCENT, anchor="nw").pack(side="left")
+            ctk.CTkLabel(row, text=text,
+                         font=ctk.CTkFont(family="Segoe UI", size=12),
+                         text_color=C_TXT2, anchor="w", justify="left",
+                         wraplength=420).pack(side="left", fill="x", expand=True)
+        elif kind == "c":
+            ctk.CTkLabel(body, text=text,
+                         font=ctk.CTkFont(family="Consolas", size=11),
+                         text_color=C_TXT2, anchor="w", justify="left",
+                         wraplength=440).pack(fill="x", padx=14, pady=1)
+        else:
+            ctk.CTkLabel(body, text=text,
+                         font=ctk.CTkFont(family="Segoe UI", size=12),
+                         text_color=C_TXT2, anchor="w", justify="left",
+                         wraplength=440).pack(fill="x", padx=8, pady=(2, 2))
+        first = False
+
+    # ── Footer buttons ────────────────────────────────────────────────────────
+    def _later():
+        win.destroy()  # banner stays up as the reminder
+
+    def _update_now():
+        win.destroy()
+        _start_in_app_update(latest_tag)
+
+    ctk.CTkButton(footer, text="Full notes ↗", width=100, height=28, **BTN_GHOST,
+                  font=ctk.CTkFont(family="Segoe UI", size=11),
+                  command=lambda: webbrowser.open(
+                      f"https://github.com/{GITHUB_REPO}/releases/tag/{latest_tag}")
+                  ).pack(side="left", padx=20)
+    ctk.CTkButton(footer, text="Update Now  →", command=_update_now,
+                  width=130, height=34,
+                  font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                  fg_color=C_ACCENT, hover_color=C_ACCENT_H,
+                  text_color="#000000", corner_radius=8).pack(side="right", padx=(0, 20))
+    ctk.CTkButton(footer, text="Later", width=80, height=28, **BTN_GHOST,
+                  command=_later).pack(side="right", padx=(0, 10))
+
+    win.protocol("WM_DELETE_WINDOW", _later)
+    # No <Return> binding on purpose: the modal can auto-open while the user
+    # is typing, and a stray Enter must never start a download. Esc = Later.
+    win.bind("<Escape>", lambda _e: _later())
 
 
 def _start_in_app_update(latest_tag: str):
@@ -5525,8 +5728,9 @@ def _check_for_update():
         _log(f"current={current} latest={latest} newer={latest > current}")
         if latest > current:
             v = data["tag_name"]
-            _log(f"Showing update banner for {v}")
-            app.after(0, lambda: _show_update_banner(v))
+            notes = data.get("body") or ""
+            _log(f"Showing What's New modal for {v} ({len(notes)} chars of notes)")
+            app.after(0, lambda v=v, n=notes: _on_update_available(v, n))
     except Exception as e:
         import traceback
         _log(f"EXCEPTION: {type(e).__name__}: {e}\n{traceback.format_exc()}")
