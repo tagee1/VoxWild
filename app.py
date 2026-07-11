@@ -56,6 +56,10 @@ from tts_utils import (
     fmt_err, estimate_audio_duration, GenerationCancelled,
     history_card_preview, history_card_voice_label,
 )
+from audio_export import (
+    LOUDNESS_PRESETS, DEFAULT_PRESET as DEFAULT_LOUDNESS_PRESET,
+    normalize_loudness,
+)
 from clone_library import (
     load_clone_library   as _lib_load,
     save_clone_library   as _lib_save,
@@ -977,6 +981,7 @@ _FX_DEFAULTS = {
     "fx_compressor": True, "fx_compressor_ratio": 2.0, "fx_gain": 0,
     "fx_noise_gate": False, "fx_trim": True,
     "fx_enhance": False, "fx_enhance_mode": "Async",
+    "fx_normalize": False, "fx_normalize_preset": DEFAULT_LOUDNESS_PRESET,
 }
 
 def _save_fx_settings():
@@ -993,6 +998,8 @@ def _save_fx_settings():
         s["fx_trim"]              = trim_var.get()
         s["fx_enhance"]           = False  # never persist — see _restore_fx_settings
         s["fx_enhance_mode"]      = enhance_mode.get()
+        s["fx_normalize"]         = normalize_var.get()
+        s["fx_normalize_preset"]  = normalize_preset_var.get()
         _save_settings(s)
     except Exception:
         pass
@@ -1010,6 +1017,10 @@ def _restore_fx_settings():
         noise_gate_var.set(s.get("fx_noise_gate",        _FX_DEFAULTS["fx_noise_gate"]))
         trim_var.set(s.get("fx_trim",                    _FX_DEFAULTS["fx_trim"]))
         enhance_mode.set(s.get("fx_enhance_mode",        _FX_DEFAULTS["fx_enhance_mode"]))
+        normalize_var.set(s.get("fx_normalize",          _FX_DEFAULTS["fx_normalize"]))
+        _np = s.get("fx_normalize_preset", _FX_DEFAULTS["fx_normalize_preset"])
+        if _np in LOUDNESS_PRESETS:   # guard against renamed presets in old settings
+            normalize_preset_var.set(_np)
         # Never auto-restore the Enhancement checkbox. When checked, the trace
         # fires _install_resemble_enhance which runs pip against python_embed.
         # If the user switches to Natural mode while pip is still running, the
@@ -1683,12 +1694,37 @@ def play_history_entry(entry):
     """Legacy wrapper — kept for any external callers."""
     _toggle_history_playback(entry, None)
 
+def _maybe_normalize_export(samples, sr):
+    """Loudness-normalize audio that is about to be written to a file, if the
+    Export toggle is on. Playback inside the app is never normalized.
+
+    Returns (samples, note) — note is "" when nothing was applied, else a
+    short suffix for the save status message.
+    """
+    try:
+        if not normalize_var.get():
+            return samples, ""
+        target = LOUDNESS_PRESETS.get(normalize_preset_var.get(),
+                                      LOUDNESS_PRESETS[DEFAULT_LOUDNESS_PRESET])
+        out, info = normalize_loudness(samples, sr, target)
+        if info["measured"] is None:
+            return samples, ""
+        note = f" · {target:g} LUFS"
+        if info["limited"]:
+            note += " (peak-limited)"
+        return out, note
+    except Exception as e:
+        _log_crash(e)
+        return samples, ""
+
+
 def download_history_entry(entry):
     folder = get_default_folder()
     filepath = filedialog.asksaveasfilename(
         initialdir=folder or None,
         defaultextension=".wav",
-        filetypes=[("MP3 files", "*.mp3"), ("WAV files", "*.wav")]
+        filetypes=[("MP3 files", "*.mp3"), ("WAV files", "*.wav"),
+                   ("FLAC files", "*.flac"), ("OGG Vorbis", "*.ogg")]
     )
     if not filepath:
         return
@@ -1698,8 +1734,11 @@ def download_history_entry(entry):
         _save_as_mp3(entry, filepath)
     else:
         try:
-            sf.write(filepath, entry["samples"], entry["sample_rate"])
-            status_label.configure(text=f"✅ Saved: {os.path.basename(filepath)}")
+            samples, norm_note = _maybe_normalize_export(
+                entry["samples"], entry["sample_rate"])
+            sf.write(filepath, samples, entry["sample_rate"])
+            status_label.configure(
+                text=f"✅ Saved: {os.path.basename(filepath)}{norm_note}")
         except Exception as e:
             _log_crash(e)
             status_label.configure(text=f"❌ Save failed: {_fmt_err(e)}")
@@ -1822,6 +1861,7 @@ def _save_as_mp3(entry, filepath):
 
             samples = entry["samples"]
             sr      = entry["sample_rate"]
+            samples, _norm_note = _maybe_normalize_export(samples, sr)
 
             # Convert float32 → int16
             pcm = np.clip(samples, -1.0, 1.0)
@@ -1851,7 +1891,7 @@ def _save_as_mp3(entry, filepath):
             )
 
             status_label.configure(
-                text=f"✅ Saved MP3: {os.path.basename(filepath)}  ({bitrate} kbps)")
+                text=f"✅ Saved MP3: {os.path.basename(filepath)}  ({bitrate} kbps){_norm_note}")
         except Exception as e:
             _log_crash(e)
             status_label.configure(text=f"❌ MP3 encode failed: {_fmt_err(e)}")
@@ -2501,10 +2541,12 @@ def queue_generate_all():
     if not out_dir: return
     set_default_folder(out_dir)
 
-    use_mp3      = queue_fmt_var.get() == "MP3"
+    out_fmt      = queue_fmt_var.get()
+    use_mp3      = out_fmt == "MP3"
     bitrate      = {"128 kbps": 128, "192 kbps": 192, "320 kbps": 320}.get(
                        queue_mp3_quality_var.get(), 192)
-    ext          = ".mp3" if use_mp3 else ".wav"
+    ext          = {"WAV": ".wav", "MP3": ".mp3",
+                    "FLAC": ".flac", "OGG": ".ogg"}.get(out_fmt, ".wav")
     queue_natural = engine_var.get() == "Natural"
 
     # ── Freemium gate: Natural mode — check before starting the batch ─────────
@@ -2585,15 +2627,17 @@ def queue_generate_all():
                             try: os.unlink(_t)
                             except OSError: pass
 
+                # Normalize the file being written; history keeps the raw take
+                out_samples, norm_note = _maybe_normalize_export(samples, sr)
                 if use_mp3:
                     scb(f"Encoding MP3...")
-                    _encode_mp3_file(out_path, samples, sr, bitrate,
+                    _encode_mp3_file(out_path, out_samples, sr, bitrate,
                                      title=item["name"], artist=voice_name)
                 else:
-                    sf.write(out_path, samples, sr)
+                    sf.write(out_path, out_samples, sr)
                 record_calibration(len(item["text"].split()), time.time() - t0)
                 add_to_history(samples, sr, item["text"], voice_name, segments=segments)
-                scb(f"✅ Saved {item['name']}{ext}")
+                scb(f"✅ Saved {item['name']}{ext}{norm_note}")
             except GenerationCancelled:
                 cancelled = True
                 break
@@ -2604,7 +2648,7 @@ def queue_generate_all():
         smooth.finish()
         is_generating = False
         completed = i + 1
-        fmt_str = "MP3" if use_mp3 else "WAV"
+        fmt_str = out_fmt
         if cancelled:
             app.after(0, lambda c=completed, t=total_items: status_label.configure(
                 text=f"⏹ Queue cancelled. {c} of {t} items completed."))
@@ -4074,6 +4118,36 @@ ctk.CTkButton(enh_panel, text="Reset to defaults", command=reset_enhancements,
               font=ctk.CTkFont(family="Segoe UI", size=11),
               **BTN_GHOST).pack(padx=14, pady=(0, 8))
 
+# ── Export ────────────────────────────────────────────────────────────────────
+_sep(enh_panel)
+_section_label(enh_panel, "EXPORT",
+    tooltip="Applied only when saving files (single save, MP3 dialog, and the "
+            "batch queue). Playback inside VoxWild is unaffected, so what you "
+            "hear while editing never changes.")
+
+_norm_checks = ctk.CTkFrame(enh_panel, fg_color="transparent")
+_norm_checks.pack(fill="x", padx=14, pady=(0, 2))
+normalize_var = ctk.BooleanVar(value=False)
+_checkbox_row(_norm_checks, "Normalize loudness", normalize_var,
+    "Measures the clip's perceived loudness (ITU BS.1770 — the standard "
+    "podcast/streaming platforms use) and gains it to the selected target, "
+    "so every export lands at a consistent, platform-ready volume. "
+    "Peaks are kept below -1 dBFS to prevent clipping.")
+
+normalize_preset_var = ctk.StringVar(value=DEFAULT_LOUDNESS_PRESET)
+normalize_preset_menu = ctk.CTkOptionMenu(
+    enh_panel, variable=normalize_preset_var,
+    values=list(LOUDNESS_PRESETS.keys()),
+    font=ctk.CTkFont(family="Segoe UI", size=11),
+    width=214, dynamic_resizing=False)
+normalize_preset_menu.pack(padx=14, pady=(0, 10))
+
+def _norm_toggle(*_):
+    normalize_preset_menu.configure(
+        state="normal" if normalize_var.get() else "disabled")
+normalize_var.trace_add("write", _norm_toggle)
+_norm_toggle()
+
 
 def _resemble_deps_without_deepspeed():
     """Return resemble-enhance's declared deps with deepspeed and training extras removed.
@@ -4326,10 +4400,10 @@ ctk.CTkLabel(q_fmt_row, text="Output format:",
              font=ctk.CTkFont(family="Segoe UI", size=11),
              text_color=C_TXT2).pack(side="left", padx=(0, 8))
 queue_fmt_var = ctk.StringVar(value="WAV")
-_q_fmt_seg = ctk.CTkSegmentedButton(q_fmt_row, values=["WAV", "MP3"],
+_q_fmt_seg = ctk.CTkSegmentedButton(q_fmt_row, values=["WAV", "MP3", "FLAC", "OGG"],
                                      variable=queue_fmt_var,
                                      font=ctk.CTkFont(family="Segoe UI", size=11),
-                                     width=120)
+                                     width=220)
 _q_fmt_seg.pack(side="left", padx=(0, 16))
 ctk.CTkLabel(q_fmt_row, text="Quality:",
              font=ctk.CTkFont(family="Segoe UI", size=11),
