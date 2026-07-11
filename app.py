@@ -51,7 +51,7 @@ from text_cleaner import clean_text, preview_clean
 from settings_window import open_settings_window, load_settings, save_settings, DEFAULT_SETTINGS
 from pronunciation import open_pronunciation_window, apply_pronunciation
 from tts_utils import (
-    format_time, chunk_text, parse_dialogue,
+    format_time, chunk_text, parse_dialogue, first_sentence,
     _srt_time, _wrap_for_subtitle, build_srt,
     fmt_err, estimate_audio_duration, GenerationCancelled,
     history_card_preview, history_card_voice_label,
@@ -2644,6 +2644,9 @@ def _do_word_count():
 def generate_and_store():
     """Generate audio, store in history. Does NOT auto-play."""
     global is_generating
+    if is_generating or _preview_busy[0]:
+        status_label.configure(text="⏳ Already working — one job at a time.")
+        return
     text = text_input.get("1.0", "end").strip()
     if not text:
         status_label.configure(text="⚠️ Please enter some text.")
@@ -2715,6 +2718,10 @@ def generate_and_store():
 def stop_audio():
     if is_generating:
         cancel_generation()   # signals the generation thread to stop after current chunk
+    elif _preview_busy[0]:
+        _cancel_event.set()   # stops the preview if it hasn't started generating yet
+        sd.stop()             # stops it if it's already playing
+        status_label.configure(text="Preview stopped.")
     else:
         sd.stop()
         status_label.configure(text="Stopped.")
@@ -2723,9 +2730,81 @@ def stop_audio():
                               fg_color="transparent", hover_color=C_ELEVATED,
                               text_color=C_TXT2, border_width=1, border_color=C_BORDER)
 
+
+_preview_busy = [False]  # a preview (canned or first-sentence) is running
+
+def preview_first_sentence():
+    """Quick preview: speak only the first sentence of the text box, through
+    the exact same pipeline as Generate (engine, voice/clone, speed, FX) —
+    so the user can judge the result before committing to a long render."""
+    text = text_input.get("1.0", "end").strip()
+    if not text:
+        status_label.configure(text="⚠️ Type or paste some text first — Preview speaks its first sentence.")
+        return
+    if is_generating or _preview_busy[0]:
+        status_label.configure(text="⏳ Already working — one job at a time.")
+        return
+
+    using_natural = engine_var.get() == "Natural"
+    if using_natural and not _lic.can_use_natural():
+        _show_upsell_modal("natural")
+        return
+
+    snippet = first_sentence(text)
+    voice   = VOICES[voice_var.get()]
+    speed   = round(speed_slider.get(), 2)
+
+    _preview_busy[0] = True
+    _cancel_event.clear()
+    sd.stop()  # never talk over something already playing
+    preview_line_btn.configure(state="disabled", text="Previewing...")
+    play_button.configure(state="disabled")
+    queue_gen_btn.configure(state="disabled")
+    stop_button.configure(state="normal")
+
+    def run():
+        try:
+            samples, sr, _segments = generate_audio(
+                snippet, voice, speed,
+                status_cb=lambda m: app.after(0, lambda m=m: status_label.configure(text=m)))
+            if _cancel_event.is_set():   # Stop pressed while generating
+                raise GenerationCancelled()
+            if using_natural:
+                _lic.record_natural_use()
+            short = snippet if len(snippet) <= 70 else snippet[:70].rstrip() + "…"
+            app.after(0, lambda: status_label.configure(text=f"🎧 Previewing: “{short}”"))
+            sd.play(samples, sr)
+            sd.wait()
+            if _cancel_event.is_set():   # Stop pressed during playback
+                raise GenerationCancelled()
+            app.after(0, lambda: status_label.configure(
+                text="✅ Preview done. Happy with it? Hit Generate for the full text."))
+        except GenerationCancelled:
+            app.after(0, lambda: status_label.configure(text="Preview cancelled."))
+        except Exception as e:
+            _log_crash(e)
+            _msg = _fmt_err(e)
+            app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
+        finally:
+            _preview_busy[0] = False
+            app.after(0, lambda: preview_line_btn.configure(state="normal", text="Preview"))
+            app.after(0, lambda: play_button.configure(state="normal", text="Generate"))
+            app.after(0, lambda: queue_gen_btn.configure(state="normal"))
+            app.after(0, lambda: stop_button.configure(
+                state="disabled", text="Stop",
+                fg_color="transparent", hover_color=C_ELEVATED,
+                text_color=C_TXT2, border_width=1, border_color=C_BORDER))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def preview_voice():
+    if is_generating or _preview_busy[0]:
+        status_label.configure(text="⏳ Already working — one job at a time.")
+        return
     voice = VOICES[voice_var.get()]
     speed = round(speed_slider.get(), 2)
+    _preview_busy[0] = True
     preview_button.configure(state="disabled")
 
     def run():
@@ -2741,6 +2820,7 @@ def preview_voice():
             _msg = _fmt_err(e)
             app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
         finally:
+            _preview_busy[0] = False
             app.after(0, lambda: preview_button.configure(state="normal"))
 
     threading.Thread(target=run, daemon=True).start()
@@ -2961,6 +3041,7 @@ def show_about():
     _section("KEYBOARD SHORTCUTS")
     shortcuts = [
         ("Ctrl + Enter", "Generate audio"),
+        ("Ctrl + Shift + Enter", "Preview first sentence"),
         ("Ctrl + P",     "Play latest"),
         ("Ctrl + S",     "Save latest"),
         ("Ctrl + I",     "Import text file"),
@@ -3030,6 +3111,7 @@ app.protocol("WM_DELETE_WINDOW", on_close)
 
 # ── Keyboard Shortcuts ────────────────────────────────────────────────────────
 def _shortcut_generate(e=None): generate_and_store()
+def _shortcut_preview(e=None):  preview_first_sentence()
 def _shortcut_save(e=None):
     if audio_history: download_history_entry(audio_history[0])
 def _shortcut_play_latest(e=None):
@@ -3040,6 +3122,7 @@ def _shortcut_stop(e=None):   stop_audio()
 def _shortcut_about(e=None):  show_about()
 
 app.bind("<Control-Return>",    _shortcut_generate)
+app.bind("<Control-Shift-Return>", _shortcut_preview)
 app.bind("<Control-s>",         _shortcut_save)
 app.bind("<Control-S>",         _shortcut_save)
 app.bind("<Control-p>",         _shortcut_play_latest)
@@ -3254,6 +3337,14 @@ play_button = ctk.CTkButton(
     corner_radius=8)
 play_button.pack(side="right", padx=(0, 4), pady=6)
 
+# Quick preview: speaks just the first sentence with the current settings
+preview_line_btn = ctk.CTkButton(
+    _tab_row, text="Preview", command=preview_first_sentence,
+    width=84, height=28,
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    **BTN_GHOST, corner_radius=8)
+preview_line_btn.pack(side="right", padx=(0, 6), pady=6)
+
 tabs = ctk.CTkTabview(app, fg_color=C_BG)
 tabs.pack(fill="both", expand=True, padx=0, pady=0)
 tabs.add("  Studio  ")
@@ -3282,7 +3373,9 @@ def _panel(parent, col, padright=8):
 text_panel = _panel(studio, 0)
 
 _section_label(text_panel, "TEXT INPUT",
-    tooltip="Type or paste any text here. Use Ctrl+Enter to generate. "
+    tooltip="Type or paste any text here. Use Ctrl+Enter to generate, or the "
+            "Preview button (Ctrl+Shift+Enter) to hear just the first sentence "
+            "before committing to a full render. "
             "Long texts are automatically split into chunks and joined seamlessly. "
             "Use the Dialogue tab for multi-speaker scripts.")
 
@@ -4527,6 +4620,9 @@ def dlg_detect_speakers():
     status_label.configure(text=f"✅ {len(speakers)} detected — speaker 1 female, speaker 2 male by default.")
 
 def dlg_generate():
+    if is_generating or _preview_busy[0]:
+        status_label.configure(text="⏳ Already working — one job at a time.")
+        return
     text    = dlg_text.get("1.0", "end").strip()
     if not text:
         status_label.configure(text="⚠️ Script is empty. Write some dialogue first.")

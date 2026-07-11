@@ -47,6 +47,33 @@ def chunk_text(text, max_chars=800, min_chars=80):
     return chunks or [text]
 
 
+_SENT_END = re.compile(r"[.!?…]+[\"'”’)\]]*(?=\s|$)")
+
+
+def first_sentence(text, max_chars=220):
+    """First sentence of text, for the quick-preview feature.
+
+    Takes the first non-empty line, cut at the first sentence-ending
+    punctuation. Ellipses are protected the same way as chunk_text so
+    "Wait... go on." isn't cut mid-thought. Overlong sentences are cut
+    at a word boundary near max_chars — previews should be fast, and
+    Chatterbox degrades on huge single inputs anyway.
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    line = next(ln.strip() for ln in s.splitlines() if ln.strip())
+    t = line.replace("...", "\x00E3\x00").replace("..", "\x00E2\x00")
+    m = _SENT_END.search(t)
+    if m:
+        t = t[:m.end()]
+    out = t.replace("\x00E3\x00", "...").replace("\x00E2\x00", "..")
+    if len(out) > max_chars:
+        cut = out.rfind(" ", 0, max_chars)
+        out = out[:cut if cut > 40 else max_chars].rstrip()
+    return out
+
+
 def parse_dialogue(text):
     """Parse SPEAKER: text lines. Returns list of (speaker, text) tuples."""
     result = []
