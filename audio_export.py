@@ -24,6 +24,9 @@ _ABS_GATE_LUFS  = -70.0   # BS.1770 absolute gate
 _REL_GATE_LU    = -10.0   # relative gate below ungated mean
 PEAK_CEILING_DB = -1.0    # sample-peak ceiling after normalization
 
+_LIMIT_LOOKAHEAD_S = 0.005   # limiter attack ramp / lookahead window
+_LIMIT_RELEASE_S   = 0.060   # limiter release time constant
+
 
 def _k_weighting_coeffs(fs):
     """Biquad coefficients for the two BS.1770 pre-filters at sample rate fs.
@@ -107,27 +110,97 @@ def measure_lufs(samples, fs):
     return float(-0.691 + 10 * np.log10(final.mean()))
 
 
+def _sliding_min_ahead(g, w):
+    """m[i] = min(g[i : i+w]) — lookahead sliding-window minimum in O(n).
+
+    van Herk/Gil-Werman: with block prefix/suffix minima, any w-wide window
+    spans at most two w-blocks, so its min is min(suffix[i], prefix[i+w-1]).
+    """
+    n = g.shape[0]
+    if w <= 1 or n == 0:
+        return g
+    pad = (-n) % w
+    if pad < w - 1:          # prefix index i+w-1 must stay in bounds
+        pad += w
+    gp = np.concatenate([g, np.full(pad, np.inf, dtype=g.dtype)])
+    blocks = gp.reshape(-1, w)
+    pre = np.minimum.accumulate(blocks, axis=1).ravel()
+    suf = np.minimum.accumulate(blocks[:, ::-1], axis=1)[:, ::-1].ravel()
+    return np.minimum(suf[:n], pre[w - 1:w - 1 + n])
+
+
+def _moving_avg(g, w):
+    """Trailing moving average over w samples (edge-held at the start)."""
+    if w <= 1:
+        return g
+    arr = np.concatenate([np.full(w - 1, g[0], dtype=g.dtype), g])
+    cs = np.concatenate([[0.0], np.cumsum(arr, dtype=np.float64)])
+    return ((cs[w:] - cs[:-w]) / w).astype(g.dtype, copy=False)
+
+
+def _limit_peaks(x, fs, ceiling):
+    """Lookahead brickwall limiter: keep |out| <= ceiling by attenuating only
+    around peaks, with a ramped attack and smooth release — no hard clipping,
+    and passages without peaks pass through untouched.
+    """
+    ceiling = np.float32(ceiling)
+    ax = np.abs(x) if x.ndim == 1 else np.abs(x).max(axis=1)
+    if not ax.size or float(ax.max()) <= ceiling:
+        return x                     # nothing exceeds the ceiling
+    g_inst = np.minimum(np.float32(1.0), ceiling / np.maximum(ax, np.float32(1e-9)))
+    w = max(1, int(round(_LIMIT_LOOKAHEAD_S * fs)))
+    # Floor over the upcoming window, then ramp into it; never above what
+    # the current sample itself requires.
+    g_att = np.minimum(_moving_avg(_sliding_min_ahead(g_inst, w), w), g_inst)
+    # One-pole smoothing gives the release; the elementwise min keeps the
+    # attack instant (smoothing must never lag a gain *reduction*).
+    alpha = np.float32(np.exp(-1.0 / (_LIMIT_RELEASE_S * fs)))
+    g_rel, _ = lfilter(np.array([1 - alpha], dtype=np.float32),
+                       np.array([1, -alpha], dtype=np.float32), g_att,
+                       zi=np.array([g_att[0] * alpha], dtype=np.float32))
+    g = np.minimum(g_rel, g_att)
+    if x.ndim != 1:
+        g = g[:, None]
+    return np.clip(x * g, -ceiling, ceiling)
+
+
 def normalize_loudness(samples, fs, target_lufs, peak_ceiling_db=PEAK_CEILING_DB):
     """Gain samples to the target integrated loudness, respecting a peak ceiling.
 
     Returns (out, info) with info = {"measured", "gain_db", "limited"}.
     Silent/unmeasurable audio is returned unchanged (measured=None).
-    If the required gain would push the sample peak above peak_ceiling_db,
-    the gain is reduced so the peak sits exactly at the ceiling instead of
-    clipping — the clip lands as loud as it can go without distortion.
+    If plain gain would push sample peaks above peak_ceiling_db, the full
+    gain is still applied and a lookahead limiter transparently tames just
+    the moments around each peak (limited=True) — quiet-but-peaky speech
+    reaches the target instead of falling short of it.
     """
-    x = np.asarray(samples)
+    x = np.asarray(samples, dtype=np.float32)
     measured = measure_lufs(x, fs)
     info = {"measured": measured, "gain_db": 0.0, "limited": False}
     if measured is None:
+        return x, info
+    # Already at target (within a quarter LU — far below audibility): leave
+    # the audio untouched so re-exporting a normalized clip is a clean no-op.
+    if abs(target_lufs - measured) < 0.25:
         return x, info
 
     gain = 10 ** ((target_lufs - measured) / 20)
     peak = float(np.max(np.abs(x))) if x.size else 0.0
     ceiling = 10 ** (peak_ceiling_db / 20)
-    if peak * gain > ceiling:
-        gain = ceiling / peak
-        info["limited"] = True
-    info["gain_db"] = float(20 * np.log10(gain)) if gain > 0 else 0.0
-    out = (x.astype(np.float64) * gain).astype(np.float32)
+    if peak * gain <= ceiling:
+        info["gain_db"] = float(20 * np.log10(gain)) if gain > 0 else 0.0
+        return x * np.float32(gain), info
+
+    info["limited"] = True
+    out = _limit_peaks(x * np.float32(gain), fs, ceiling)
+    # Limiting shaves a little energy off the loudest moments, so the result
+    # lands slightly under target — nudge up and re-limit until it converges.
+    for _ in range(2):
+        got = measure_lufs(out, fs)
+        if got is None or abs(target_lufs - got) <= 0.2:
+            break
+        step = 10 ** ((target_lufs - got) / 20)
+        gain *= step
+        out = _limit_peaks(out * np.float32(step), fs, ceiling)
+    info["gain_db"] = float(20 * np.log10(gain))
     return out, info
