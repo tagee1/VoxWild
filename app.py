@@ -951,7 +951,10 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
     on_success()
 
 # ── Voices ────────────────────────────────────────────────────────────────────
+# Combined label -> Kokoro voice ID map for every language. Existing code looks
+# up VOICES[label] all over, so each voice (English, Spanish, …) must live here.
 VOICES = {
+    # English (US + UK)
     "🇺🇸 Female - Heart (Best)": "af_heart",
     "🇺🇸 Female - Bella":        "af_bella",
     "🇺🇸 Female - Sarah":        "af_sarah",
@@ -965,7 +968,46 @@ VOICES = {
     "🇬🇧 Female - Isabella":     "bf_isabella",
     "🇬🇧 Male - George (Best)":  "bm_george",
     "🇬🇧 Male - Lewis":          "bm_lewis",
+    # Spanish (Español)
+    "🇪🇸 Female - Dora":         "ef_dora",
+    "🇪🇸 Male - Alex":           "em_alex",
+    "🇪🇸 Male - Santa":          "em_santa",
 }
+
+# Language groups for the Fast (Kokoro) voice picker. Order = dropdown order.
+# Each entry carries its espeak-ng lang code (passed to kokoro.create so the
+# voice is phonemized natively) and the sample line the Preview button speaks.
+# The voice lists are derived from VOICES below, so this stays a single source.
+LANGUAGES = {
+    "🇺🇸 English": {"lang": "en-us", "labels": [],
+                    "preview": "Hello! This is a preview of the selected voice."},
+    "🇪🇸 Español": {"lang": "es", "labels": [],
+                    "preview": "¡Hola! Esta es una vista previa de la voz seleccionada."},
+}
+DEFAULT_LANG_NAME = "🇺🇸 English"
+
+# Kokoro voice-ID first letter -> language group. a=American, b=British (both
+# English); e=Spanish. New languages add their prefix here (f=French, etc.).
+_PREFIX_LANG = {"a": "🇺🇸 English", "b": "🇺🇸 English", "e": "🇪🇸 Español"}
+
+# Populate each language's label list (in VOICES order) and build voice_id ->
+# espeak-ng lang code, used at every kokoro.create() call site.
+VOICE_LANG = {}
+for _lbl, _vid in VOICES.items():
+    _lname = _PREFIX_LANG.get(_vid[0], DEFAULT_LANG_NAME)
+    LANGUAGES[_lname]["labels"].append(_lbl)
+    VOICE_LANG[_vid] = LANGUAGES[_lname]["lang"]
+
+def lang_for_voice(voice_id):
+    """espeak-ng language code for a Kokoro voice ID (defaults to en-us)."""
+    return VOICE_LANG.get(voice_id, "en-us")
+
+def _lang_name_for_label(label):
+    """LANGUAGES key whose voice list contains this label (defaults English)."""
+    for _lname, _ldata in LANGUAGES.items():
+        if label in _ldata["labels"]:
+            return _lname
+    return DEFAULT_LANG_NAME
 
 # ── Settings helpers (load_settings / save_settings imported from settings_window) ─
 def get_default_folder():
@@ -2179,7 +2221,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
             if _cancel_event.is_set():
                 raise GenerationCancelled()
             if status_cb: status_cb(f"⏳ Generating chunk {i+1}/{len(chunks)}...")
-            samples, sr = kokoro.create(chunk, voice=voice, speed=speed)
+            samples, sr = kokoro.create(chunk, voice=voice, speed=speed, lang=lang_for_voice(voice))
             all_samples.append(samples)
             sample_rate = sr
             smooth.set_target(lo + (hi - lo) * (i + 1) / len(chunks))
@@ -2257,7 +2299,7 @@ def generate_dialogue_audio(dialogue_lines, speaker_voices, speed,
             for chunk in line_chunks:
                 if cancel_event and cancel_event.is_set():
                     raise GenerationCancelled()
-                samp, sr = kokoro.create(chunk, voice=voice_id, speed=speed)
+                samp, sr = kokoro.create(chunk, voice=voice_id, speed=speed, lang=lang_for_voice(voice_id))
                 line_samples.append(samp)
                 sample_rate = sr
 
@@ -2303,7 +2345,7 @@ def generate_dialogue_audio(dialogue_lines, speaker_voices, speed,
 # ── Profiles ──────────────────────────────────────────────────────────────────
 def get_current_settings():
     return {
-        "voice": voice_var.get(), "speed": speed_slider.get(),
+        "voice": voice_var.get(), "language": language_var.get(), "speed": speed_slider.get(),
         "highpass": highpass_slider.get(), "lowpass": lowpass_slider.get(),
         "reverb": reverb_slider.get(), "compressor": compressor_var.get(),
         "compressor_ratio": compressor_slider.get(), "gain": gain_slider.get(),
@@ -2311,7 +2353,16 @@ def get_current_settings():
     }
 
 def apply_settings(s):
-    voice_var.set(s.get("voice", "🇬🇧 Male - George (Best)"))
+    v = s.get("voice", "🇬🇧 Male - George (Best)")
+    lang_name = s.get("language") or _lang_name_for_label(v)
+    if lang_name not in LANGUAGES:
+        lang_name = DEFAULT_LANG_NAME
+    labels = LANGUAGES[lang_name]["labels"]
+    if v not in labels:
+        v = labels[0]
+    language_var.set(lang_name)
+    voice_menu.configure(values=labels)
+    voice_var.set(v)
     speed_slider.set(s.get("speed", 0.85))
     highpass_slider.set(s.get("highpass", 20))
     lowpass_slider.set(s.get("lowpass", 18000))
@@ -2847,6 +2898,8 @@ def preview_voice():
         status_label.configure(text="⏳ Already working — one job at a time.")
         return
     voice = VOICES[voice_var.get()]
+    lang = lang_for_voice(voice)
+    preview_text = LANGUAGES[_lang_name_for_label(voice_var.get())]["preview"]
     speed = round(speed_slider.get(), 2)
     _preview_busy[0] = True
     preview_button.configure(state="disabled")
@@ -2854,7 +2907,7 @@ def preview_voice():
     def run():
         try:
             samples, sr = kokoro.create(
-                "Hello! This is a preview of the selected voice.", voice=voice, speed=speed)
+                preview_text, voice=voice, speed=speed, lang=lang)
             enhanced = apply_enhancements(samples, sr)
             sd.play(enhanced, sr)
             sd.wait()
@@ -3500,13 +3553,41 @@ voice_container.pack(fill="x")
 kokoro_frame = ctk.CTkFrame(voice_container, fg_color="transparent")
 kokoro_frame.pack(fill="x")
 
-_section_label(kokoro_frame, "VOICE",
-    tooltip="Select a built-in voice for Fast mode. Voices marked (Best) sound the most natural. "
-            "US and UK accents are available.")
-voice_var = ctk.StringVar(value="🇬🇧 Male - George (Best)")
-ctk.CTkOptionMenu(kokoro_frame, variable=voice_var, values=list(VOICES.keys()),
+_section_label(kokoro_frame, "LANGUAGE",
+    tooltip="Choose the language for Fast mode. Each language has its own set of "
+            "built-in voices, pronounced natively.")
+language_var = ctk.StringVar(value=DEFAULT_LANG_NAME)
+ctk.CTkOptionMenu(kokoro_frame, variable=language_var,
+                  values=list(LANGUAGES.keys()),
+                  command=lambda *_: _on_language_change(),
                   width=214, dynamic_resizing=False,
-                  font=ctk.CTkFont(family="Segoe UI", size=12)).pack(padx=14, pady=(0, 6))
+                  font=ctk.CTkFont(family="Segoe UI", size=12)).pack(padx=14, pady=(0, 8))
+
+_section_label(kokoro_frame, "VOICE",
+    tooltip="Select a built-in voice for the chosen language. Voices marked (Best) "
+            "sound the most natural.")
+voice_var = ctk.StringVar(value="🇬🇧 Male - George (Best)")
+voice_menu = ctk.CTkOptionMenu(kokoro_frame, variable=voice_var,
+                  values=LANGUAGES[DEFAULT_LANG_NAME]["labels"],
+                  width=214, dynamic_resizing=False,
+                  font=ctk.CTkFont(family="Segoe UI", size=12))
+voice_menu.pack(padx=14, pady=(0, 6))
+
+def _on_language_change():
+    """User picked a language: repopulate the voice menu, keep a valid voice."""
+    labels = LANGUAGES[language_var.get()]["labels"]
+    voice_menu.configure(values=labels)
+    if voice_var.get() not in labels:
+        voice_var.set(labels[0])
+
+def _sync_language_to_voice(*_):
+    """Any code that sets voice_var (profiles, defaults) auto-fixes the language."""
+    want = _lang_name_for_label(voice_var.get())
+    if language_var.get() != want:
+        language_var.set(want)
+        voice_menu.configure(values=LANGUAGES[want]["labels"])
+voice_var.trace_add("write", _sync_language_to_voice)
+
 preview_button = ctk.CTkButton(
     kokoro_frame, text="Preview Voice", command=preview_voice,
     width=214, height=30,
