@@ -1111,7 +1111,7 @@ def record_calibration(word_count, elapsed_seconds, use_cb=None):
     data = _get_calibration()
     if use_cb is None:
         use_cb = engine_var.get() == "Natural"
-    wps = word_count / elapsed_seconds if elapsed_seconds > 0 else (0.5 if use_cb else 55)
+    wps = word_count / elapsed_seconds if elapsed_seconds > 0 else (0.5 if use_cb else 8)
     _EMA_ALPHA = 0.4
     if use_cb:
         data.setdefault("cb_samples", [])
@@ -1122,7 +1122,7 @@ def record_calibration(word_count, elapsed_seconds, use_cb=None):
     else:
         data["samples"].append(round(wps, 3))
         data["samples"] = data["samples"][-5:]
-        prior = data.get("words_per_second") or 55
+        prior = data.get("words_per_second") or 8
         data["words_per_second"] = round(_EMA_ALPHA * wps + (1 - _EMA_ALPHA) * prior, 3)
     save_calibration(data)
 
@@ -1130,7 +1130,7 @@ def get_words_per_second():
     data = _get_calibration()
     if engine_var.get() == "Natural":
         return data.get("cb_words_per_second") or 0.5
-    return data.get("words_per_second") or 55
+    return data.get("words_per_second") or 8
 
 # ── Audio History ─────────────────────────────────────────────────────────────
 audio_history = []   # list of dicts: {samples, sample_rate, text, duration, timestamp, voice}
@@ -1971,39 +1971,154 @@ def export_srt_from_entry(entry):
         _log_crash(e)
         status_label.configure(text=f"❌ SRT export failed: {_fmt_err(e)}")
 
+# ── Segmented progress bar ────────────────────────────────────────────────────
+class SegmentBar:
+    """A row of proportional mini progress bars — one cell per text chunk.
+    Cells light up as their chunk finishes; the active cell fills as it runs.
+    Falls back to a single cell when no segments are set (e.g. enhancement).
+    All widget work happens on the main thread (driven by SmoothProgress._tick)."""
+    _TRACK = "#201f1e"   # neutral dark: empty cell reads clearly as "not done"
+
+    def __init__(self, parent):
+        self.frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.frame.grid_rowconfigure(0, weight=1)
+        self.cells   = []
+        self._maxcols = 0
+        self._build([1])
+
+    def _build(self, weights):
+        for c in self.cells:
+            c.destroy()
+        self.cells = []
+        for i in range(self._maxcols):
+            self.frame.grid_columnconfigure(i, weight=0, minsize=0)
+        total = sum(weights) or 1
+        for i, w in enumerate(weights):
+            self.frame.grid_columnconfigure(i, weight=max(1, int(round(w / total * 1000))), minsize=8)
+            bar = ctk.CTkProgressBar(self.frame, height=14, corner_radius=5,
+                                     progress_color=C_ACCENT, fg_color=self._TRACK)
+            bar.set(0.0)
+            bar.grid(row=0, column=i, sticky="ew",
+                     padx=((0, 4) if i < len(weights) - 1 else (0, 0)), pady=0)
+            self.cells.append(bar)
+        self._maxcols = max(self._maxcols, len(weights))
+
+    def set_segments(self, weights):
+        self._build([max(1, int(x)) for x in weights] if weights else [1])
+
+    def update(self, active_index, active_frac):
+        af = max(0.0, min(1.0, active_frac))
+        for i, bar in enumerate(self.cells):
+            bar.set(1.0 if i < active_index else (af if i == active_index else 0.0))
+
+    def set(self, frac):   # single-cell (time-driven) fallback
+        if len(self.cells) != 1:
+            self._build([1])
+        self.cells[0].set(max(0.0, min(1.0, frac)))
+
+    def complete(self):
+        for bar in self.cells:
+            bar.set(1.0)
+
+    def reset(self):
+        self._build([1])
+
+    def pack(self, **kw):
+        self.frame.pack(**kw)
+
+
 # ── Smooth Progress ───────────────────────────────────────────────────────────
 class SmoothProgress:
-    def __init__(self, bar, time_label):
-        self.bar         = bar
-        self.time_label  = time_label
-        self._current    = 0.0
-        self._target     = 0.0
+    """Drives a SegmentBar honestly: progress tracks actual chunks completed
+    (not a hopeful clock), and the ETA is derived from the observed rate so it
+    self-corrects even when the first estimate is off. Segment state is updated
+    from worker threads (plain data only); all widget work runs in _tick on the
+    main thread."""
+    def __init__(self, bar, time_label, pct_label=None):
+        self.bar        = bar
+        self.time_label = time_label
+        self.pct_label  = pct_label
         self._running    = False
         self._start_time = None
         self._est_total  = None
-
-    def start(self, estimated_seconds):
         self._current    = 0.0
-        self._target     = 0.0
+        self._seg_w      = None      # per-chunk char weights, or None (time mode)
+        self._seg_cum    = [0]
+        self._seg_total  = 0
+        self._seg_start  = None      # when the current segment batch began (per queue item)
+        self._last_rate  = None      # chars/sec of the most recent completed chunk
+        self._active     = 0         # chunks completed so far
+        self._active_ts  = None      # when the current chunk started
+        self._built_key  = None
+
+    # ---- called on the main thread ----
+    def start(self, estimated_seconds):
         self._running    = True
         self._start_time = time.time()
         self._est_total  = max(estimated_seconds, 1)
-        self.bar.set(0)
-        self.time_label.configure(text=f"⏱ Est. time: ~{format_time(estimated_seconds)}")
+        self._current    = 0.0
+        self._seg_w      = None
+        self._seg_cum    = [0]
+        self._seg_total  = 0
+        self._seg_start  = self._start_time
+        self._last_rate  = None
+        self._active     = 0
+        self._active_ts  = self._start_time
+        self._built_key  = None
+        app.after(0, self._begin_ui)
+
+    def _begin_ui(self):
+        self.bar.reset()
+        self.time_label.configure(text=f"⏱ Est. time: ~{format_time(self._est_total)}")
+        if self.pct_label:
+            self.pct_label.configure(text="0%")
         self._tick()
 
-    def set_target(self, value):
-        self._target = min(value, 0.99)
+    # ---- called from worker threads (data only, thread-safe) ----
+    def begin_segments(self, weights):
+        weights = [max(1, int(w)) for w in weights] or [1]
+        cum = [0]
+        for w in weights:
+            cum.append(cum[-1] + w)
+        # Set derived fields first, then _seg_w last: _tick keys off _seg_w, so this
+        # ordering means it never sees new weights against a stale cum (cross-thread).
+        self._seg_cum   = cum
+        self._seg_total = cum[-1]
+        self._seg_start = time.time()
+        self._active    = 0
+        self._active_ts = self._seg_start
+        self._seg_w     = weights
+
+    def segment_done(self, i):
+        # Learn the rate from the chunk that just finished — recent, not cumulative,
+        # so a slow warmup chunk doesn't poison the estimate for the fast ones after it.
+        now = time.time()
+        dur = now - (self._active_ts or now)
+        w   = self._seg_w[i] if (self._seg_w and i < len(self._seg_w)) else 0
+        if dur > 0.05 and w > 0:
+            self._last_rate = w / dur
+        self._active    = i + 1
+        self._active_ts = now
+
+    def set_target(self, value):   # legacy no-op safeguard (segment mode ignores it)
+        pass
 
     def finish(self):
-        # Called from worker threads — schedule all UI work on the main thread
         elapsed = time.time() - self._start_time if self._start_time else 0
         self._running = False
-        self.bar.after(0, lambda e=elapsed: self._finish_ui(e))
+        app.after(0, lambda e=elapsed: self._finish_ui(e))
+
+    # ---- main-thread rendering ----
+    def _seed_rate(self):
+        try:
+            return max(1.0, get_words_per_second() * 5.8)   # words/s → chars/s
+        except Exception:
+            return 40.0
 
     def _finish_ui(self, elapsed):
-        self._current = 1.0
-        self.bar.set(1.0)
+        self.bar.complete()
+        if self.pct_label:
+            self.pct_label.configure(text="100%")
         self.time_label.configure(text=f"✅ Done in {format_time(elapsed)}")
         s = _get_settings()
         threshold = s.get("notify_threshold_seconds", 10)
@@ -2011,33 +2126,57 @@ class SmoothProgress:
             try:
                 from win10toast import ToastNotifier
                 ToastNotifier().show_toast(
-                    "VoxWild",
-                    "Your audio is ready!",
-                    duration=4,
-                    threaded=True
-                )
+                    "VoxWild", "Your audio is ready!", duration=4, threaded=True)
             except Exception:
                 pass  # Notification is optional, never crash for it
 
     def _tick(self):
         if not self._running:
             return
-        elapsed     = time.time() - self._start_time
-        remaining   = self._est_total - elapsed
-        if remaining > 0:
-            time_driven = min(elapsed / self._est_total * 0.90, 0.90)
-            ideal       = max(time_driven, self._target)
-            self._current += (ideal - self._current) * 0.15
-            self._current  = min(self._current, 0.90)
-            self.bar.set(self._current)
-            self.time_label.configure(text=f"⏱ Est. remaining: ~{format_time(remaining)}")
+        now     = time.time()
+        elapsed = now - self._start_time
+
+        seg_w   = self._seg_w        # capture once — worker thread may be mid-update
+        seg_cum = self._seg_cum
+        if seg_w and len(seg_cum) == len(seg_w) + 1:
+            key = tuple(seg_w)
+            if key != self._built_key:
+                self.bar.set_segments(seg_w)
+                self._built_key = key
+            n        = len(seg_w)
+            ai       = min(self._active, n)
+            done_w   = seg_cum[ai]
+            total    = seg_cum[-1] or 1
+            rate     = self._last_rate or self._seed_rate()
+            if ai < n:
+                est_chunk = seg_w[ai] / max(rate, 1)
+                in_frac   = min(0.98, max(0.0, (now - (self._active_ts or now)) / max(est_chunk, 0.05)))
+                work      = (done_w + seg_w[ai] * in_frac) / total
+                self.bar.update(ai, in_frac)
+                remain = (total - done_w) / max(rate, 1)
+                self.time_label.configure(text=f"⏱ ~{format_time(remain)} left")
+            else:
+                work = 1.0
+                self.bar.complete()
+                self.time_label.configure(text="⏱ Assembling audio…")
+            if self.pct_label:
+                self.pct_label.configure(text=f"{min(99, int(round(work * 100)))}%")
         else:
-            # Estimate exceeded — breathe smoothly between 0.88 and 0.97
-            import math
-            pulse = 0.925 + 0.045 * math.sin(elapsed * 1.8)
-            self.bar.set(pulse)
-            self.time_label.configure(text="⏱ Processing…")
-        app.after(100, self._tick)
+            # Time-driven fallback (non-chunked ops): ease up, never stall/pulse.
+            if elapsed < self._est_total:
+                ideal = elapsed / self._est_total * 0.95
+                remain_txt = f"⏱ ~{format_time(self._est_total - elapsed)} left"
+            else:
+                over  = elapsed - self._est_total
+                ideal = 0.95 + 0.04 * (1 - 1 / (1 + over / 5))   # creep toward 0.99
+                remain_txt = "⏱ Processing…"
+            self._current += (ideal - self._current) * 0.2
+            self.bar.set(min(0.99, self._current))
+            self.time_label.configure(text=remain_txt)
+            if self.pct_label:
+                self.pct_label.configure(text=f"{int(min(99, self._current * 100))}%")
+
+        app.after(80, self._tick)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 # format_time imported from tts_utils
@@ -2192,6 +2331,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
         # Chatterbox's T3 model silently truncates around ~500 chars — keep chunks small
         chunks = chunk_text(text, max_chars=300)
         all_samples, sample_rate = [], None
+        smooth.begin_segments([len(c) for c in chunks])
         _clone_path = cb_clone_path_var.get()
         if _clone_path and not os.path.exists(_clone_path):
             if status_cb: status_cb("⚠️ Voice clone file not found — using default voice.")
@@ -2212,11 +2352,12 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
             )
             all_samples.append(samples)
             sample_rate = sr
-            smooth.set_target(lo + (hi - lo) * (i + 1) / len(chunks))
+            smooth.segment_done(i)
     else:
         # ── Kokoro path ────────────────────────────────────────────────────────
         chunks = chunk_text(text)
         all_samples, sample_rate = [], None
+        smooth.begin_segments([len(c) for c in chunks])
         for i, chunk in enumerate(chunks):
             if _cancel_event.is_set():
                 raise GenerationCancelled()
@@ -2224,7 +2365,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
             samples, sr = kokoro.create(chunk, voice=voice, speed=speed, lang=lang_for_voice(voice))
             all_samples.append(samples)
             sample_rate = sr
-            smooth.set_target(lo + (hi - lo) * (i + 1) / len(chunks))
+            smooth.segment_done(i)
 
     # Build per-chunk timings (before trim/enhance) for SRT
     chunk_timings = []
@@ -3402,15 +3543,18 @@ ctk.CTkButton(
 prog_row = ctk.CTkFrame(app, fg_color=C_SURFACE, corner_radius=0, height=34)
 prog_row.pack(fill="x")
 prog_row.pack_propagate(False)
-progress_bar = ctk.CTkProgressBar(prog_row, height=6, corner_radius=3)
-progress_bar.set(0)
-progress_bar.pack(side="left", fill="x", expand=True, padx=(16, 10), pady=14)
+progress_pct_label = ctk.CTkLabel(
+    prog_row, text="0%", width=48, anchor="w",
+    font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"), text_color=C_ACCENT)
+progress_pct_label.pack(side="left", padx=(16, 8))
+progress_bar = SegmentBar(prog_row)
+progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=10)
 progress_time_label = ctk.CTkLabel(
-    prog_row, text="", width=260, anchor="w",
+    prog_row, text="", width=190, anchor="w",
     font=ctk.CTkFont(family="Segoe UI", size=12), text_color=C_TXT3)
 progress_time_label.pack(side="left", padx=(0, 16))
 
-smooth = SmoothProgress(progress_bar, progress_time_label)
+smooth = SmoothProgress(progress_bar, progress_time_label, progress_pct_label)
 
 _sep(app)
 
@@ -5504,13 +5648,16 @@ def _handle_license_on_startup():
 # Seed Kokoro calibration on first-ever launch using a quick inference.
 # Skipped if calibration data already exists. Takes ~150-250ms — imperceptible.
 def _run_kokoro_benchmark():
+    # Warm the ONNX session on EVERY launch so the user's first real generation
+    # isn't hit by cold-start latency (which otherwise blows the time estimate).
+    # Also seeds calibration the first time. Runs in a background thread.
     _BENCH_TEXT = "The quick brown fox jumps over the lazy dog today."
     try:
-        if load_calibration().get("words_per_second"):
-            return  # already calibrated
+        already = bool(load_calibration().get("words_per_second"))
         _t0 = time.time()
         kokoro.create(_BENCH_TEXT, voice="af_heart", speed=1.0)
-        record_calibration(len(_BENCH_TEXT.split()), time.time() - _t0, use_cb=False)
+        if not already:
+            record_calibration(len(_BENCH_TEXT.split()), time.time() - _t0, use_cb=False)
     except Exception:
         pass  # non-critical; never block startup
 
@@ -6101,7 +6248,7 @@ def _show_onboarding(on_done=None):
     win.bind("<Return>", lambda _: _dismiss())
 
 
-_run_kokoro_benchmark()
+threading.Thread(target=_run_kokoro_benchmark, daemon=True).start()
 
 # Load persisted history before splash so cards are ready when UI appears
 app.after(0, _load_history)
