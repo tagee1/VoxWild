@@ -3620,6 +3620,51 @@ _section_label(text_panel, "TEXT INPUT",
             "Long texts are automatically split into chunks and joined seamlessly. "
             "Use the Dialogue tab for multi-speaker scripts.")
 
+def _attach_context_menu(widget):
+    """Give a CTk textbox/entry a right-click Cut/Copy/Paste/Select All menu.
+    Paste fires the same <<Paste>> event as Ctrl+V, so existing paste handlers
+    (word count, auto-clean) still run. Built once per widget."""
+    inner   = getattr(widget, "_textbox", None) or getattr(widget, "_entry", None) or widget
+    is_text = hasattr(inner, "tag_add")   # Text widgets have tags; Entry widgets don't
+    menu = tk.Menu(inner, tearoff=0,
+                   bg=C_ELEVATED, fg=C_TXT,
+                   activebackground=C_ACCENT, activeforeground="#0d0d0d",
+                   bd=0, relief="flat")
+
+    def _emit(ev):
+        try: inner.event_generate(ev)
+        except Exception: pass
+
+    def _select_all():
+        try:
+            if is_text:
+                inner.tag_add("sel", "1.0", "end-1c")
+            else:
+                inner.select_range(0, "end")
+            inner.focus_set()
+        except Exception: pass
+
+    menu.add_command(label="Cut",   command=lambda: _emit("<<Cut>>"))
+    menu.add_command(label="Copy",  command=lambda: _emit("<<Copy>>"))
+    menu.add_command(label="Paste", command=lambda: _emit("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="Select All", command=_select_all)
+
+    def _popup(event):
+        try:
+            inner.focus_set()
+            if is_text:   # drop the caret where they clicked, so paste lands there
+                inner.mark_set("insert", "@%d,%d" % (event.x, event.y))
+        except Exception: pass
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    inner.bind("<Button-3>", _popup)
+    return menu
+
+
 text_input = ctk.CTkTextbox(
     text_panel,
     font=ctk.CTkFont(family="Segoe UI", size=13),
@@ -3645,6 +3690,7 @@ def _on_paste(e=None):
         app.after(20, _clean)
 
 text_input.bind("<<Paste>>", _on_paste)
+_attach_context_menu(text_input)
 
 word_count_label = ctk.CTkLabel(
     text_panel,
@@ -4748,6 +4794,7 @@ dlg_text = ctk.CTkTextbox(
     fg_color=C_ELEVATED, border_width=0, corner_radius=8,
     text_color=C_TXT)
 dlg_text.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+_attach_context_menu(dlg_text)
 dlg_text.insert("1.0",
     "NARRATOR: In the beginning, there was silence.\n"
     "ALICE: But silence never lasts forever.\n"
@@ -5440,6 +5487,7 @@ def _show_activation_modal(can_skip=True, remaining=0):
         placeholder_text="XXXX-XXXX-XXXX-XXXX",
         font=ctk.CTkFont(family="Segoe UI", size=13))
     key_entry.pack(pady=(4, 8))
+    _attach_context_menu(key_entry)
 
     # Pre-fill if there's a saved (unactivated) key
     saved_key = _lic.load_license().get("key") or ""
