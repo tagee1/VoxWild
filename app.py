@@ -1571,6 +1571,240 @@ def _make_history_card(parent, idx, entry):
 
     return outer
 
+# ══════════════════════════════════════════════════════════════════════════════
+# READ-ALONG HIGHLIGHTING — highlight text_input in time with playback.
+# Timing anchors to the entry's real per-chunk `segments`; offsets map to the
+# on-screen characters (the live textbox). Off by default; one voice at a time.
+# ══════════════════════════════════════════════════════════════════════════════
+_RA_BOUND = re.compile(r'[.!?…]+["”’\')\]]*(?=\s|$)|\n[ \t]*\n')
+_RA_WORD  = re.compile(r'\S+')
+_RA_ABBR  = {"mr","mrs","ms","dr","st","sr","jr","vs","etc","prof","gen","sen",
+             "rev","col","gov","lt","sgt","capt","fig","no","vol","dept"}
+
+def _ra_is_false_stop(text, dot_pos):
+    k = dot_pos
+    while k > 0 and (text[k-1].isalnum() or text[k-1] == "."):
+        k -= 1
+    word = text[k:dot_pos].lower().strip(".")
+    if word in _RA_ABBR:
+        return True
+    return len(word) == 1 and word.isalpha()
+
+def _ra_split_sentences(text):
+    """Return [(start, end, sentence_text)] with offsets into `text`."""
+    out, pos = [], 0
+    for m in _RA_BOUND.finditer(text):
+        end = m.end()
+        if m.group().rstrip()[:1] in ".!?…":
+            dot = m.start()
+            if text[dot] == "." and _ra_is_false_stop(text, dot):
+                continue
+        seg = text[pos:end]
+        s0 = pos + (len(seg) - len(seg.lstrip()))
+        s1 = pos + len(seg.rstrip())
+        if text[s0:s1].strip():
+            out.append((s0, s1, text[s0:s1]))
+        pos = end
+    if pos < len(text):
+        seg = text[pos:]
+        s0 = pos + (len(seg) - len(seg.lstrip()))
+        s1 = pos + len(seg.rstrip())
+        if text[s0:s1].strip():
+            out.append((s0, s1, text[s0:s1]))
+    if not out and text.strip():
+        s0 = len(text) - len(text.lstrip())
+        s1 = len(text.rstrip())
+        out.append((s0, s1, text[s0:s1]))
+    return out
+
+def _ra_offset_to_time(segments, duration):
+    """Return f(char_fraction 0..1) -> seconds, anchored to real chunk boundaries."""
+    anchors = [(0.0, 0.0)]
+    if segments:
+        stotal = sum(len(t) for _s, _e, t in segments) or 1
+        cum = 0
+        for _s, e, t in segments:
+            cum += len(t)
+            anchors.append((min(1.0, cum / stotal), float(e)))
+        if anchors[-1][0] < 1.0:
+            anchors.append((1.0, float(duration)))
+    else:
+        anchors.append((1.0, float(duration)))
+    def f(frac):
+        frac = 0.0 if frac < 0 else (1.0 if frac > 1 else frac)
+        for i in range(1, len(anchors)):
+            if frac <= anchors[i][0]:
+                f0, t0 = anchors[i-1]; f1, t1 = anchors[i]
+                if f1 == f0:
+                    return t1
+                return t0 + (t1 - t0) * (frac - f0) / (f1 - f0)
+        return anchors[-1][1]
+    return f
+
+def _ra_build(text, segments=None, duration=0.0):
+    """Build sentence/word timeline with char offsets into `text`."""
+    n = max(1, len(text))
+    f = _ra_offset_to_time(segments, duration)
+    sentences = []
+    for s0, s1, stext in _ra_split_sentences(text):
+        words = []
+        for m in _RA_WORD.finditer(text[s0:s1]):
+            w0, w1 = s0 + m.start(), s0 + m.end()
+            words.append({"start": w0, "end": w1, "t0": f(w0/n), "t1": f(w1/n)})
+        sentences.append({"start": s0, "end": s1, "t0": f(s0/n), "t1": f(s1/n),
+                          "words": words})
+    return {"duration": duration, "sentences": sentences}
+
+def _ra_active_index(items, t):
+    lo = -1
+    for i, it in enumerate(items):
+        if it["t0"] <= t:
+            lo = i
+        if it["t0"] <= t < it["t1"]:
+            return i
+    return lo
+
+# ── highlight controller (main-thread) ──
+_ra_play_entry = [None]
+_RA_INTERVAL = 40          # ms between highlight updates
+_RA_DIM_FG   = "#6f6a68"
+_RA_SENT_BG  = "#123a2b"
+_RA_SENT_FG  = "#f4efe7"
+_RA_WORD_FG  = "#04140d"
+_ra_state = {"active": False, "sents": None, "mode": "Sentence", "sr": 24000,
+             "last_i": -1, "last_w": -1, "gen": 0}
+
+def _ra_inner():
+    t = globals().get("text_input", None)
+    return getattr(t, "_textbox", None) if t is not None else None
+
+def _ra_idx(off):
+    return f"1.0 + {int(off)} chars"
+
+def _ra_setup_tags():
+    inner = _ra_inner()
+    if inner is None:
+        return
+    inner.tag_config("ra_dim",  foreground=_RA_DIM_FG)
+    inner.tag_config("ra_sent", foreground=_RA_SENT_FG, background=_RA_SENT_BG)
+    inner.tag_config("ra_word", foreground=_RA_WORD_FG, background=C_ACCENT)
+    inner.tag_add("ra_dim", "1.0", "end-1c")
+    inner.tag_raise("ra_sent"); inner.tag_raise("ra_word")
+
+def _ra_clear_tags():
+    inner = _ra_inner()
+    if inner is None:
+        return
+    for tg in ("ra_dim", "ra_sent", "ra_word"):
+        try: inner.tag_remove(tg, "1.0", "end")
+        except Exception: pass
+
+def _ra_paint(t):
+    inner = _ra_inner()
+    st = _ra_state
+    if inner is None or not st["sents"]:
+        return
+    sents = st["sents"]
+    i = _ra_active_index(sents, t)
+    if i < 0:
+        return
+    if st["mode"] == "Word":
+        words = sents[i]["words"]
+        wi = _ra_active_index(words, t) if words else -1
+        if i == st["last_i"] and wi == st["last_w"]:
+            return
+        st["last_i"], st["last_w"] = i, wi
+        inner.tag_remove("ra_word", "1.0", "end")
+        inner.tag_remove("ra_sent", "1.0", "end")
+        if wi >= 0:
+            w = words[wi]
+            inner.tag_add("ra_word", _ra_idx(w["start"]), _ra_idx(w["end"]))
+            try: inner.see(_ra_idx(w["start"]))
+            except Exception: pass
+    else:
+        if i == st["last_i"]:
+            return
+        st["last_i"] = i
+        s = sents[i]
+        inner.tag_remove("ra_sent", "1.0", "end")
+        inner.tag_add("ra_sent", _ra_idx(s["start"]), _ra_idx(s["end"]))
+        try: inner.see(_ra_idx(s["start"]))
+        except Exception: pass
+
+def _ra_tick(gen):
+    st = _ra_state
+    if gen != st["gen"] or not st["active"]:
+        return                            # a newer session (or stop) superseded this loop
+    if _play_start_time[0] is None:       # playback ended / stopped
+        _ra_stop(); return
+    try:
+        if _pause_pos[0] is not None:
+            t = _pause_pos[0] / (st["sr"] or 24000)
+        else:
+            t = time.time() - _play_start_time[0]
+        _ra_paint(t)
+    except Exception as e:
+        _log_crash(e)
+    app.after(_RA_INTERVAL, lambda: _ra_tick(gen))
+
+def _ra_maybe_start(entry):
+    _ra_stop()
+    try:
+        rv = globals().get("readalong_var")
+        if rv is None or not rv.get() or not entry:
+            return
+        txt = globals().get("text_input", None)
+        if txt is None:
+            return
+        disp = txt.get("1.0", "end-1c")
+        etext = entry.get("text") or ""
+        if not etext.strip() or disp.strip() != etext.strip():
+            return                        # box no longer shows this entry's text
+        sr = entry.get("sample_rate") or 24000
+        samples = entry.get("samples")
+        dur = (len(samples) / sr) if samples is not None and hasattr(samples, "__len__") else 0.0
+        if dur <= 0:
+            return
+        ra = _ra_build(disp, segments=entry.get("segments"), duration=dur)
+        mv = globals().get("readalong_mode_var")
+        _ra_state.update(active=True, sents=ra["sentences"], sr=sr,
+                         mode=(mv.get() if mv is not None else "Sentence"),
+                         last_i=-1, last_w=-1, gen=_ra_state["gen"] + 1)
+        _ra_setup_tags()
+        _g = _ra_state["gen"]
+        app.after(0, lambda: _ra_tick(_g))
+    except Exception as e:
+        _log_crash(e)
+
+def _ra_stop():
+    _ra_state["active"] = False
+    _ra_state["gen"] = _ra_state.get("gen", 0) + 1   # invalidate any running tick loop
+    _ra_state["last_i"] = -1
+    _ra_state["last_w"] = -1
+    _ra_clear_tags()
+
+def _ra_on_toggle():
+    rv = globals().get("readalong_var")
+    if rv is not None and rv.get():
+        if _play_start_time[0] is not None and _ra_play_entry[0] is not None:
+            _ra_maybe_start(_ra_play_entry[0])
+    else:
+        _ra_stop()
+
+def _ra_on_mode_change(*_):
+    mv = globals().get("readalong_mode_var")
+    _ra_state["mode"] = mv.get() if mv is not None else "Sentence"
+    _ra_state["last_i"] = -1
+    _ra_state["last_w"] = -1
+    inner = _ra_inner()
+    if inner is not None:
+        try:
+            inner.tag_remove("ra_sent", "1.0", "end")
+            inner.tag_remove("ra_word", "1.0", "end")
+        except Exception:
+            pass
+
+
 def _reset_play_btn():
     """Reset active play/pause/stop buttons to idle state. Call from main thread only."""
     play_btn = _active_play_btn[0]
@@ -1598,6 +1832,7 @@ def _reset_play_btn():
     _active_stop_btn[0]  = None
     _pause_pos[0]        = None
     _play_start_time[0]  = None
+    _ra_stop()
 
 def _toggle_history_playback(entry, btn, pause_btn=None, stop_btn=None):
     """Play a history entry. Stops any currently playing audio first."""
@@ -1664,6 +1899,8 @@ def _toggle_history_playback(entry, btn, pause_btn=None, stop_btn=None):
                 app.after(0, _reset_play_btn)
 
     threading.Thread(target=run, daemon=True).start()
+    _ra_play_entry[0] = entry
+    _ra_maybe_start(entry)
 
 def _history_stop(play_btn):
     """Stop playback if this card's play button is the active one."""
@@ -4004,6 +4241,27 @@ ctk.CTkButton(txt_btns, text="Dict",
 ctk.CTkButton(txt_btns, text="Clear", command=clear_text,
               width=54, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_DARK).pack(side="left")
+
+# Read-along highlighting (OFF by default) — lights up the text in time with playback
+readalong_var = ctk.BooleanVar(value=False)
+readalong_mode_var = ctk.StringVar(value="Sentence")
+ra_ctrl = ctk.CTkFrame(txt_btns, fg_color="transparent")
+ra_ctrl.pack(side="right")
+ra_mode_seg = ctk.CTkSegmentedButton(
+    ra_ctrl, values=["Sentence", "Word"], variable=readalong_mode_var,
+    width=138, height=26, font=ctk.CTkFont(family="Segoe UI", size=11),
+    command=lambda *_: _ra_on_mode_change())
+ra_mode_seg.pack(side="right", padx=(8, 0))
+readalong_switch = ctk.CTkSwitch(
+    ra_ctrl, text="Read-along", variable=readalong_var, command=_ra_on_toggle,
+    font=ctk.CTkFont(family="Segoe UI", size=12),
+    progress_color=C_ACCENT, text_color=C_TXT2,
+    switch_width=38, switch_height=18)
+readalong_switch.pack(side="right")
+_Tooltip(readalong_switch,
+    "Highlight the words as they're spoken during playback. Pick Sentence or Word. "
+    "Off by default — turn it on, then press Play on a clip in the history panel. "
+    "(The text box must still show that clip's text.)")
 
 # ── Voice + Engine panel ──────────────────────────────────────────────────────
 mid_panel = _panel(studio, 1)
