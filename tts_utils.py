@@ -81,7 +81,10 @@ def parse_dialogue(text):
         line = line.strip()
         if not line:
             continue
-        m = re.match(r'^([A-Z][A-Z0-9 _\-]*)\s*:\s*(.+)$', line)
+        # Speaker names need only START with a capital (Alex:, Dr Smith:) —
+        # no longer required to be ALL CAPS. Still capital-first to avoid matching
+        # lowercase prose like "note:" or "https:".
+        m = re.match(r'^([A-Z][A-Za-z0-9 _\-]*)\s*:\s*(.+)$', line)
         if m:
             result.append((m.group(1).strip(), m.group(2).strip()))
         elif result:
