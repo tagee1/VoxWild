@@ -2591,6 +2591,117 @@ def apply_enhancements(samples, sample_rate):
 
     return out
 
+# ══════════════════════════════════════════════════════════════════════════════
+# INLINE SPEECH TAGS — [pause]/[slow]/[loud]/[voice: X]/[spell]/… parsed into
+# spans (voice/speed/gain/transform) that generate_audio renders and stitches.
+# Recognized tags are consumed; unrecognized [..] stays as literal text. Fast mode.
+# ══════════════════════════════════════════════════════════════════════════════
+_TAG_RE = re.compile(r'\[[^\[\]]*\]')
+_TAG_SLOW, _TAG_FAST = 0.75, 1.4
+_TAG_LOUD, _TAG_QUIET = 1.5, 0.5
+
+# friendly first-name -> voice id, e.g. "george" -> "bm_george"
+_VOICE_BY_NAME = {}
+for _lbl, _vid in VOICES.items():
+    _nm = _lbl.split(" - ")[-1].split(" (")[0].strip().lower()
+    if _nm:
+        _VOICE_BY_NAME[_nm] = _vid
+
+def _tag_spell(t, digits_only=False):
+    out = []
+    for ch in t:
+        if ch.isspace():
+            out.append(' ')
+        elif ch.isdigit():
+            out.append(ch + '. ')
+        elif ch.isalpha() and not digits_only:
+            out.append(ch.upper() + '. ')
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+def _tag_is_recognized(tag):
+    t = tag[1:-1].strip().lower()
+    if re.match(r'(pause|break)\b\s*(\d+(\.\d+)?)?\s*(ms|s)?$', t): return True
+    if re.match(r'/?(slow|fast|loud|quiet|spell|digits|voice|rate|volume)$', t): return True
+    if re.match(r'(rate|volume)\s+\d+(\.\d+)?$', t): return True
+    if re.match(r'voice\s*:\s*\S', t): return True
+    return False
+
+def strip_speech_tags(text):
+    """Remove recognized tags (leaving unrecognized brackets) — for engines that
+    can't apply them (Natural mode)."""
+    return _TAG_RE.sub(lambda m: ' ' if _tag_is_recognized(m.group()) else m.group(), text)
+
+def parse_speech_tags(text, base_voice, base_speed):
+    """Return (spans, used_effect). spans: {"kind":"text","text","voice","speed","gain"}
+    or {"kind":"pause","seconds"}. Stack-based open/close; unrecognized [..] left literal."""
+    speed_stack, gain_stack, voice_stack, xform_stack = [], [], [], []
+    spans, run, used = [], [], [False]
+    def cur_speed():
+        f = speed_stack[-1] if speed_stack else 1.0
+        return max(0.5, min(2.0, base_speed * f))
+    def cur_gain():  return gain_stack[-1] if gain_stack else 1.0
+    def cur_voice(): return voice_stack[-1] if voice_stack else base_voice
+    def cur_x():     return xform_stack[-1] if xform_stack else None
+    def flush():
+        if not run: return
+        t = ''.join(run); run.clear()
+        if not t.strip(): return
+        x = cur_x()
+        if x == 'spell':    t = _tag_spell(t)
+        elif x == 'digits': t = _tag_spell(t, digits_only=True)
+        spans.append({"kind": "text", "text": t, "voice": cur_voice(),
+                      "speed": cur_speed(), "gain": cur_gain()})
+    pos = 0
+    for m in _TAG_RE.finditer(text):
+        run.append(text[pos:m.start()])
+        raw = m.group()[1:-1].strip()
+        low = raw.lower()
+        handled = True
+        if re.match(r'(pause|break)\b\s*(\d+(?:\.\d+)?)?\s*(ms|s)?$', low):
+            flush()
+            mm = re.match(r'(?:pause|break)\s*(\d+(?:\.\d+)?)\s*(ms|s)?$', low)
+            secs = float(mm.group(1)) / (1000.0 if mm and mm.group(2) == 'ms' else 1.0) if mm else 0.5
+            spans.append({"kind": "pause", "seconds": max(0.0, min(30.0, secs))})
+            used[0] = True
+        elif low.startswith('/'):
+            nm = low[1:].strip()
+            if nm in ('slow', 'fast', 'rate', 'loud', 'quiet', 'volume', 'voice', 'spell', 'digits'):
+                flush()
+                if nm in ('slow', 'fast', 'rate') and speed_stack: speed_stack.pop()
+                elif nm in ('loud', 'quiet', 'volume') and gain_stack: gain_stack.pop()
+                elif nm == 'voice' and voice_stack: voice_stack.pop()
+                elif nm in ('spell', 'digits') and xform_stack: xform_stack.pop()
+            else:
+                handled = False
+        elif low == 'slow':   flush(); speed_stack.append(_TAG_SLOW); used[0] = True
+        elif low == 'fast':   flush(); speed_stack.append(_TAG_FAST); used[0] = True
+        elif low == 'loud':   flush(); gain_stack.append(_TAG_LOUD); used[0] = True
+        elif low == 'quiet':  flush(); gain_stack.append(_TAG_QUIET); used[0] = True
+        elif low == 'spell':  flush(); xform_stack.append('spell'); used[0] = True
+        elif low == 'digits': flush(); xform_stack.append('digits'); used[0] = True
+        else:
+            rm = re.match(r'(rate|volume)\s+(\d+(?:\.\d+)?)$', low)
+            vm = re.match(r'voice\s*:\s*(\S.*)$', raw, re.I)
+            if rm:
+                flush()
+                v = float(rm.group(2))
+                (speed_stack if rm.group(1) == 'rate' else gain_stack).append(v)
+                used[0] = True
+            elif vm:
+                flush()
+                voice_stack.append(_VOICE_BY_NAME.get(vm.group(1).strip().lower(), base_voice))
+                used[0] = True
+            else:
+                handled = False
+        if not handled:
+            run.append(m.group())
+        pos = m.end()
+    run.append(text[pos:]); flush()
+    return spans, used[0]
+
+
 def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95)):
     """Generate audio for text.
     progress_range: (lo, hi) — smooth bar target is scaled within this window.
@@ -2602,6 +2713,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
 
     if use_chatterbox:
         # ── Chatterbox path ────────────────────────────────────────────────────
+        text = strip_speech_tags(text)   # inline tags are a Fast-mode feature
         if not chatterbox_engine.is_ready:
             if status_cb: status_cb("Waiting for Natural mode to finish loading...")
             chatterbox_engine.start(status_cb=status_cb)
@@ -2631,18 +2743,43 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
             sample_rate = sr
             smooth.segment_done(i)
     else:
-        # ── Kokoro path ────────────────────────────────────────────────────────
-        chunks = chunk_text(text)
-        all_samples, sample_rate = [], None
-        smooth.begin_segments([len(c) for c in chunks])
-        for i, chunk in enumerate(chunks):
+        # ── Kokoro path (with inline speech tags) ───────────────────────────────
+        spans, _tag_used = parse_speech_tags(text, voice, speed)
+        units = []
+        for _sp in spans:
+            if _sp["kind"] == "pause":
+                units.append(_sp)
+            else:
+                for _sub in chunk_text(_sp["text"]):
+                    units.append({"kind": "text", "text": _sub, "voice": _sp["voice"],
+                                  "speed": _sp["speed"], "gain": _sp["gain"]})
+        if not units:
+            units = [{"kind": "text", "text": text, "voice": voice, "speed": speed, "gain": 1.0}]
+        chunks, all_samples, sample_rate, _used_gain = [], [], None, False
+        smooth.begin_segments([max(1, len(u.get("text", "")) or 1) for u in units])
+        for i, u in enumerate(units):
             if _cancel_event.is_set():
                 raise GenerationCancelled()
-            if status_cb: status_cb(f"⏳ Generating chunk {i+1}/{len(chunks)}...")
-            samples, sr = kokoro.create(chunk, voice=voice, speed=speed, lang=lang_for_voice(voice))
-            all_samples.append(samples)
-            sample_rate = sr
+            if u["kind"] == "pause":
+                all_samples.append(np.zeros(int(u["seconds"] * 24000), dtype=np.float32))
+                chunks.append("")
+                sample_rate = sample_rate or 24000
+            else:
+                if status_cb: status_cb(f"⏳ Generating chunk {i+1}/{len(units)}...")
+                samples, sr = kokoro.create(u["text"], voice=u["voice"], speed=u["speed"],
+                                            lang=lang_for_voice(u["voice"]))
+                samples = np.asarray(samples, dtype=np.float32) * u["gain"]
+                if abs(u["gain"] - 1.0) > 1e-6:
+                    _used_gain = True
+                all_samples.append(samples)
+                chunks.append(u["text"])
+                sample_rate = sr
             smooth.segment_done(i)
+        if _used_gain:                       # scale down so gains never clip; keep dynamics
+            _peak = max((float(np.max(np.abs(s))) for s in all_samples if len(s)), default=0.0)
+            if _peak > 0.97:
+                _f = 0.97 / _peak
+                all_samples = [s * _f for s in all_samples]
 
     # Build per-chunk timings (before trim/enhance) for SRT
     chunk_timings = []
@@ -4188,6 +4325,49 @@ def _attach_context_menu(widget):
     return menu
 
 
+# ── Inline speech tags: insert-toolbar + '[' menu data ──
+_TAG_VOICES = []
+for _lbl in VOICES:
+    _nm = _lbl.split(" - ")[-1].split(" (")[0].strip()
+    _flag = _lbl.split(" ")[0]
+    _TAG_VOICES.append((_nm, _flag))
+_TAG_ITEMS = [
+    {"label": "⏸  Pause",        "snip": "[pause ⟨1⟩s]",       "kw": "pause break wait beat"},
+    {"label": "🐢  Slow down",    "snip": "[slow]‸[/slow]",     "kw": "slow slower drama"},
+    {"label": "🐇  Speed up",     "snip": "[fast]‸[/fast]",     "kw": "fast faster hurry"},
+    {"label": "🎚  Rate (exact)", "snip": "[rate 0.8]‸[/rate]", "kw": "rate speed exact tempo pace"},
+    {"label": "🔊  Louder",       "snip": "[loud]‸[/loud]",     "kw": "loud louder volume punch"},
+    {"label": "🔉  Quieter",      "snip": "[quiet]‸[/quiet]",   "kw": "quiet quieter soft volume aside"},
+    {"label": "🔤  Spell out",    "snip": "[spell]‸[/spell]",   "kw": "spell letters code acronym reference"},
+    {"label": "🔢  Say digits",   "snip": "[digits]‸[/digits]", "kw": "digits numbers phone code"},
+] + [
+    {"label": f"{_f}  Voice: {_n}", "snip": f"[voice: {_n}]‸[/voice]", "kw": f"voice narrator switch {_n}"}
+    for _n, _f in _TAG_VOICES
+]
+_TAG_BUTTONS = [
+    ("⏸", "Pause",  "[pause ⟨1⟩s]",             "Insert a pause — type the length after it drops in"),
+    ("🐢", "Slow",  "[slow]‸[/slow]",           "Slow the selected / following words down"),
+    ("🐇", "Fast",  "[fast]‸[/fast]",           "Speed the selected / following words up"),
+    ("🔊", "Loud",  "[loud]‸[/loud]",           "Make the selected / following words louder"),
+    ("🔉", "Quiet", "[quiet]‸[/quiet]",         "Make the selected / following words softer"),
+    ("🎙", "Voice", "[voice: George]‸[/voice]", "Switch narrator — edit the name, or use the [ menu for all voices"),
+]
+tags_bar = ctk.CTkFrame(text_panel, fg_color="transparent")
+tags_bar.pack(fill="x", padx=14, pady=(0, 4))
+ctk.CTkLabel(tags_bar, text="Insert tag:", font=ctk.CTkFont(family="Segoe UI", size=11),
+             text_color=C_TXT3).pack(side="left", padx=(0, 4))
+for _ic, _lb, _snip, _tip in _TAG_BUTTONS:
+    _tb = ctk.CTkButton(tags_bar, text=_ic, width=34, height=26,
+                        command=lambda s=_snip: _tag_insert_snippet(s, from_bracket=False),
+                        font=ctk.CTkFont(family="Segoe UI", size=13), **BTN_GHOST)
+    _tb.pack(side="left", padx=2)
+    _Tooltip(_tb, f"{_lb} — {_tip}")
+ctk.CTkButton(tags_bar, text="?  Tag guide", width=1, height=26,
+              command=lambda: _tag_show_guide(),
+              font=ctk.CTkFont(family="Segoe UI", size=11), **BTN_DARK).pack(side="right")
+ctk.CTkLabel(tags_bar, text="type  [  for the menu",
+             font=ctk.CTkFont(family="Segoe UI", size=10), text_color=C_TXT3).pack(side="right", padx=8)
+
 text_input = ctk.CTkTextbox(
     text_panel,
     font=ctk.CTkFont(family="Segoe UI", size=13),
@@ -4214,6 +4394,232 @@ def _on_paste(e=None):
 
 text_input.bind("<<Paste>>", _on_paste)
 _attach_context_menu(text_input)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Inline speech tags — live green/orange coloring + a '[' autocomplete menu that
+# appears at the caret (filter, arrow/enter/click), plus snippet insertion.
+# ══════════════════════════════════════════════════════════════════════════════
+_tag_inner = text_input._textbox            # underlying tk.Text
+_tag_inner.tag_config("tag_ok",  foreground=C_ACCENT)
+_tag_inner.tag_config("tag_bad", foreground="#f0a35e")
+_tagmenu = {"win": None, "list": None, "items": []}
+
+def _tag_recolor(*_):
+    try:
+        inner = _tag_inner
+        inner.tag_remove("tag_ok", "1.0", "end")
+        inner.tag_remove("tag_bad", "1.0", "end")
+        txt = inner.get("1.0", "end-1c")
+        for m in _TAG_RE.finditer(txt):
+            name = "tag_ok" if _tag_is_recognized(m.group()) else "tag_bad"
+            inner.tag_add(name, f"1.0 + {m.start()} chars", f"1.0 + {m.end()} chars")
+    except Exception:
+        pass
+
+def _tag_menu_hide():
+    if _tagmenu["win"] is not None:
+        try: _tagmenu["win"].destroy()
+        except Exception: pass
+        _tagmenu["win"] = None
+        _tagmenu["list"] = None
+
+def _tag_ctx():
+    """Return the query string after an open '[' at the caret, else None."""
+    try:
+        inner = _tag_inner
+        if inner.tag_ranges("sel"):
+            return None
+        before = inner.get("1.0", "insert")
+        br = before.rfind("[")
+        if br < 0:
+            return None
+        between = before[br + 1:]
+        if "]" in between or "[" in between or len(between) > 24:
+            return None
+        after = inner.get("insert", "end-1c")
+        nclose, nopen = after.find("]"), after.find("[")
+        if nclose != -1 and (nopen == -1 or nclose < nopen):
+            return None                      # caret is inside an already-closed tag
+        return between
+    except Exception:
+        return None
+
+def _tag_filter(query):
+    toks = query.strip().lower().split()
+    out = []
+    for it in _TAG_ITEMS:
+        words = re.split(r"[^a-z0-9]+", (it["label"] + " " + it["kw"]).lower())
+        if all(any(w.startswith(t) for w in words if w) for t in toks):
+            out.append(it)
+    return out
+
+def _tag_menu_show(query):
+    try:
+        items = _tag_filter(query)
+        if not items:
+            _tag_menu_hide(); return
+        inner = _tag_inner
+        box = inner.bbox("insert")
+        if not box:
+            _tag_menu_hide(); return
+        x, y, _w, h = box
+        sx = inner.winfo_rootx() + x
+        sy = inner.winfo_rooty() + y + h + 3
+        if _tagmenu["win"] is None:
+            win = tk.Toplevel(app)
+            win.wm_overrideredirect(True)
+            try: win.attributes("-topmost", True)
+            except Exception: pass
+            win.configure(bg=C_BORDER)
+            lb = tk.Listbox(win, activestyle="none", exportselection=False,
+                            bg=C_ELEVATED, fg=C_TXT,
+                            selectbackground=C_ACCENT_D, selectforeground=C_TXT,
+                            highlightthickness=0, bd=0, relief="flat",
+                            font=("Segoe UI", 11), width=24)
+            lb.pack(padx=1, pady=1)
+            lb.bind("<ButtonRelease-1>", lambda e: _tag_menu_choose())
+            _tagmenu["win"], _tagmenu["list"] = win, lb
+        lb = _tagmenu["list"]
+        lb.delete(0, "end")
+        for it in items:
+            lb.insert("end", " " + it["label"])
+        lb.configure(height=min(9, len(items)))
+        lb.selection_clear(0, "end"); lb.selection_set(0); lb.activate(0)
+        _tagmenu["items"] = items
+        _tagmenu["win"].geometry(f"+{sx}+{sy}")
+        _tagmenu["win"].deiconify(); _tagmenu["win"].lift()
+    except Exception:
+        _tag_menu_hide()
+
+def _tag_menu_move(delta):
+    lb = _tagmenu["list"]
+    if not lb or not lb.size():
+        return
+    cur = lb.curselection()
+    i = max(0, min(lb.size() - 1, (cur[0] if cur else 0) + delta))
+    lb.selection_clear(0, "end"); lb.selection_set(i); lb.activate(i); lb.see(i)
+
+def _tag_menu_choose():
+    lb, items = _tagmenu["list"], _tagmenu["items"]
+    if lb and items:
+        cur = lb.curselection()
+        i = cur[0] if cur else 0
+        if 0 <= i < len(items):
+            _tag_insert_snippet(items[i]["snip"], from_bracket=True)
+    _tag_menu_hide()
+
+def _tag_insert_snippet(snip, from_bracket=False):
+    """Insert a tag snippet into text_input. ⟨x⟩ pre-selects x; ‸ is caret/wrap point."""
+    try:
+        inner = _tag_inner
+        if from_bracket:
+            before = inner.get("1.0", "insert")
+            br = before.rfind("[")
+            if br < 0:
+                return
+            start = inner.index(f"insert - {len(before) - br} chars")
+            end = inner.index("insert")
+            sel_text = ""
+        elif inner.tag_ranges("sel"):
+            start, end = inner.index("sel.first"), inner.index("sel.last")
+            sel_text = inner.get(start, end)
+        else:
+            start = end = inner.index("insert")
+            sel_text = ""
+        ph = snip.find("⟨")
+        if ph >= 0:
+            b = snip.find("⟩"); val = snip[ph + 1:b]
+            body = snip[:ph] + val + snip[b + 1:]
+            sf, st = ph, ph + len(val)
+        else:
+            mk = snip.find("‸")
+            if mk >= 0:
+                body = snip[:mk] + sel_text + snip[mk + 1:]
+                sf = st = mk + len(sel_text)
+            else:
+                body, sf, st = snip, len(snip), len(snip)
+        inner.delete(start, end)
+        inner.insert(start, body)
+        cf = inner.index(f"{start} + {sf} chars")
+        ct = inner.index(f"{start} + {st} chars")
+        inner.tag_remove("sel", "1.0", "end")
+        if sf != st:
+            inner.tag_add("sel", cf, ct)
+        inner.mark_set("insert", ct if sf != st else cf)
+        inner.focus_set()
+        _tag_recolor()
+        try: update_word_count()
+        except Exception: pass
+    except Exception:
+        pass
+
+def _tag_on_keyrelease(e=None):
+    if e is not None and e.keysym in ("Up", "Down", "Return", "Tab", "Escape", "Left", "Right"):
+        return
+    _tag_recolor()
+    ctx = _tag_ctx()
+    if ctx is not None:
+        _tag_menu_show(ctx)
+    else:
+        _tag_menu_hide()
+
+def _tag_key_nav(e):
+    if _tagmenu["win"] is None:
+        return None
+    k = e.keysym
+    if k == "Down":  _tag_menu_move(1);  return "break"
+    if k == "Up":    _tag_menu_move(-1); return "break"
+    if k in ("Return", "Tab"): _tag_menu_choose(); return "break"
+    if k == "Escape": _tag_menu_hide(); return "break"
+    return None
+
+_tag_inner.bind("<KeyRelease>", _tag_on_keyrelease, add="+")
+_tag_inner.bind("<Down>",   _tag_key_nav, add="+")
+_tag_inner.bind("<Up>",     _tag_key_nav, add="+")
+_tag_inner.bind("<Return>", _tag_key_nav, add="+")
+_tag_inner.bind("<Tab>",    _tag_key_nav, add="+")
+_tag_inner.bind("<Escape>", _tag_key_nav, add="+")
+_tag_inner.bind("<FocusOut>", lambda e: app.after(150, _tag_menu_hide), add="+")
+_tag_inner.bind("<Button-1>", lambda e: _tag_menu_hide(), add="+")
+
+def _tag_show_guide():
+    win = ctk.CTkToplevel(app)
+    win.title("Speech tags")
+    _center_window(win, 470, 480)
+    win.configure(fg_color=C_BG)
+    win.transient(app)
+    try: win.grab_set()
+    except Exception: pass
+    ctk.CTkLabel(win, text="Inline speech tags",
+                 font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+                 text_color=C_TXT).pack(anchor="w", padx=20, pady=(18, 2))
+    ctk.CTkLabel(win, text="Type these right in your text. Paired tags turn an effect on, then "
+                 "a closing /tag turns it off. The toolbar buttons and the [ menu insert them for you.",
+                 font=ctk.CTkFont(family="Segoe UI", size=11), text_color=C_TXT2,
+                 wraplength=430, justify="left").pack(anchor="w", padx=20, pady=(0, 8))
+    _rows = [
+        ("[pause 1s]", "A pause — also [pause 500ms] or [break]. No closing tag needed."),
+        ("[slow] … [/slow]", "Slow the wrapped words down."),
+        ("[fast] … [/fast]", "Speed the wrapped words up."),
+        ("[rate 0.8] … [/rate]", "Exact speed — below 1 is slower, above 1 is faster."),
+        ("[loud] … [/loud]", "Make a stretch louder."),
+        ("[quiet] … [/quiet]", "Make a stretch softer."),
+        ("[spell]R4T9[/spell]", "Read characters one by one — codes, references."),
+        ("[digits]1984[/digits]", "Read a number one digit at a time."),
+        ("[voice: Emma] … [/voice]", "Switch narrator, then back. Any built-in voice name."),
+    ]
+    body = ctk.CTkScrollableFrame(win, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+    for _code, _desc in _rows:
+        r = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=8)
+        r.pack(fill="x", pady=3)
+        ctk.CTkLabel(r, text=_code, font=ctk.CTkFont(family="Consolas", size=12),
+                     text_color=C_ACCENT, anchor="w").pack(anchor="w", padx=12, pady=(7, 0))
+        ctk.CTkLabel(r, text=_desc, font=ctk.CTkFont(family="Segoe UI", size=11),
+                     text_color=C_TXT2, anchor="w", justify="left",
+                     wraplength=400).pack(anchor="w", padx=12, pady=(0, 8))
+
+_tag_recolor()
 
 word_count_label = ctk.CTkLabel(
     text_panel,
