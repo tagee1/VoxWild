@@ -792,6 +792,27 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
     import zipfile
     import glob as _glob
     import tempfile
+    import ssl
+    import shutil
+
+    # Frozen PyInstaller apps have no access to the system CA store, so default
+    # HTTPS verification fails with CERTIFICATE_VERIFY_FAILED — which urllib
+    # reports as a URLError and looks like "no internet". Hand urllib certifi's
+    # bundled CA file, the same fix used for the license/update HTTPS calls.
+    try:
+        import certifi
+        _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        _ssl_ctx = ssl.create_default_context()
+
+    def _download(url, dest):
+        """Stream a URL to a file over HTTPS using the certifi CA context.
+        (urllib.request.urlretrieve accepts no ssl context, so we can't use it
+        in the frozen app.)"""
+        req = urllib.request.Request(url, headers={"User-Agent": "VoxWild-setup"})
+        with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx) as resp, \
+                open(dest, "wb") as out:
+            shutil.copyfileobj(resp, out)
 
     python_dir = ChatterboxEngine._CB_PYTHON_DIR
     python_exe = ChatterboxEngine._PYTHON_USER
@@ -803,7 +824,7 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
         zip_tmp = os.path.join(tempfile.gettempdir(), "tts_python_embed.zip")
         try:
             os.makedirs(python_dir, exist_ok=True)
-            urllib.request.urlretrieve(py_url, zip_tmp)
+            _download(py_url, zip_tmp)
         except urllib.error.URLError as e:
             on_failure(f"Could not download Python — check your internet connection.\n({e})")
             return
@@ -840,7 +861,7 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
         get_pip_url = "https://bootstrap.pypa.io/get-pip.py"
         get_pip_tmp = os.path.join(tempfile.gettempdir(), "tts_get_pip.py")
         try:
-            urllib.request.urlretrieve(get_pip_url, get_pip_tmp)
+            _download(get_pip_url, get_pip_tmp)
         except urllib.error.URLError as e:
             on_failure(f"Could not download pip installer — check your internet connection.\n({e})")
             return
