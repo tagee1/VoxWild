@@ -115,6 +115,22 @@ def emit(obj):
     _proto_bin.write(line.encode("utf-8"))
     _proto_bin.flush()
 
+# The only files load_model_from_local() below actually reads.
+#
+# snapshot_download() with no allow_patterns fetches the ENTIRE repo — ~12.9 GB
+# as of 2026-08, because ResembleAI ship every checkpoint in both .pt and
+# .safetensors form plus multilingual variants (t3_23lang, t3_mtl23ls_v2/v3,
+# s3gen_v3) that this app never loads. Restricting to these five keeps the
+# download at ~3 GB, which is what the setup dialog promises the user.
+MODEL_FILES = [
+    "ve.safetensors",
+    "t3_cfg.safetensors",
+    "s3gen.safetensors",
+    "tokenizer.json",
+    "conds.pt",
+]
+
+
 def load_model_from_local(local_dir):
     """Load Chatterbox model step-by-step from local cache with progress messages."""
     from pathlib import Path
@@ -372,11 +388,13 @@ def main():
 
     try:
         # ── HTTP timeout patch ───────────────────────────────────────────────
-        # HuggingFace's downloader uses requests with no default timeout.
-        # If the connection stalls mid-download, the process hangs forever.
-        # Monkey-patch requests.Session.send to enforce a 120s timeout on
-        # any stalled read — the download will raise an exception instead
-        # of hanging, and our retry loop will resume where it left off.
+        # If the connection stalls mid-download, the process can hang for a
+        # very long time. Enforce a read timeout so a stalled transfer raises
+        # instead of hanging, and our retry loop resumes where it left off.
+        #
+        # huggingface_hub >= 1.0 uses httpx, NOT requests — patching only
+        # requests.Session.send silently does nothing on those versions.
+        # Patch both so this works regardless of which one is in use.
         try:
             import requests as _req
             _orig_send = _req.Session.send
@@ -385,14 +403,32 @@ def main():
                 return _orig_send(self, request, **kwargs)
             _req.Session.send = _timeout_send
         except Exception:
-            pass  # if requests isn't available, we still proceed without timeout
+            pass  # requests not present — fine, httpx patch below may still apply
+
+        try:
+            import httpx as _httpx
+            # Generous read/write windows so genuinely slow (but progressing)
+            # connections aren't killed mid-chunk; short connect so a dead
+            # endpoint fails fast. httpx's default is 5s for everything.
+            _DL_TIMEOUT = _httpx.Timeout(connect=30.0, read=120.0,
+                                         write=120.0, pool=30.0)
+            _orig_client_init = _httpx.Client.__init__
+            def _client_init(self, *a, **kw):
+                if kw.get("timeout") is None:
+                    kw["timeout"] = _DL_TIMEOUT
+                return _orig_client_init(self, *a, **kw)
+            _httpx.Client.__init__ = _client_init
+        except Exception:
+            pass  # httpx not present — we still proceed without the patch
 
         import torchaudio
         from chatterbox.tts import ChatterboxTTS
 
         try:
             from huggingface_hub import snapshot_download
-            local_dir = snapshot_download("ResembleAI/chatterbox", local_files_only=True)
+            local_dir = snapshot_download("ResembleAI/chatterbox",
+                                          allow_patterns=MODEL_FILES,
+                                          local_files_only=True)
             model = load_model_from_local(local_dir)
         except Exception:
             # ── Download with retry + heartbeat ──────────────────────────────
@@ -433,7 +469,9 @@ def main():
                     emit({"type": "status",
                           "msg": f"Downloading Chatterbox model (~3 GB, first run only)... "
                                  f"attempt {attempt}/{MAX_RETRIES}"})
-                    local_dir = _snap_dl("ResembleAI/chatterbox", resume_download=True)
+                    local_dir = _snap_dl("ResembleAI/chatterbox",
+                                         allow_patterns=MODEL_FILES,
+                                         resume_download=True)
                     _stop_heartbeat.set()
                     hb.join(timeout=2)
                     model = load_model_from_local(local_dir)
