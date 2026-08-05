@@ -74,6 +74,35 @@ def _res(relative_path):
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, relative_path)
 
+
+def _ensure_msvc_runtime(python_dir):
+    """Put the MSVC C++ runtime next to the embedded Python interpreter.
+
+    PyTorch links against MSVCP140.dll but does not ship it, and the Python
+    embeddable package only bundles VCRUNTIME140. On a machine without the
+    Visual C++ Redistributable -- which a clean Windows install does not have --
+    importing torch fails with WinError 126 on torch/lib/c10.dll.
+
+    We already ship these DLLs with the app, so copy them beside python.exe,
+    which is first in that process's DLL search order.
+
+    Called on every worker start rather than only during setup: an environment
+    installed by an earlier build is missing them, and setup never runs again
+    for those users because _cb_env_exists() already reports the env as present.
+    """
+    try:
+        if not os.path.isdir(python_dir):
+            return
+        import shutil as _sh
+        for _dll in ("msvcp140.dll", "msvcp140_1.dll"):
+            _src = _res(_dll)
+            _dst = os.path.join(python_dir, _dll)
+            if os.path.exists(_src) and not os.path.exists(_dst):
+                _sh.copy2(_src, _dst)
+    except Exception:
+        pass  # non-fatal -- machines with the VC++ Redistributable already have these
+
+
 # ── In-memory caches (eliminates repeated disk reads in hot paths) ────────────
 _settings_cache     = None
 _calibration_cache  = None
@@ -485,6 +514,7 @@ class ChatterboxEngine:
             # worker subprocess loads them. Without this, the frozen app's
             # stripped PATH causes "Could not find module" OSErrors.
             python_dir  = os.path.dirname(self.PYTHON)
+            _ensure_msvc_runtime(python_dir)
             scripts_dir = os.path.join(python_dir, "Scripts")
             env = os.environ.copy()
             env["PATH"] = (
@@ -650,6 +680,7 @@ class EnhanceEngine:
                 )
 
             python_dir  = os.path.dirname(self.PYTHON)
+            _ensure_msvc_runtime(python_dir)
             scripts_dir = os.path.join(python_dir, "Scripts")
             env = os.environ.copy()
             env["PATH"] = (
@@ -853,6 +884,12 @@ def _run_chatterbox_setup(update_status, on_success, on_failure):
         except Exception as e:
             on_failure(f"Failed to configure Python environment: {e}")
             return
+
+    # ── Step 1b: MSVC C++ runtime for the embedded Python ────────────────────
+    # See _ensure_msvc_runtime(). This is belt-and-braces for a fresh install —
+    # the same call runs on every worker start, which is what actually covers
+    # users whose environment was created by an earlier build.
+    _ensure_msvc_runtime(python_dir)
 
     # ── Step 2: bootstrap pip ─────────────────────────────────────────────────
     pip_exe = os.path.join(python_dir, "Scripts", "pip.exe")
