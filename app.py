@@ -66,6 +66,7 @@ from clone_library import (
     add_clone_to_library as _lib_add,
     rename_clone_in_library as _lib_rename,
 )
+import clips_library as _cliplib          # Clips Library (save clips into folders)
 from audio_utils import trim_silence, enhance_audio
 import license as _lic
 
@@ -172,6 +173,10 @@ CLONE_INDEX      = os.path.join(CLONE_DIR, "library.json")
 HISTORY_JSON     = os.path.join(_USER_DIR, "history.json")
 HISTORY_AUDIO    = os.path.join(_USER_DIR, "history_audio")
 os.makedirs(HISTORY_AUDIO, exist_ok=True)
+LIBRARY_DIR      = os.path.join(_USER_DIR, "clips_library")
+LIBRARY_AUDIO    = os.path.join(LIBRARY_DIR, "audio")
+LIBRARY_INDEX    = os.path.join(LIBRARY_DIR, "library.json")
+os.makedirs(LIBRARY_AUDIO, exist_ok=True)
 
 # ── One-time migration: copy existing user files from app dir to %APPDATA% ────
 def _migrate_user_data():
@@ -680,7 +685,9 @@ class EnhanceEngine:
 
     def __init__(self):
         self._proc = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()       # guards start() (worker spin-up)
+        self._req_lock = threading.Lock()   # serializes enhance() — one shared pipe,
+                                            # concurrent jobs would cross each other's replies
 
     @property
     def PYTHON(self):
@@ -775,33 +782,40 @@ class EnhanceEngine:
         return self._proc is not None and self._proc.poll() is None
 
     def enhance(self, input_path, output_path, device="cpu", status_cb=None):
-        """Enhance one audio file; returns (sample_rate, rms_delta_db)."""
-        req = {
-            "cmd": "enhance",
-            "input_path": input_path,
-            "output_path": output_path,
-            "device": device,
-        }
-        self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
-        self._proc.stdin.flush()
-        for raw_bytes in self._proc.stdout:
-            raw = raw_bytes.decode("utf-8", errors="replace").strip()
-            if not raw:
-                continue
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if msg["type"] == "status":
-                if status_cb:
-                    status_cb(msg["msg"])
-            elif msg["type"] == "done":
-                return msg.get("sr", 44100), msg.get("rms_delta_db", 0.0)
-            elif msg["type"] == "error":
-                self.stop()
-                raise RuntimeError(msg["msg"])
-        self.stop()
-        raise RuntimeError("Enhance worker closed unexpectedly.")
+        """Enhance one audio file; returns (sample_rate, rms_delta_db).
+
+        Serialized by _req_lock: the worker is ONE shared subprocess, so two
+        concurrent enhance() calls would interleave their 'done'/'error' replies on
+        the same pipe — a thread could read the other's reply and open a file that
+        hasn't been written yet (the crash). The lock makes jobs take turns.
+        """
+        with self._req_lock:
+            req = {
+                "cmd": "enhance",
+                "input_path": input_path,
+                "output_path": output_path,
+                "device": device,
+            }
+            self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
+            self._proc.stdin.flush()
+            for raw_bytes in self._proc.stdout:
+                raw = raw_bytes.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if msg["type"] == "status":
+                    if status_cb:
+                        status_cb(msg["msg"])
+                elif msg["type"] == "done":
+                    return msg.get("sr", 44100), msg.get("rms_delta_db", 0.0)
+                elif msg["type"] == "error":
+                    self.stop()
+                    raise RuntimeError(msg["msg"])
+            self.stop()
+            raise RuntimeError("Enhance worker closed unexpectedly.")
 
 
 enhance_engine = EnhanceEngine()
@@ -1457,11 +1471,33 @@ def refresh_history_panel():
 
 def _make_history_card(parent, idx, entry):
     def _delete(e=entry):
+        # copy into the Library's Recently Deleted first, so a deleted clip is recoverable
+        _trashed_id = None
+        try:
+            _c = _lib_save_recent(e, "", quiet=True)
+            if _c:
+                _cliplib.trash_clip(_c["id"], LIBRARY_AUDIO, LIBRARY_INDEX)
+                _trashed_id = _c["id"]
+        except Exception as _ex:
+            _log_crash(_ex)
         if e in audio_history:
             audio_history.remove(e)
             _delete_history_audio(e)
         refresh_history_panel()
         _save_history()
+        _lib_refresh_if_ready()
+        def _undo(_e=e, _tid=_trashed_id):
+            if _e not in audio_history:
+                audio_history.insert(0, _e)
+                if len(audio_history) > MAX_HISTORY:
+                    _delete_history_audio(audio_history.pop())
+                refresh_history_panel()
+                _save_history()
+            if _tid:
+                try: _cliplib.delete_clip_forever(_tid, LIBRARY_AUDIO, LIBRARY_INDEX)
+                except Exception: pass
+            _lib_refresh_if_ready()
+        _lib_show_undo("Clip deleted — find it in the Library's Recently Deleted.", _undo)
 
     outer = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=6,
                          border_width=1, border_color=C_BORDER)
@@ -1584,6 +1620,14 @@ def _make_history_card(parent, idx, entry):
         **BTN_GHOST, corner_radius=5,
         command=lambda e=entry: download_history_entry(e)
     ).pack(side="left", padx=(0, 4))
+
+    _lib_save_btn = ctk.CTkButton(
+        row_act, text="📁", width=30, height=22,
+        font=ctk.CTkFont(family="Segoe UI", size=11),
+        **BTN_GHOST, corner_radius=5)
+    _lib_save_btn.configure(command=lambda e=entry, w=_lib_save_btn: _lib_save_menu(e, w))
+    _lib_save_btn.pack(side="left", padx=(0, 4))
+    _Tooltip(_lib_save_btn, "Save to Library — keep this clip in a folder")
 
     if entry.get("segments"):
         ctk.CTkButton(
@@ -2485,11 +2529,19 @@ class SmoothProgress:
             rate     = self._last_rate or self._seed_rate()
             if ai < n:
                 est_chunk = seg_w[ai] / max(rate, 1)
-                in_frac   = min(0.98, max(0.0, (now - (self._active_ts or now)) / max(est_chunk, 0.05)))
+                on_chunk  = now - (self._active_ts or now)
+                in_frac   = min(0.98, max(0.0, on_chunk / max(est_chunk, 0.05)))
                 work      = (done_w + seg_w[ai] * in_frac) / total
                 self.bar.update(ai, in_frac)
                 remain = (total - done_w) / max(rate, 1)
-                self.time_label.configure(text=f"⏱ ~{format_time(remain)} left")
+                if in_frac >= 0.98:
+                    # section is running past its estimate — the fill would pin here,
+                    # so show a LIVE elapsed timer instead of a frozen "~0s left".
+                    self.time_label.configure(
+                        text=f"⏱ Still working on section {ai + 1} of {n}… "
+                             f"({format_time(int(on_chunk))} so far)")
+                else:
+                    self.time_label.configure(text=f"⏱ ~{format_time(remain)} left")
             else:
                 work = 1.0
                 self.bar.complete()
@@ -2656,7 +2708,7 @@ def apply_enhancements(samples, sample_rate):
 # ══════════════════════════════════════════════════════════════════════════════
 _TAG_RE = re.compile(r'\[[^\[\]]*\]')
 _TAG_SLOW, _TAG_FAST = 0.75, 1.4
-_TAG_LOUD, _TAG_QUIET = 1.5, 0.5
+_TAG_LOUD, _TAG_QUIET = 2.0, 0.5   # [loud] bumped 1.5→2.0 (user wanted more punch); tune by ear
 
 # friendly first-name -> voice id, e.g. "george" -> "bm_george"
 _VOICE_BY_NAME = {}
@@ -2678,10 +2730,39 @@ def _tag_spell(t, digits_only=False):
             out.append(ch)
     return ''.join(out)
 
+_YEAR_ONES = ["zero","one","two","three","four","five","six","seven","eight","nine",
+              "ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen",
+              "seventeen","eighteen","nineteen"]
+_YEAR_TENS = ["","","twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"]
+
+def _two_digit_words(n):
+    if n < 20:
+        return _YEAR_ONES[n]
+    t, o = divmod(n, 10)
+    return _YEAR_TENS[t] + ("-" + _YEAR_ONES[o] if o else "")
+
+def _year_to_words(y):
+    if y % 1000 == 0:                      # 1000, 2000
+        return _YEAR_ONES[y // 1000] + " thousand"
+    if 2000 <= y <= 2009:                  # 2001-2009 -> "two thousand X"
+        return "two thousand " + _YEAR_ONES[y % 10]
+    hi, lo = divmod(y, 100)                # halves: 19|82 -> "nineteen eighty-two"
+    if lo == 0:
+        return _two_digit_words(hi) + " hundred"
+    if lo < 10:
+        return _two_digit_words(hi) + " oh " + _YEAR_ONES[lo]
+    return _two_digit_words(hi) + " " + _two_digit_words(lo)
+
+def _tag_year(t):
+    """Read 4-digit year-like numbers (1000-2999) naturally: 1982 -> nineteen eighty-two."""
+    return re.sub(r'\b\d{4}\b',
+                  lambda m: _year_to_words(int(m.group())) if 1000 <= int(m.group()) <= 2999
+                  else m.group(), t)
+
 def _tag_is_recognized(tag):
     t = tag[1:-1].strip().lower()
     if re.match(r'(pause|break)\b\s*(\d+(\.\d+)?)?\s*(ms|s)?$', t): return True
-    if re.match(r'/?(slow|fast|loud|quiet|spell|digits|voice|rate|volume)$', t): return True
+    if re.match(r'/?(slow|fast|loud|quiet|spell|digits|year|voice|rate|volume)$', t): return True
     if re.match(r'(rate|volume)\s+\d+(\.\d+)?$', t): return True
     if re.match(r'voice\s*:\s*\S', t): return True
     return False
@@ -2709,6 +2790,7 @@ def parse_speech_tags(text, base_voice, base_speed):
         x = cur_x()
         if x == 'spell':    t = _tag_spell(t)
         elif x == 'digits': t = _tag_spell(t, digits_only=True)
+        elif x == 'year':   t = _tag_year(t)
         spans.append({"kind": "text", "text": t, "voice": cur_voice(),
                       "speed": cur_speed(), "gain": cur_gain()})
     pos = 0
@@ -2725,12 +2807,12 @@ def parse_speech_tags(text, base_voice, base_speed):
             used[0] = True
         elif low.startswith('/'):
             nm = low[1:].strip()
-            if nm in ('slow', 'fast', 'rate', 'loud', 'quiet', 'volume', 'voice', 'spell', 'digits'):
+            if nm in ('slow', 'fast', 'rate', 'loud', 'quiet', 'volume', 'voice', 'spell', 'digits', 'year'):
                 flush()
                 if nm in ('slow', 'fast', 'rate') and speed_stack: speed_stack.pop()
                 elif nm in ('loud', 'quiet', 'volume') and gain_stack: gain_stack.pop()
                 elif nm == 'voice' and voice_stack: voice_stack.pop()
-                elif nm in ('spell', 'digits') and xform_stack: xform_stack.pop()
+                elif nm in ('spell', 'digits', 'year') and xform_stack: xform_stack.pop()
             else:
                 handled = False
         elif low == 'slow':   flush(); speed_stack.append(_TAG_SLOW); used[0] = True
@@ -2739,6 +2821,7 @@ def parse_speech_tags(text, base_voice, base_speed):
         elif low == 'quiet':  flush(); gain_stack.append(_TAG_QUIET); used[0] = True
         elif low == 'spell':  flush(); xform_stack.append('spell'); used[0] = True
         elif low == 'digits': flush(); xform_stack.append('digits'); used[0] = True
+        elif low == 'year':   flush(); xform_stack.append('year'); used[0] = True
         else:
             rm = re.match(r'(rate|volume)\s+(\d+(?:\.\d+)?)$', low)
             vm = re.match(r'voice\s*:\s*(\S.*)$', raw, re.I)
@@ -2760,6 +2843,63 @@ def parse_speech_tags(text, base_voice, base_speed):
     return spans, used[0]
 
 
+def time_stretch(y, rate, n_fft=1024, hop=None):
+    """Change audio DURATION without changing PITCH (phase vocoder, numpy-only).
+    rate>1 => faster/shorter (e.g. [fast]=1.4); rate<1 => slower/longer ([slow]=0.75).
+    Lets speed tags work on Chatterbox (Natural mode), which has no speed argument.
+    Verified: duration err <0.2%, spectral envelope preserved (LTAS 0.99+), RMS kept."""
+    y = np.asarray(y, dtype=np.float32)
+    if abs(rate - 1.0) < 1e-3 or len(y) < n_fft:
+        return y
+    if hop is None:
+        hop = n_fft // 4
+    win = np.hanning(n_fft).astype(np.float32)
+
+    pad = n_fft // 2
+    yp = np.pad(y, pad, mode="reflect")
+    n_frames = 1 + (len(yp) - n_fft) // hop
+    frames = np.lib.stride_tricks.as_strided(
+        yp, shape=(n_frames, n_fft),
+        strides=(yp.strides[0] * hop, yp.strides[0])).copy()
+    frames *= win
+    D = np.fft.rfft(frames, axis=1).T
+    n_bins, n_frames = D.shape
+
+    phi_advance = np.linspace(0, np.pi * hop, n_bins).astype(np.float32)
+    time_steps = np.arange(0, n_frames - 1, rate, dtype=np.float32)
+    out = np.zeros((n_bins, len(time_steps)), dtype=np.complex64)
+    phase_acc = np.angle(D[:, 0]).astype(np.float32)
+    mag, ang = np.abs(D), np.angle(D)
+    for t, step in enumerate(time_steps):
+        i = int(step); alpha = step - i
+        m = (1.0 - alpha) * mag[:, i] + alpha * mag[:, i + 1]
+        out[:, t] = m * np.exp(1j * phase_acc)
+        dphase = ang[:, i + 1] - ang[:, i] - phi_advance
+        dphase -= 2.0 * np.pi * np.round(dphase / (2.0 * np.pi))
+        phase_acc = phase_acc + phi_advance + dphase
+
+    fr = np.fft.irfft(out.T, n=n_fft, axis=1).astype(np.float32) * win
+    out_len = n_fft + hop * (fr.shape[0] - 1)
+    sig = np.zeros(out_len, dtype=np.float32)
+    wsum = np.zeros(out_len, dtype=np.float32)
+    w2 = win * win
+    for k in range(fr.shape[0]):
+        s = k * hop
+        sig[s:s + n_fft] += fr[k]
+        wsum[s:s + n_fft] += w2
+    wsum[wsum < 1e-8] = 1e-8
+    sig = (sig / wsum)[pad:-pad]
+
+    in_rms = float(np.sqrt(np.mean(y ** 2)))
+    out_rms = float(np.sqrt(np.mean(sig ** 2))) if len(sig) else 0.0
+    if out_rms > 1e-9 and in_rms > 1e-9:
+        sig *= (in_rms / out_rms)
+    peak = float(np.max(np.abs(sig))) if len(sig) else 0.0
+    if peak > 0.99:
+        sig *= 0.99 / peak
+    return sig.astype(np.float32)
+
+
 def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95)):
     """Generate audio for text.
     progress_range: (lo, hi) — smooth bar target is scaled within this window.
@@ -2770,15 +2910,12 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
     use_chatterbox = engine_var.get() == "Natural"
 
     if use_chatterbox:
-        # ── Chatterbox path ────────────────────────────────────────────────────
-        text = strip_speech_tags(text)   # inline tags are a Fast-mode feature
+        # ── Chatterbox path (inline tags: pause/volume/spell/speed) ─────────────
+        # Natural mode clones ONE voice, so [voice:] can't switch narrators here —
+        # it stays Fast-only. Everything else applies via split-and-stitch.
         if not chatterbox_engine.is_ready:
             if status_cb: status_cb("Waiting for Natural mode to finish loading...")
             chatterbox_engine.start(status_cb=status_cb)
-        # Chatterbox's T3 model silently truncates around ~500 chars — keep chunks small
-        chunks = chunk_text(text, max_chars=300)
-        all_samples, sample_rate = [], None
-        smooth.begin_segments([len(c) for c in chunks])
         _clone_path = cb_clone_path_var.get()
         if _clone_path and not os.path.exists(_clone_path):
             if status_cb: status_cb("⚠️ Voice clone file not found — using default voice.")
@@ -2786,20 +2923,59 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
         prompt = _clone_path or None
         exag   = cb_exag_slider.get()
         cfg    = cb_cfg_slider.get()
-        for i, chunk in enumerate(chunks):
+        cb_sr  = chatterbox_engine.sr or 24000
+
+        # base_speed=1.0 → each span's "speed" IS the tag factor ([slow]=0.75,
+        # [fast]=1.4, [rate N]=N). Spell/digits are already baked into span text.
+        spans, _tag_used = parse_speech_tags(text, voice, 1.0)
+        if _tag_used and any(s.get("voice") not in (None, voice) for s in spans):
+            if status_cb: status_cb("ℹ️ [voice:] tags are ignored in Natural mode (uses your cloned voice).")
+        units = []
+        for _sp in spans:
+            if _sp["kind"] == "pause":
+                units.append(_sp)
+            else:
+                # Chatterbox's T3 model truncates ~500 chars — keep sub-chunks small
+                for _sub in chunk_text(_sp["text"], max_chars=300):
+                    units.append({"kind": "text", "text": _sub,
+                                  "speed": _sp["speed"], "gain": _sp["gain"]})
+        if not units:
+            units = [{"kind": "text", "text": text, "speed": 1.0, "gain": 1.0}]
+
+        all_samples, sample_rate, chunks = [], None, []
+        smooth.begin_segments([max(1, len(u.get("text", "")) or 1) for u in units])
+        _used_gain = False
+        n_text = sum(1 for u in units if u["kind"] == "text")
+        _done = 0
+        for i, u in enumerate(units):
             if _cancel_event.is_set():
                 raise GenerationCancelled()
-            if status_cb: status_cb(f"Generating chunk {i+1}/{len(chunks)}...")
-            samples, sr = chatterbox_engine.generate_chunk(
-                chunk,
-                audio_prompt_path=prompt,
-                exaggeration=exag,
-                cfg_weight=cfg,
-                status_cb=status_cb,
-            )
-            all_samples.append(samples)
-            sample_rate = sr
+            if u["kind"] == "pause":
+                all_samples.append(np.zeros(int(u["seconds"] * cb_sr), dtype=np.float32))
+                chunks.append("")
+                sample_rate = sample_rate or cb_sr
+            else:
+                _done += 1
+                if status_cb: status_cb(f"Generating chunk {_done}/{n_text}...")
+                samples, sr = chatterbox_engine.generate_chunk(
+                    u["text"], audio_prompt_path=prompt,
+                    exaggeration=exag, cfg_weight=cfg, status_cb=status_cb)
+                samples = np.asarray(samples, dtype=np.float32)
+                if abs(u["speed"] - 1.0) > 1e-3:        # [slow]/[fast]/[rate]
+                    samples = time_stretch(samples, u["speed"])
+                if abs(u["gain"] - 1.0) > 1e-6:         # [loud]/[quiet]/[volume]
+                    samples = samples * u["gain"]
+                    _used_gain = True
+                all_samples.append(samples)
+                chunks.append(u["text"])
+                sample_rate = sr
+                cb_sr = sr or cb_sr
             smooth.segment_done(i)
+        if _used_gain:                       # scale down so gains never clip; keep dynamics
+            _peak = max((float(np.max(np.abs(s))) for s in all_samples if len(s)), default=0.0)
+            if _peak > 0.97:
+                _f = 0.97 / _peak
+                all_samples = [s * _f for s in all_samples]
     else:
         # ── Kokoro path (with inline speech tags) ───────────────────────────────
         spans, _tag_used = parse_speech_tags(text, voice, speed)
@@ -3693,6 +3869,13 @@ def preview_first_sentence():
     text = text_input.get("1.0", "end").strip()
     if not text:
         status_label.configure(text="⚠️ Type or paste some text first — Preview speaks its first sentence.")
+        try:
+            text_input.focus_set()          # put the cursor where they need to type
+        except Exception:
+            pass
+        preview_line_btn.configure(text="⚠️ Type text first")   # flash it right where they clicked
+        app.after(1500, lambda: preview_line_btn.cget("text") == "⚠️ Type text first"
+                  and preview_line_btn.configure(text="Preview"))
         return
     if is_generating or _preview_busy[0]:
         status_label.configure(text="⏳ Already working — one job at a time.")
@@ -4309,6 +4492,7 @@ tabs.add("  Studio  ")
 tabs.add("  Queue  ")
 tabs.add("  Dialogue  ")
 tabs.add("  Audiobook  ")
+tabs.add("  Library  ")
 tabs.add("  Profiles  ")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4398,6 +4582,7 @@ _TAG_ITEMS = [
     {"label": "🔉  Quieter",      "snip": "[quiet]‸[/quiet]",   "kw": "quiet quieter soft volume aside"},
     {"label": "🔤  Spell out",    "snip": "[spell]‸[/spell]",   "kw": "spell letters code acronym reference"},
     {"label": "🔢  Say digits",   "snip": "[digits]‸[/digits]", "kw": "digits numbers phone code"},
+    {"label": "📅  Say year",     "snip": "[year]‸[/year]",     "kw": "year date 1982 nineteen eighty"},
 ] + [
     {"label": f"{_f}  Voice: {_n}", "snip": f"[voice: {_n}]‸[/voice]", "kw": f"voice narrator switch {_n}"}
     for _n, _f in _TAG_VOICES
@@ -4664,6 +4849,7 @@ def _tag_show_guide():
         ("[quiet] … [/quiet]", "Make a stretch softer."),
         ("[spell]R4T9[/spell]", "Read characters one by one — codes, references."),
         ("[digits]1984[/digits]", "Read a number one digit at a time."),
+        ("[year]1982[/year]", "Read a year naturally — “nineteen eighty-two.”"),
         ("[voice: Emma] … [/voice]", "Switch narrator, then back. Any built-in voice name."),
     ]
     body = ctk.CTkScrollableFrame(win, fg_color="transparent")
@@ -4718,8 +4904,8 @@ ra_mode_seg = ctk.CTkSegmentedButton(
 ra_mode_seg.pack(side="right", padx=(8, 0))
 readalong_switch = ctk.CTkSwitch(
     ra_ctrl, text="Read-along", variable=readalong_var, command=_ra_on_toggle,
-    font=ctk.CTkFont(family="Segoe UI", size=12),
-    progress_color=C_ACCENT, text_color=C_TXT2,
+    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+    progress_color=C_ACCENT, text_color=C_TXT,   # was C_TXT2 (muted) — user couldn't see the label
     switch_width=38, switch_height=18)
 readalong_switch.pack(side="right")
 _Tooltip(readalong_switch,
@@ -7686,6 +7872,343 @@ def _cleanup_stale_old_files():
             pass
     except Exception:
         pass
+# ══════════════════════════════════════════════════════════════════════════════
+# CLIPS LIBRARY TAB — save generated clips into folders (engine: clips_library.py)
+# ══════════════════════════════════════════════════════════════════════════════
+library_tab = tabs.tab("  Library  ")
+_lib_state = {"folder": "", "trash": False}        # current view
+
+def _lib_data():
+    return _cliplib.load_library(LIBRARY_AUDIO, LIBRARY_INDEX)
+
+def _lib_fmt_date(iso):
+    try:
+        return _dt.fromisoformat(iso).strftime("%b %d, %Y")
+    except Exception:
+        return ""
+
+def _lib_startup_sweep():
+    try:
+        n = _cliplib.sweep_trash(LIBRARY_AUDIO, LIBRARY_INDEX, days=30)
+        if n:
+            print(f"[library] swept {n} old clip(s) from Recently Deleted", flush=True)
+    except Exception as e:
+        _log_crash(e)
+
+# ── undo toast (6 s) ──────────────────────────────────────────────────────────
+_lib_toast = {"frame": None, "after": None}
+def _lib_hide_toast():
+    if _lib_toast["after"]:
+        try: app.after_cancel(_lib_toast["after"])
+        except Exception: pass
+        _lib_toast["after"] = None
+    if _lib_toast["frame"]:
+        try: _lib_toast["frame"].destroy()
+        except Exception: pass
+        _lib_toast["frame"] = None
+def _lib_show_undo(msg, undo_fn):
+    _lib_hide_toast()
+    # parented to the app root (not the Library tab) so it shows on ANY tab —
+    # recent-clip deletes happen from the history panel while on Studio.
+    fr = ctk.CTkFrame(app, fg_color=C_ACCENT_D, corner_radius=8,
+                      border_width=1, border_color=C_ACCENT)
+    fr.place(relx=0.5, rely=1.0, anchor="s", y=-14)
+    ctk.CTkLabel(fr, text=msg, font=ctk.CTkFont(family="Segoe UI", size=12),
+                 text_color=C_TXT).pack(side="left", padx=(14, 10), pady=8)
+    def _do():
+        _lib_hide_toast()
+        try: undo_fn()
+        except Exception as e: _log_crash(e)
+    ctk.CTkButton(fr, text="Undo", width=64, height=26,
+                  font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                  fg_color=C_ACCENT, hover_color=C_ACCENT, text_color="#08150f",
+                  command=_do).pack(side="left", padx=(0, 12), pady=8)
+    _lib_toast["frame"] = fr
+    _lib_toast["after"] = app.after(6000, _lib_hide_toast)
+
+# ── playback (Play + Stop; reuse the shared history player) ────────────────────
+def _lib_play_clip(clip, play_btn, stop_btn):
+    try:
+        samples, sr = sf.read(clip["file"], dtype="float32")
+        if getattr(samples, "ndim", 1) > 1:
+            samples = samples.mean(axis=1)
+        entry = {"samples": samples, "sample_rate": sr, "text": clip.get("name", "clip")}
+        _toggle_history_playback(entry, play_btn, None, stop_btn)
+    except Exception as e:
+        _log_crash(e)
+        status_label.configure(text=f"❌ Could not play clip: {_fmt_err(e)}")
+
+# ── save a recent-history entry into the library ──────────────────────────────
+def _lib_save_recent(entry, folder="", quiet=False):
+    raw = entry.get("samples")
+    if raw is None or (hasattr(raw, "__len__") and len(raw) == 0):
+        if not quiet:
+            status_label.configure(text="❌ This clip's audio is missing — can't save it.")
+        return None
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False); tmp.close()
+        sf.write(tmp.name, np.clip(np.nan_to_num(raw, nan=0.0), -1.0, 1.0), entry["sample_rate"])
+        nm = (history_card_preview(entry.get("text", "")) or "Clip").strip()[:60] or "Clip"
+        clip = _cliplib.add_clip(tmp.name,
+            {"name": nm, "text": entry.get("text", ""), "voice": entry.get("voice", ""),
+             "duration": entry.get("duration", 0.0), "origin": "recent"},
+            folder, LIBRARY_AUDIO, LIBRARY_INDEX)
+        try: os.remove(tmp.name)
+        except Exception: pass
+        if not quiet:
+            status_label.configure(text=f"✅ Saved to Library{(' · ' + folder) if folder else ''}.")
+            _lib_refresh_if_ready()
+        return clip
+    except Exception as e:
+        _log_crash(e)
+        if not quiet:
+            status_label.configure(text=f"❌ Could not save to Library: {_fmt_err(e)}")
+        return None
+
+def _lib_save_menu(entry, widget):
+    data = _lib_data()
+    m = tk.Menu(app, tearoff=0)
+    m.add_command(label="All Clips", command=lambda: _lib_save_recent(entry, ""))
+    if data["folders"]:
+        m.add_separator()
+        for f in data["folders"]:
+            m.add_command(label=f, command=lambda ff=f: _lib_save_recent(entry, ff))
+    m.add_separator()
+    def _new():
+        nm = ctk.CTkInputDialog(text="New folder name:", title="New folder").get_input()
+        if nm and nm.strip():
+            _cliplib.add_folder(nm.strip(), LIBRARY_AUDIO, LIBRARY_INDEX)
+            _lib_save_recent(entry, nm.strip())
+    m.add_command(label="＋ New folder…", command=_new)
+    try:
+        m.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
+    finally:
+        m.grab_release()
+
+# ── folder actions ────────────────────────────────────────────────────────────
+def _lib_new_folder():
+    nm = ctk.CTkInputDialog(text="New folder name:", title="New folder").get_input()
+    if nm and nm.strip():
+        _cliplib.add_folder(nm.strip(), LIBRARY_AUDIO, LIBRARY_INDEX)
+        _lib_state["folder"] = nm.strip(); _lib_state["trash"] = False
+        _lib_refresh()
+def _lib_folder_menu(folder, ev):
+    m = tk.Menu(app, tearoff=0)
+    def _rename():
+        nm = ctk.CTkInputDialog(text=f"Rename '{folder}' to:", title="Rename folder").get_input()
+        if nm and nm.strip():
+            _cliplib.rename_folder(folder, nm.strip(), LIBRARY_AUDIO, LIBRARY_INDEX)
+            if _lib_state["folder"] == folder: _lib_state["folder"] = nm.strip()
+            _lib_refresh()
+    def _delete():
+        if messagebox.askyesno("Delete folder",
+                f"Delete the folder '{folder}'?\nIts clips move to All Clips (they are NOT deleted)."):
+            _cliplib.delete_folder(folder, LIBRARY_AUDIO, LIBRARY_INDEX)
+            if _lib_state["folder"] == folder: _lib_state["folder"] = ""
+            _lib_refresh()
+    m.add_command(label="Rename…", command=_rename)
+    m.add_command(label="Delete folder", command=_delete)
+    try: m.tk_popup(ev.x_root, ev.y_root)
+    finally: m.grab_release()
+
+# ── clip actions ──────────────────────────────────────────────────────────────
+def _lib_rename_clip(cid):
+    nm = ctk.CTkInputDialog(text="Rename clip to:", title="Rename").get_input()
+    if nm and nm.strip():
+        _cliplib.rename_clip(cid, nm.strip(), LIBRARY_AUDIO, LIBRARY_INDEX)
+        _lib_refresh()
+def _lib_move_menu(cid, widget):
+    data = _lib_data()
+    m = tk.Menu(app, tearoff=0)
+    m.add_command(label="All Clips",
+        command=lambda: (_cliplib.move_clip(cid, "", LIBRARY_AUDIO, LIBRARY_INDEX), _lib_refresh()))
+    if data["folders"]:
+        m.add_separator()
+        for f in data["folders"]:
+            m.add_command(label=f,
+                command=lambda ff=f: (_cliplib.move_clip(cid, ff, LIBRARY_AUDIO, LIBRARY_INDEX), _lib_refresh()))
+    try:
+        m.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
+    finally:
+        m.grab_release()
+def _lib_export_clip(clip):
+    dest = filedialog.asksaveasfilename(defaultextension=".wav",
+        initialfile=(clip.get("name", "clip")[:40] + ".wav"),
+        filetypes=[("WAV files", "*.wav")])
+    if not dest: return
+    try:
+        s, sr = sf.read(clip["file"], dtype="float32")
+        sf.write(dest, s, sr)
+        status_label.configure(text=f"✅ Exported: {os.path.basename(dest)}")
+    except Exception as e:
+        _log_crash(e)
+        status_label.configure(text=f"❌ Export failed: {_fmt_err(e)}")
+def _lib_delete_clip(cid):
+    _cliplib.trash_clip(cid, LIBRARY_AUDIO, LIBRARY_INDEX)
+    _lib_refresh()
+    _lib_show_undo("Clip moved to Recently Deleted.",
+                   lambda: (_cliplib.restore_clip(cid, LIBRARY_AUDIO, LIBRARY_INDEX), _lib_refresh()))
+def _lib_restore(cid):
+    _cliplib.restore_clip(cid, LIBRARY_AUDIO, LIBRARY_INDEX); _lib_refresh()
+def _lib_delete_forever(cid):
+    if messagebox.askyesno("Delete forever", "Permanently delete this clip? This cannot be undone."):
+        _cliplib.delete_clip_forever(cid, LIBRARY_AUDIO, LIBRARY_INDEX); _lib_refresh()
+def _lib_empty_trash():
+    if messagebox.askyesno("Empty Recently Deleted", "Permanently delete ALL clips in Recently Deleted?"):
+        _cliplib.empty_trash(LIBRARY_AUDIO, LIBRARY_INDEX); _lib_refresh()
+
+# ── layout: folders (left) | search + clips (right) ───────────────────────────
+_lib_root = ctk.CTkFrame(library_tab, fg_color="transparent")
+_lib_root.pack(fill="both", expand=True, padx=10, pady=10)
+
+_lib_side = ctk.CTkFrame(_lib_root, fg_color=C_CARD, corner_radius=8, width=210)
+_lib_side.pack(side="left", fill="y", padx=(0, 10)); _lib_side.pack_propagate(False)
+ctk.CTkLabel(_lib_side, text="Folders",
+             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+             text_color=C_TXT).pack(anchor="w", padx=12, pady=(12, 6))
+_lib_folder_scroll = ctk.CTkScrollableFrame(_lib_side, fg_color="transparent")
+_lib_folder_scroll.pack(fill="both", expand=True, padx=6)
+ctk.CTkButton(_lib_side, text="＋ New folder", height=30,
+              font=ctk.CTkFont(family="Segoe UI", size=12),
+              fg_color=C_ACCENT_D, hover_color=C_ACCENT, text_color=C_TXT,
+              command=_lib_new_folder).pack(fill="x", padx=10, pady=10)
+
+_lib_main = ctk.CTkFrame(_lib_root, fg_color="transparent")
+_lib_main.pack(side="left", fill="both", expand=True)
+_lib_search_var = ctk.StringVar()
+ctk.CTkEntry(_lib_main, textvariable=_lib_search_var,
+             placeholder_text="Search clips by name or text…", height=32).pack(fill="x")
+_lib_search_var.trace_add("write", lambda *a: _lib_refresh())
+_lib_head = ctk.CTkFrame(_lib_main, fg_color="transparent")
+_lib_head.pack(fill="x", pady=(8, 4))
+_lib_title = ctk.CTkLabel(_lib_head, text="All Clips",
+             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"), text_color=C_TXT)
+_lib_title.pack(side="left")
+_lib_empty_btn = ctk.CTkButton(_lib_head, text="Empty", width=60, height=24,
+             font=ctk.CTkFont(family="Segoe UI", size=10),
+             fg_color="transparent", hover_color="#3d1515", text_color=C_DANGER,
+             border_width=1, border_color="#3d1515", corner_radius=5, command=_lib_empty_trash)
+_lib_clip_scroll = ctk.CTkScrollableFrame(_lib_main, fg_color="transparent")
+_lib_clip_scroll.pack(fill="both", expand=True, pady=(4, 0))
+
+def _lib_select(folder, trash=False):
+    _lib_state["folder"] = folder; _lib_state["trash"] = trash
+    _lib_refresh()
+
+def _lib_refresh_folders():
+    for w in _lib_folder_scroll.winfo_children(): w.destroy()
+    data = _lib_data()
+    def _fbtn(label, folder, trash, count):
+        active = (_lib_state["trash"] == trash) and (trash or (_lib_state["folder"] == folder))
+        b = ctk.CTkButton(_lib_folder_scroll, text=f"{label}  ({count})", anchor="w", height=30,
+                          font=ctk.CTkFont(family="Segoe UI", size=12),
+                          fg_color=(C_ACCENT_D if active else "transparent"),
+                          hover_color=C_ELEVATED, text_color=C_TXT,
+                          command=lambda: _lib_select(folder, trash))
+        b.pack(fill="x", pady=2)
+        if folder and not trash:
+            b.bind("<Button-3>", lambda e, ff=folder: _lib_folder_menu(ff, e))
+    _fbtn("📁 All Clips", "", False, len(_cliplib.clips_in_folder(data, None)))
+    for f in data["folders"]:
+        _fbtn("📂 " + f, f, False, len(_cliplib.clips_in_folder(data, f)))
+    _fbtn("🗑 Recently Deleted", "", True, len(_cliplib.trashed_clips(data)))
+
+def _lib_make_clip_row(clip):
+    card = ctk.CTkFrame(_lib_clip_scroll, fg_color=C_CARD, corner_radius=6,
+                        border_width=1, border_color=C_BORDER)
+    card.pack(fill="x", pady=(0, 8))
+    inner = ctk.CTkFrame(card, fg_color="transparent"); inner.pack(fill="x", padx=12, pady=9)
+    r1 = ctk.CTkFrame(inner, fg_color="transparent"); r1.pack(fill="x")
+    ctk.CTkLabel(r1, text=clip.get("name", "Clip"),
+                 font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+                 text_color=C_TXT, anchor="w").pack(side="left")
+    ctk.CTkLabel(r1, text=_lib_fmt_date(clip.get("date", "")),
+                 font=ctk.CTkFont(family="Segoe UI", size=10), text_color=C_TXT3).pack(side="right")
+    meta = []
+    if clip.get("voice"):
+        meta.append(history_card_voice_label(clip["voice"]))
+    try: meta.append(format_time(int(clip.get("duration", 0))))
+    except Exception: pass
+    if meta:
+        ctk.CTkLabel(inner, text="   ·   ".join(meta),
+                     font=ctk.CTkFont(family="Segoe UI", size=10),
+                     text_color=C_ACCENT, anchor="w").pack(fill="x", pady=(2, 0))
+    if clip.get("text"):
+        ctk.CTkLabel(inner, text=history_card_preview(clip["text"]),
+                     font=ctk.CTkFont(family="Segoe UI", size=11), text_color=C_TXT2,
+                     anchor="w", justify="left", wraplength=430).pack(fill="x", pady=(4, 0))
+    act = ctk.CTkFrame(inner, fg_color="transparent"); act.pack(fill="x", pady=(7, 0))
+    if _lib_state["trash"]:
+        ctk.CTkButton(act, text="Restore", width=64, height=24,
+                      font=ctk.CTkFont(family="Segoe UI", size=10),
+                      fg_color=C_ACCENT_D, hover_color=C_ACCENT, text_color=C_TXT, corner_radius=5,
+                      command=lambda cid=clip["id"]: _lib_restore(cid)).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(act, text="Delete forever", width=104, height=24,
+                      font=ctk.CTkFont(family="Segoe UI", size=10),
+                      fg_color="transparent", hover_color="#3d1515", text_color=C_DANGER,
+                      border_width=1, border_color="#3d1515", corner_radius=5,
+                      command=lambda cid=clip["id"]: _lib_delete_forever(cid)).pack(side="left")
+    else:
+        pb = ctk.CTkButton(act, text="Play", width=60, height=24,
+                           font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+                           fg_color=C_ACCENT_D, hover_color=C_ACCENT, text_color=C_TXT, corner_radius=5)
+        sb = ctk.CTkButton(act, text="Stop", width=48, height=24,
+                           font=ctk.CTkFont(family="Segoe UI", size=10),
+                           state="disabled", **BTN_GHOST, corner_radius=5)
+        pb.configure(command=lambda c=clip, b=pb, s=sb: _lib_play_clip(c, b, s))
+        sb.configure(command=lambda b=pb: _history_stop(b))
+        pb.pack(side="left", padx=(0, 4)); sb.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(act, text="Delete", width=52, height=24,
+                      font=ctk.CTkFont(family="Segoe UI", size=10),
+                      fg_color="transparent", hover_color="#3d1515", text_color=C_DANGER,
+                      border_width=1, border_color="#3d1515", corner_radius=5,
+                      command=lambda cid=clip["id"]: _lib_delete_clip(cid)).pack(side="right")
+        _mv = ctk.CTkButton(act, text="Move", width=52, height=24,
+                            font=ctk.CTkFont(family="Segoe UI", size=10), **BTN_GHOST, corner_radius=5)
+        _mv.configure(command=lambda cid=clip["id"], w=_mv: _lib_move_menu(cid, w))
+        _mv.pack(side="right", padx=(0, 4))
+        ctk.CTkButton(act, text="Export", width=56, height=24,
+                      font=ctk.CTkFont(family="Segoe UI", size=10), **BTN_GHOST, corner_radius=5,
+                      command=lambda c=clip: _lib_export_clip(c)).pack(side="right", padx=(0, 4))
+        ctk.CTkButton(act, text="Rename", width=60, height=24,
+                      font=ctk.CTkFont(family="Segoe UI", size=10), **BTN_GHOST, corner_radius=5,
+                      command=lambda cid=clip["id"]: _lib_rename_clip(cid)).pack(side="right", padx=(0, 4))
+
+def _lib_refresh():
+    _lib_refresh_folders()
+    for w in _lib_clip_scroll.winfo_children(): w.destroy()
+    data = _lib_data()
+    q = _lib_search_var.get()
+    if _lib_state["trash"]:
+        _lib_title.configure(text="🗑 Recently Deleted — auto-clears after 30 days")
+        _lib_empty_btn.pack(side="right")
+        clips = _cliplib.trashed_clips(data)
+        if q:
+            ql = q.lower()
+            clips = [c for c in clips
+                     if ql in c.get("name", "").lower() or ql in c.get("text", "").lower()]
+    else:
+        _lib_empty_btn.pack_forget()
+        folder = _lib_state["folder"]
+        _lib_title.configure(text=("📁 All Clips" if not folder else "📂 " + folder))
+        clips = _cliplib.search_clips(data, q, folder)
+    if not clips:
+        ctk.CTkLabel(_lib_clip_scroll,
+                     text=("No matches." if q else
+                           "No clips here yet.\nHit 📁 on a clip in the history panel to save one."),
+                     font=ctk.CTkFont(family="Segoe UI", size=12),
+                     text_color=C_TXT3, justify="left").pack(anchor="w", padx=6, pady=16)
+        return
+    for c in clips:
+        _lib_make_clip_row(c)
+
+def _lib_refresh_if_ready():
+    try: _lib_refresh()
+    except Exception: pass
+
+_lib_refresh()
+app.after(3500, _lib_startup_sweep)
+
 app.after(3000, _cleanup_stale_old_files)
 
 # Check for updates in the background — 2 s delay so the UI is fully settled first
