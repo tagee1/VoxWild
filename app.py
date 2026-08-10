@@ -655,7 +655,9 @@ class EnhanceEngine:
 
     def __init__(self):
         self._proc = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()       # guards start() (worker spin-up)
+        self._req_lock = threading.Lock()   # serializes enhance() — one shared pipe,
+                                            # concurrent jobs would cross each other's replies
 
     @property
     def PYTHON(self):
@@ -749,33 +751,40 @@ class EnhanceEngine:
         return self._proc is not None and self._proc.poll() is None
 
     def enhance(self, input_path, output_path, device="cpu", status_cb=None):
-        """Enhance one audio file; returns (sample_rate, rms_delta_db)."""
-        req = {
-            "cmd": "enhance",
-            "input_path": input_path,
-            "output_path": output_path,
-            "device": device,
-        }
-        self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
-        self._proc.stdin.flush()
-        for raw_bytes in self._proc.stdout:
-            raw = raw_bytes.decode("utf-8", errors="replace").strip()
-            if not raw:
-                continue
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if msg["type"] == "status":
-                if status_cb:
-                    status_cb(msg["msg"])
-            elif msg["type"] == "done":
-                return msg.get("sr", 44100), msg.get("rms_delta_db", 0.0)
-            elif msg["type"] == "error":
-                self.stop()
-                raise RuntimeError(msg["msg"])
-        self.stop()
-        raise RuntimeError("Enhance worker closed unexpectedly.")
+        """Enhance one audio file; returns (sample_rate, rms_delta_db).
+
+        Serialized by _req_lock: the worker is ONE shared subprocess, so two
+        concurrent enhance() calls would interleave their 'done'/'error' replies on
+        the same pipe — a thread could read the other's reply and open a file that
+        hasn't been written yet (the crash). The lock makes jobs take turns.
+        """
+        with self._req_lock:
+            req = {
+                "cmd": "enhance",
+                "input_path": input_path,
+                "output_path": output_path,
+                "device": device,
+            }
+            self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
+            self._proc.stdin.flush()
+            for raw_bytes in self._proc.stdout:
+                raw = raw_bytes.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if msg["type"] == "status":
+                    if status_cb:
+                        status_cb(msg["msg"])
+                elif msg["type"] == "done":
+                    return msg.get("sr", 44100), msg.get("rms_delta_db", 0.0)
+                elif msg["type"] == "error":
+                    self.stop()
+                    raise RuntimeError(msg["msg"])
+            self.stop()
+            raise RuntimeError("Enhance worker closed unexpectedly.")
 
 
 enhance_engine = EnhanceEngine()
@@ -2483,11 +2492,19 @@ class SmoothProgress:
             rate     = self._last_rate or self._seed_rate()
             if ai < n:
                 est_chunk = seg_w[ai] / max(rate, 1)
-                in_frac   = min(0.98, max(0.0, (now - (self._active_ts or now)) / max(est_chunk, 0.05)))
+                on_chunk  = now - (self._active_ts or now)
+                in_frac   = min(0.98, max(0.0, on_chunk / max(est_chunk, 0.05)))
                 work      = (done_w + seg_w[ai] * in_frac) / total
                 self.bar.update(ai, in_frac)
                 remain = (total - done_w) / max(rate, 1)
-                self.time_label.configure(text=f"⏱ ~{format_time(remain)} left")
+                if in_frac >= 0.98:
+                    # section is running past its estimate — the fill would pin here,
+                    # so show a LIVE elapsed timer instead of a frozen "~0s left".
+                    self.time_label.configure(
+                        text=f"⏱ Still working on section {ai + 1} of {n}… "
+                             f"({format_time(int(on_chunk))} so far)")
+                else:
+                    self.time_label.configure(text=f"⏱ ~{format_time(remain)} left")
             else:
                 work = 1.0
                 self.bar.complete()
