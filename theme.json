@@ -56,6 +56,17 @@
     "border_width": 0,
     "corner_radius": 1000
   },
+  "CTkSwitch": {
+    "fg_color": ["#383838", "#383838"],
+    "progress_color": ["#00d98b", "#00d98b"],
+    "button_color": ["#f0ece4", "#f0ece4"],
+    "button_hover_color": ["#ffffff", "#ffffff"],
+    "text_color": ["#f0ece4", "#f0ece4"],
+    "text_color_disabled": ["#4e4a48", "#4e4a48"],
+    "button_length": 0,
+    "border_width": 0,
+    "corner_radius": 1000
+  },
   "CTkProgressBar": {
     "fg_color": ["#1f1f1f", "#1f1f1f"],
     "progress_color": ["#00d98b", "#00d98b"],

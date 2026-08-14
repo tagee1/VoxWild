@@ -28,7 +28,8 @@
       "Read(//c/Users/tcsco/.cache/huggingface/hub/**)",
       "Bash(\"C:/tts-app/chatterbox_env/Scripts/python.exe\" -c \"import inspect; from chatterbox.tts import ChatterboxTTS; print\\(inspect.getfile\\(ChatterboxTTS\\)\\)\")",
       "Skill(update-config)",
-      "Bash(\"C:/Users/tcsco/AppData/Local/Python/bin/python.exe\" \"C:/tts-app/app.py\")"
+      "Bash(\"C:/Users/tcsco/AppData/Local/Python/bin/python.exe\" \"C:/tts-app/app.py\")",
+      "PowerShell(git *)"
     ]
   }
 }

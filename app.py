@@ -293,6 +293,17 @@ def _center_window(win, w: int, h: int) -> None:
             sh = win.winfo_screenheight()
         x = (sw - w) // 2
         y = (sh - h) // 2
+    # Clamp onto the visible screen. If the parent is hidden or not yet mapped
+    # (e.g. still behind the splash) Windows reports its position as a large
+    # negative sentinel, which would drop the dialog off-screen — where a modal
+    # with grab_set() can neither be reached nor dismissed.
+    try:
+        sw_ = win.winfo_screenwidth()
+        sh_ = win.winfo_screenheight()
+        x = max(0, min(x, max(0, sw_ - w)))
+        y = max(0, min(y, max(0, sh_ - h)))
+    except Exception:
+        x, y = max(0, x), max(0, y)
     win.geometry(f"{w}x{h}+{x}+{y}")
 
 
@@ -1179,18 +1190,31 @@ def save_calibration(data):
     except OSError:
         pass  # calibration is non-critical; silently skip if disk write fails
 
+# Natural (Chatterbox) generation speed on a CPU-only machine. The old default
+# of 0.5 wps was ~6x too fast for an 8 GB CPU box, so the progress bar filled to
+# 98% in seconds and then parked in "still working" for minutes on every run.
+# Measured behaviour on such a machine is roughly 0.08 wps (~10 words / 2 min).
+_CB_WPS_DEFAULT = 0.08
+
+# Natural runs are minutes long, so there are far fewer samples than Fast mode.
+# Weight the newest measurement harder so it converges on the real machine speed
+# within a couple of runs instead of a dozen.
+_CB_EMA_ALPHA = 0.6
+
+
 def record_calibration(word_count, elapsed_seconds, use_cb=None):
     data = _get_calibration()
     if use_cb is None:
         use_cb = engine_var.get() == "Natural"
-    wps = word_count / elapsed_seconds if elapsed_seconds > 0 else (0.5 if use_cb else 8)
+    wps = word_count / elapsed_seconds if elapsed_seconds > 0 else (_CB_WPS_DEFAULT if use_cb else 8)
     _EMA_ALPHA = 0.4
     if use_cb:
         data.setdefault("cb_samples", [])
         data["cb_samples"].append(round(wps, 3))
         data["cb_samples"] = data["cb_samples"][-5:]
-        prior = data.get("cb_words_per_second") or 0.5
-        data["cb_words_per_second"] = round(_EMA_ALPHA * wps + (1 - _EMA_ALPHA) * prior, 3)
+        prior = data.get("cb_words_per_second") or _CB_WPS_DEFAULT
+        data["cb_words_per_second"] = round(
+            _CB_EMA_ALPHA * wps + (1 - _CB_EMA_ALPHA) * prior, 3)
     else:
         data["samples"].append(round(wps, 3))
         data["samples"] = data["samples"][-5:]
@@ -1201,8 +1225,62 @@ def record_calibration(word_count, elapsed_seconds, use_cb=None):
 def get_words_per_second():
     data = _get_calibration()
     if engine_var.get() == "Natural":
-        return data.get("cb_words_per_second") or 0.5
+        return data.get("cb_words_per_second") or _CB_WPS_DEFAULT
     return data.get("words_per_second") or 8
+
+
+# ── Natural-mode timing model ────────────────────────────────────────────────
+# Chatterbox cost is dominated by fixed per-section model overhead, NOT by how
+# much text is in the section. Measured on an 8 GB CPU-only box: a 3-word section
+# and a 16-word section both took ~175 s. Weighting the bar by character count
+# (correct for Kokoro, where time really does scale with text) made it stop at
+# 23% / 60% / 67% and then sit in "still working" for minutes.
+#
+# So Natural weights every text section equally and estimates in seconds-per-
+# section. Pauses are near-instant and get a token weight so they don't count
+# as a full section.
+# Measured on this 8 GB CPU-only box (chars -> seconds for one section):
+#
+#      9 -> 210     15 -> 170     16 -> 150     34 -> 194
+#     90 -> 292     95 -> 296
+#
+# which fits  time ~= 120 s fixed + 1.85 s per character. Both terms matter:
+# weighting purely by characters (correct for Kokoro) put the bar at 23%/60%
+# when the truth was 40%/72%; weighting every section equally fixed the bar
+# position but under-estimated long sections roughly 3x.
+#
+# So one section's weight = fixed overhead expressed in character-equivalents
+# (120 / 1.85 ~= 65) plus its actual characters, and we learn seconds-per-
+# weight-unit from real runs on this machine.
+_CB_SECTION_FIXED_CHARS = 65      # 120 s of fixed overhead, in char-equivalents
+_CB_SECS_PER_WEIGHT_DEF = 1.85    # seconds per weight unit
+_CB_SECTION_EMA_ALPHA   = 0.5
+_CB_PAUSE_WEIGHT        = 1       # a [pause] is near-instant, not a real section
+
+
+def cb_section_weight(text):
+    """Relative cost of one Natural text section (fixed overhead + its text)."""
+    return _CB_SECTION_FIXED_CHARS + max(0, len(text or ""))
+
+
+def get_cb_secs_per_weight():
+    data = _get_calibration()
+    v = data.get("cb_secs_per_weight")
+    return v if (v and v > 0.05) else _CB_SECS_PER_WEIGHT_DEF
+
+
+def record_section_rate(seconds, weight):
+    """EMA of seconds-per-weight-unit for Natural sections on this machine."""
+    if not seconds or seconds <= 1 or not weight or weight <= 0:
+        return
+    spw = seconds / weight
+    if not (0.05 < spw < 60):
+        return                     # ignore absurd outliers (stalls, cancels)
+    data = _get_calibration()
+    prior = data.get("cb_secs_per_weight") or _CB_SECS_PER_WEIGHT_DEF
+    data["cb_secs_per_weight"] = round(
+        _CB_SECTION_EMA_ALPHA * spw + (1 - _CB_SECTION_EMA_ALPHA) * prior, 4)
+    save_calibration(data)
 
 # ── Audio History ─────────────────────────────────────────────────────────────
 audio_history = []   # list of dicts: {samples, sample_rate, text, duration, timestamp, voice}
@@ -1469,6 +1547,24 @@ def refresh_history_panel():
     for i, entry in enumerate(audio_history):
         _make_history_card(history_inner, i, entry)
 
+def _history_index(entry):
+    """Position of `entry` in audio_history BY IDENTITY, or -1 if absent.
+
+    Do NOT use `entry in audio_history` or `audio_history.remove(entry)` for this.
+    Both compare with ==, which on these dicts compares the numpy "samples" arrays
+    element-wise; numpy raises ValueError for two clips of different length instead
+    of returning False. That crashed Delete (for any card but the first) and Undo
+    (nearly always) — see crashes.log 2026-08-10 and 2026-08-13:
+        ValueError: operands could not be broadcast together with shapes (53587,) (1005775,)
+    Identity is also the correct test here: history holds specific entry objects,
+    and two genuinely distinct clips could be equal by value.
+    """
+    for i, e in enumerate(audio_history):
+        if e is entry:
+            return i
+    return -1
+
+
 def _make_history_card(parent, idx, entry):
     def _delete(e=entry):
         # copy into the Library's Recently Deleted first, so a deleted clip is recoverable
@@ -1480,14 +1576,15 @@ def _make_history_card(parent, idx, entry):
                 _trashed_id = _c["id"]
         except Exception as _ex:
             _log_crash(_ex)
-        if e in audio_history:
-            audio_history.remove(e)
+        _idx = _history_index(e)
+        if _idx >= 0:
+            audio_history.pop(_idx)
             _delete_history_audio(e)
         refresh_history_panel()
         _save_history()
         _lib_refresh_if_ready()
         def _undo(_e=e, _tid=_trashed_id):
-            if _e not in audio_history:
+            if _history_index(_e) < 0:
                 audio_history.insert(0, _e)
                 if len(audio_history) > MAX_HISTORY:
                     _delete_history_audio(audio_history.pop())
@@ -2429,6 +2526,7 @@ class SmoothProgress:
         self._active     = 0         # chunks completed so far
         self._active_ts  = None      # when the current chunk started
         self._built_key  = None
+        self._per_section = False    # True = Natural: cost is per section, not per char
 
     # ---- called on the main thread ----
     def start(self, estimated_seconds):
@@ -2454,7 +2552,15 @@ class SmoothProgress:
         self._tick()
 
     # ---- called from worker threads (data only, thread-safe) ----
-    def begin_segments(self, weights):
+    def begin_segments(self, weights, per_section=False):
+        """weights: relative cost per chunk.
+
+        per_section=True (Natural/Chatterbox): the caller has already weighted
+        every text section equally, because generation cost there is fixed
+        per-section rather than proportional to text length. This also switches
+        the seed estimate and the learned rate over to seconds-per-section.
+        """
+        self._per_section = per_section
         weights = [max(1, int(w)) for w in weights] or [1]
         cum = [0]
         for w in weights:
@@ -2476,6 +2582,13 @@ class SmoothProgress:
         w   = self._seg_w[i] if (self._seg_w and i < len(self._seg_w)) else 0
         if dur > 0.05 and w > 0:
             self._last_rate = w / dur
+        # Natural: remember this machine's true seconds-per-weight, so the NEXT
+        # run starts from measured reality instead of the built-in default.
+        if self._per_section and w > _CB_PAUSE_WEIGHT:
+            try:
+                record_section_rate(dur, w)
+            except Exception:
+                pass  # calibration is non-critical
         self._active    = i + 1
         self._active_ts = now
 
@@ -2490,6 +2603,8 @@ class SmoothProgress:
     # ---- main-thread rendering ----
     def _seed_rate(self):
         try:
+            if self._per_section:
+                return 1.0 / max(0.05, get_cb_secs_per_weight())   # weight-units/sec
             return max(1.0, get_words_per_second() * 5.8)   # words/s → chars/s
         except Exception:
             return 40.0
@@ -2527,13 +2642,19 @@ class SmoothProgress:
             done_w   = seg_cum[ai]
             total    = seg_cum[-1] or 1
             rate     = self._last_rate or self._seed_rate()
+            # Guard against divide-by-zero ONLY. This used to clamp to max(rate, 1),
+            # which was harmless for Kokoro (chars/sec is tens) but silently broke
+            # Natural: its rate is ~0.54 weight-units/sec, so the clamp forced it to
+            # 1.0 and every estimate degenerated into "weight number, shown as
+            # seconds" (a 91-weight job displayed "1m 31s").
+            safe_rate = max(rate, 1e-6)
             if ai < n:
-                est_chunk = seg_w[ai] / max(rate, 1)
+                est_chunk = seg_w[ai] / safe_rate
                 on_chunk  = now - (self._active_ts or now)
                 in_frac   = min(0.98, max(0.0, on_chunk / max(est_chunk, 0.05)))
                 work      = (done_w + seg_w[ai] * in_frac) / total
                 self.bar.update(ai, in_frac)
-                remain = (total - done_w) / max(rate, 1)
+                remain = (total - done_w) / safe_rate
                 if in_frac >= 0.98:
                     # section is running past its estimate — the fill would pin here,
                     # so show a LIVE elapsed timer instead of a frozen "~0s left".
@@ -2569,6 +2690,16 @@ class SmoothProgress:
 # format_time imported from tts_utils
 
 def estimate_processing_time(text):
+    if engine_var.get() == "Natural":
+        # Fixed-overhead-plus-length model — see the Natural timing notes above.
+        # Split the same way generate_audio does so the section count matches;
+        # the bar self-corrects anyway once begin_segments() reports the real one.
+        try:
+            parts = chunk_text(text, max_chars=300) or [text]
+        except Exception:
+            parts = [text]
+        weight = sum(cb_section_weight(p) for p in parts) or cb_section_weight(text)
+        return weight * get_cb_secs_per_weight()
     return len(text.split()) / get_words_per_second()
 
 # estimate_audio_duration imported from tts_utils
@@ -2708,7 +2839,7 @@ def apply_enhancements(samples, sample_rate):
 # ══════════════════════════════════════════════════════════════════════════════
 _TAG_RE = re.compile(r'\[[^\[\]]*\]')
 _TAG_SLOW, _TAG_FAST = 0.75, 1.4
-_TAG_LOUD, _TAG_QUIET = 2.0, 0.5   # [loud] bumped 1.5→2.0 (user wanted more punch); tune by ear
+_TAG_LOUD, _TAG_QUIET = 3.0, 0.5   # [loud] 1.5 → 2.0 → 3.0 (user wanted more punch); tune by ear
 
 # friendly first-name -> voice id, e.g. "george" -> "bm_george"
 _VOICE_BY_NAME = {}
@@ -2718,14 +2849,18 @@ for _lbl, _vid in VOICES.items():
         _VOICE_BY_NAME[_nm] = _vid
 
 def _tag_spell(t, digits_only=False):
+    # Separator is a comma, not a full stop: Chatterbox gives a period a much
+    # heavier prosodic break, which made mixed strings like "R4T9" land unevenly
+    # (an audible gap at the digit->letter boundary). A comma reads steadier.
+    _SEP = ', '
     out = []
     for ch in t:
         if ch.isspace():
             out.append(' ')
         elif ch.isdigit():
-            out.append(ch + '. ')
+            out.append(ch + _SEP)
         elif ch.isalpha() and not digits_only:
-            out.append(ch.upper() + '. ')
+            out.append(ch.upper() + _SEP)
         else:
             out.append(ch)
     return ''.join(out)
@@ -2840,7 +2975,27 @@ def parse_speech_tags(text, base_voice, base_speed):
             run.append(m.group())
         pos = m.end()
     run.append(text[pos:]); flush()
-    return spans, used[0]
+    # [year]/[spell]/[digits] only REWRITE WORDS — they don't change voice, speed
+    # or gain. But every span is synthesized as its own TTS call, and each call
+    # carries leading/trailing silence, so a bare text transform mid-sentence used
+    # to leave an audible gap on both sides of the tag. Merge neighbouring text
+    # spans whose generation settings are identical so they're spoken in one
+    # breath. Spans that really do differ ([loud], [slow], [voice:], pauses) still
+    # split, because those need separate synthesis to work at all.
+    merged = []
+    for s in spans:
+        p = merged[-1] if merged else None
+        if (p is not None and p["kind"] == "text" and s["kind"] == "text"
+                and p["voice"] == s["voice"]
+                and abs(p["speed"] - s["speed"]) < 1e-9
+                and abs(p["gain"]  - s["gain"])  < 1e-9):
+            joined = p["text"] + s["text"]
+            # "in [year]1982[/year] and" leaves doubled spaces at the seams when the
+            # user pads inside the tag; harmless to the engine, tidier for read-along.
+            p["text"] = re.sub(r'[ \t]{2,}', ' ', joined)
+        else:
+            merged.append(s)
+    return merged, used[0]
 
 
 def time_stretch(y, rate, n_fft=1024, hop=None):
@@ -2900,6 +3055,59 @@ def time_stretch(y, rate, n_fft=1024, hop=None):
     return sig.astype(np.float32)
 
 
+def wsola(x, rate, frame=1024, search=360):
+    """Time-stretch WITHOUT changing pitch, time-domain (speech-friendly, no robotic phasiness).
+    rate>1 => faster/shorter ([fast]=1.4); rate<1 => slower/longer ([slow]=0.75).
+
+    Used instead of time_stretch() on the Natural (Chatterbox) path: the phase
+    vocoder is pitch-correct but adds metallic "phasiness" that is very audible
+    on speech, worst at large stretches. WSOLA is the standard speech choice."""
+    x = np.asarray(x, dtype=np.float32)
+    if abs(rate - 1.0) < 1e-3 or len(x) < frame * 2:
+        return x
+    Hs = frame // 2
+    Ha = rate * Hs
+    win = np.hanning(frame).astype(np.float32)
+    out_len = int(np.ceil(len(x) / rate)) + frame
+    out = np.zeros(out_len, dtype=np.float32)
+    ow = np.zeros(out_len, dtype=np.float32)
+    out[:frame] += x[:frame] * win
+    ow[:frame] += win
+    prev_read = 0
+    read = float(Ha)
+    syn = Hs
+    while syn + frame < out_len:
+        tgt = prev_read + Hs
+        if tgt + frame > len(x):
+            break
+        target = x[tgt:tgt + frame]
+        center = int(round(read))
+        lo = max(0, center - search)
+        hi = min(len(x) - frame, center + search)
+        if hi <= lo:
+            break
+        best, best_corr = lo, -1e30
+        for s in range(lo, hi + 1, 2):
+            c = float(np.dot(x[s:s + frame], target))
+            if c > best_corr:
+                best_corr, best = c, s
+        out[syn:syn + frame] += x[best:best + frame] * win
+        ow[syn:syn + frame] += win
+        prev_read = best
+        read += Ha
+        syn += Hs
+    ow[ow < 1e-6] = 1e-6
+    out = (out / ow)[:int(round(len(x) / rate))]
+    ir = float(np.sqrt(np.mean(x ** 2)))
+    orr = float(np.sqrt(np.mean(out ** 2))) if len(out) else 0.0
+    if orr > 1e-9 and ir > 1e-9:
+        out *= ir / orr
+    p = float(np.max(np.abs(out))) if len(out) else 0.0
+    if p > 0.99:
+        out *= 0.99 / p
+    return out.astype(np.float32)
+
+
 def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95)):
     """Generate audio for text.
     progress_range: (lo, hi) — smooth bar target is scaled within this window.
@@ -2943,7 +3151,13 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
             units = [{"kind": "text", "text": text, "speed": 1.0, "gain": 1.0}]
 
         all_samples, sample_rate, chunks = [], None, []
-        smooth.begin_segments([max(1, len(u.get("text", "")) or 1) for u in units])
+        # Natural: a section costs a big fixed overhead PLUS a per-character
+        # amount, so weight it as (fixed-in-char-equivalents + its characters).
+        # Pauses are near-instant and get a token weight.
+        smooth.begin_segments(
+            [_CB_PAUSE_WEIGHT if u["kind"] == "pause"
+             else cb_section_weight(u.get("text", "")) for u in units],
+            per_section=True)
         _used_gain = False
         n_text = sum(1 for u in units if u["kind"] == "text")
         _done = 0
@@ -2962,7 +3176,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
                     exaggeration=exag, cfg_weight=cfg, status_cb=status_cb)
                 samples = np.asarray(samples, dtype=np.float32)
                 if abs(u["speed"] - 1.0) > 1e-3:        # [slow]/[fast]/[rate]
-                    samples = time_stretch(samples, u["speed"])
+                    samples = wsola(samples, u["speed"])
                 if abs(u["gain"] - 1.0) > 1e-6:         # [loud]/[quiet]/[volume]
                     samples = samples * u["gain"]
                     _used_gain = True
@@ -4350,6 +4564,7 @@ def _section_label(parent, text, padx=14, pady=(12, 6), tooltip=None):
                  text_color=C_TXT2, anchor="w").pack(side="left")
     if tooltip:
         _info_btn(row, tooltip).pack(side="left", padx=(5, 0))
+    return row      # so callers can add their own trailing widgets
 
 # ── Status Bar (packed first so it stays at bottom) ───────────────────────────
 status_bar = ctk.CTkFrame(app, fg_color=C_SURFACE, corner_radius=0, height=32)
@@ -4515,12 +4730,19 @@ def _panel(parent, col, padright=8):
 # ── Text panel ────────────────────────────────────────────────────────────────
 text_panel = _panel(studio, 0)
 
-_section_label(text_panel, "TEXT INPUT",
+_ti_header = _section_label(text_panel, "TEXT INPUT",
     tooltip="Type or paste any text here. Use Ctrl+Enter to generate, or the "
             "Preview button (Ctrl+Shift+Enter) to hear just the first sentence "
             "before committing to a full render. "
             "Long texts are automatically split into chunks and joined seamlessly. "
             "Use the Dialogue tab for multi-speaker scripts.")
+# The "type [ for menu" hint sits here rather than on the tag-button row below:
+# that row overflows the panel on small / DPI-scaled displays and the hint was
+# the first thing clipped off it. This header row has spare space to its right,
+# and it shows in both Fast and Natural since the text panel is shared.
+ctk.CTkLabel(_ti_header, text="type  [  for menu",
+             font=ctk.CTkFont(family="Segoe UI", size=10),
+             text_color=C_TXT3).pack(side="left", padx=(12, 0))
 
 def _attach_context_menu(widget):
     """Give a CTk textbox/entry a right-click Cut/Copy/Paste/Select All menu.
@@ -4608,8 +4830,10 @@ for _ic, _lb, _snip, _tip in _TAG_BUTTONS:
 ctk.CTkButton(tags_bar, text="?  Tag guide", width=1, height=26,
               command=lambda: _tag_show_guide(),
               font=ctk.CTkFont(family="Segoe UI", size=11), **BTN_DARK).pack(side="right")
-ctk.CTkLabel(tags_bar, text="type  [  for the menu",
-             font=ctk.CTkFont(family="Segoe UI", size=10), text_color=C_TXT3).pack(side="right", padx=8)
+# The "type [ for the menu" hint used to live here. On small / DPI-scaled displays
+# this row overflows the panel and the hint was pushed off the right edge anyway,
+# taking the "? Tag guide" button with it. Removed — the Tag guide button explains
+# the same thing and now has room to render fully.
 
 text_input = ctk.CTkTextbox(
     text_panel,
@@ -4881,22 +5105,35 @@ ctk.CTkButton(txt_btns, text="Import", command=import_file,
 ctk.CTkButton(txt_btns, text="+ Queue", command=queue_add,
               width=76, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_GHOST).pack(side="left", padx=(0, 5))
-ctk.CTkButton(txt_btns, text="Clean", command=show_text_cleaner,
+_clean_btn = ctk.CTkButton(txt_btns, text="Clean", command=show_text_cleaner,
               width=66, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
-              **BTN_GHOST).pack(side="left", padx=(0, 5))
-ctk.CTkButton(txt_btns, text="Dict",
+              **BTN_GHOST)
+_clean_btn.pack(side="left", padx=(0, 5))
+_Tooltip(_clean_btn, "Clean up pasted text — fix smart quotes, odd spacing and stray characters")
+_dict_btn = ctk.CTkButton(txt_btns, text="Dict",
               command=lambda: open_pronunciation_window(app),
               width=54, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
-              **BTN_GHOST).pack(side="left", padx=(0, 5))
+              **BTN_GHOST)
+_dict_btn.pack(side="left", padx=(0, 5))
+_Tooltip(_dict_btn, "Pronunciation dictionary — teach VoxWild how to say specific words")
 ctk.CTkButton(txt_btns, text="Clear", command=clear_text,
               width=54, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_DARK).pack(side="left")
 
-# Read-along highlighting (OFF by default) — lights up the text in time with playback
+# Read-along highlighting (OFF by default) — lights up the text in time with playback.
+#
+# On its own row rather than sharing the Import/Clean/Dict row: measured, that row
+# needs ~855 px and the text panel only gets ~500 on a 1280 px screen at 150% DPI
+# scaling, so "Sentence" / "Word" were clipped off the right edge (worse in Natural,
+# where the wider engine panel squeezes column 0 further). Alone it needs ~340 px.
 readalong_var = ctk.BooleanVar(value=False)
 readalong_mode_var = ctk.StringVar(value="Sentence")
-ra_ctrl = ctk.CTkFrame(txt_btns, fg_color="transparent")
-ra_ctrl.pack(side="right")
+ra_row = ctk.CTkFrame(text_panel, fg_color="transparent")
+ra_row.pack(fill="x", padx=10, pady=(0, 8))
+ra_ctrl = ctk.CTkFrame(ra_row, fg_color="transparent")
+# Left-aligned, nudged in slightly so it sits under the middle of the button row
+# above rather than hard against the panel edge. Tweak the 40 to shift it.
+ra_ctrl.pack(side="left", padx=(40, 0))
 ra_mode_seg = ctk.CTkSegmentedButton(
     ra_ctrl, values=["Sentence", "Word"], variable=readalong_mode_var,
     width=138, height=26, font=ctk.CTkFont(family="Segoe UI", size=11),
@@ -5410,10 +5647,49 @@ _section_label(mid_panel, "SPEED",
 speed_slider, speed_label = make_slider(mid_panel, "Playback Speed", 0.5, 2.0, 30, 0.85)
 
 # Engine switch logic
+# Natural holds several GB, so it used to be unloaded the instant you switched
+# to Fast — which meant toggling back cost a full model reload (minutes). Keep it
+# warm for a short grace period instead: quick back-and-forth is free, but the
+# memory is still released if you've genuinely moved on. Matters on small
+# machines, where loading Natural at all is gated on 6 GB free.
+_CB_UNLOAD_GRACE_MS = 5 * 60 * 1000        # 5 minutes
+_cb_unload_job = [None]
+
+
+def _cancel_cb_unload():
+    """Called when Natural is re-selected — keep the warm model."""
+    if _cb_unload_job[0] is not None:
+        try:
+            app.after_cancel(_cb_unload_job[0])
+        except Exception:
+            pass
+        _cb_unload_job[0] = None
+
+
+def _schedule_cb_unload():
+    """Release Natural's memory, but not until the grace period has passed."""
+    _cancel_cb_unload()
+
+    def _do_unload():
+        _cb_unload_job[0] = None
+        # Re-check at fire time: the user may have switched back, or a low-RAM
+        # revert may have stopped the worker already.
+        if engine_var.get() == "Natural" or not chatterbox_engine.is_ready:
+            return
+        try:
+            status_label.configure(text="Natural mode unloaded to free memory.")
+        except Exception:
+            pass
+        threading.Thread(target=chatterbox_engine.stop, daemon=True).start()
+
+    _cb_unload_job[0] = app.after(_CB_UNLOAD_GRACE_MS, _do_unload)
+
+
 def _on_engine_change(*_):
     if engine_var.get() == "Natural":
         kokoro_frame.pack_forget()
         cb_frame.pack(fill="x")
+        _cancel_cb_unload()          # still warm? then switching back is instant
         if not chatterbox_engine.is_ready:
             def _start_load():
                 try:
@@ -5452,10 +5728,83 @@ def _on_engine_change(*_):
         cb_frame.pack_forget()
         kokoro_frame.pack(fill="x")
         if chatterbox_engine.is_ready:
-            status_label.configure(text="Fast mode active — Natural mode unloaded.")
-            threading.Thread(target=chatterbox_engine.stop, daemon=True).start()
+            status_label.configure(
+                text="Fast mode active — Natural stays loaded for 5 minutes.")
+            _schedule_cb_unload()
 
 engine_var.trace_add("write", _on_engine_change)
+
+
+def _persist_engine(*_):
+    """Remember the Fast/Natural choice across restarts.
+
+    Engine was the one setting that silently reverted on every launch, so a user
+    who had set Natural up (a ~3 GB download) would quietly be back on Fast next
+    time and think Natural had broken.
+    """
+    try:
+        s = _get_settings()
+        s["engine"] = engine_var.get()
+        _save_settings(s)
+    except Exception:
+        pass  # persistence is non-critical, never block the engine switch
+
+
+engine_var.trace_add("write", _persist_engine)
+
+
+def _restore_engine_choice(_tries=0):
+    """Re-select Natural on launch if that's what was last used.
+
+    Guarded on _cb_env_exists(): if the environment is missing or half-installed
+    we stay on Fast rather than greeting the user with the setup modal on every
+    launch. Setting the var fires _on_engine_change, which runs the normal load
+    path (background thread + progress modal), so nothing here is special-cased.
+    """
+    try:
+        if _get_settings().get("engine") != "Natural":
+            return
+        if not _cb_env_exists():
+            return
+        # Wait for the main window to actually be on screen. Firing while the
+        # splash is still up means app.winfo_x() is Windows' hidden-window
+        # sentinel, and any modal this triggers (the low-RAM warning) centers
+        # itself off-screen — unreachable, because it grabs input and sits
+        # topmost. Poll rather than guess a delay that's long enough.
+        if (not app.winfo_viewable()) or app.winfo_x() < -1000:
+            if _tries < 60:
+                app.after(500, lambda: _restore_engine_choice(_tries + 1))
+            return
+        if engine_var.get() != "Natural":
+            engine_var.set("Natural")
+    except Exception:
+        pass
+
+
+app.after(1200, _restore_engine_choice)
+
+
+def _lock_engine_column_width():
+    """Keep the text panel the same width in Fast and Natural.
+
+    Column 0 carries the grid weight, so it absorbs whatever the engine column
+    doesn't use. The Chatterbox panel is wider than the Kokoro one, so switching
+    engines resized the text box — noticeably wider in Fast. Pin column 1 to the
+    wider of the two panels so the swap can't move anything.
+
+    Measured at runtime rather than hardcoded: the real width depends on the
+    user's DPI scaling, so a fixed number would be wrong on most machines.
+    """
+    try:
+        app.update_idletasks()
+        need = max(cb_frame.winfo_reqwidth(), kokoro_frame.winfo_reqwidth())
+        if need > 0:
+            studio.grid_columnconfigure(1, minsize=need + 40)   # + panel padding
+    except Exception:
+        pass  # cosmetic — never break startup over layout
+
+
+app.after(400, _lock_engine_column_width)
 
 # Generate / Stop buttons are in the header bar
 
