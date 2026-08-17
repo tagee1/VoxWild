@@ -1085,6 +1085,44 @@ def lang_for_voice(voice_id):
     """espeak-ng language code for a Kokoro voice ID (defaults to en-us)."""
     return VOICE_LANG.get(voice_id, "en-us")
 
+
+# 'ñ' preceded by i/í — the only place Kokoro's Spanish voices get it wrong.
+_ES_NI_RE = re.compile("([iIíÍ])([ñÑ])")
+
+def _es_fix_ni(text, lang):
+    """Respell 'ñ' that follows an 'i'. Spanish voices only; no-op elsewhere.
+
+    Kokoro's Spanish voices smear the palatal nasal /ɲ/ into a plain /n/ when it
+    follows a high front vowel, so 'niño' is heard as 'nino'. Nothing upstream is
+    at fault — espeak's phonemes are already correct (nˈiɲo) and 'ɲ' is in
+    Kokoro's vocabulary — the voice model itself is what loses the contrast, so
+    this can only be worked around from the text side. Respelling to 'ninio'
+    gives /nˈinjo/ (n + y-glide), which Spanish listeners hear as the same sound
+    and which every Spanish voice renders cleanly. Confirmed by ear on Dora,
+    Alex and Santa, 2026-08-14.
+
+    Deliberately narrow: fires only after i/í. 'año', 'España', 'otoño' and
+    'pequeño' already sound right and are left untouched.
+    """
+    if not text or not lang or not lang.startswith("es"):
+        return text
+    return _ES_NI_RE.sub(
+        lambda m: m.group(1) + ("NI" if m.group(2) == "Ñ" else "ni"), text)
+
+
+def kokoro_create(text, voice, speed=1.0, lang=None):
+    """kokoro.create with per-language text repairs applied.
+
+    Call this instead of kokoro.create() so a fix can never be added at one site
+    and forgotten at another. Callers keep their ORIGINAL text for read-along and
+    SRT timings — only what reaches the model is rewritten.
+    """
+    lang = lang or lang_for_voice(voice)
+    text = _dash_pause(text)
+    if lang.startswith("en"):
+        text = _speak_times(text)             # "o'clock" is English-only
+    return kokoro.create(_es_fix_ni(text, lang), voice=voice, speed=speed, lang=lang)
+
 def _lang_name_for_label(label):
     """LANGUAGES key whose voice list contains this label (defaults English)."""
     for _lname, _ldata in LANGUAGES.items():
@@ -2888,6 +2926,55 @@ def _year_to_words(y):
         return _two_digit_words(hi) + " oh " + _YEAR_ONES[lo]
     return _two_digit_words(hi) + " " + _two_digit_words(lo)
 
+# Clock times: hour 0-23, minutes 00-59, optional am/pm. Bounded on purpose so
+# scores and ratios ("16:9", "2:1") aren't mistaken for times — their second part
+# isn't two digits. The lookarounds keep it off HH:MM:SS durations too, where
+# "30:00:00" would otherwise have its middle pair rewritten.
+_TIME_RE = re.compile(
+    r'\b(?<![\d:])([01]?\d|2[0-3]):([0-5]\d)(?![\d:])(\s*[ap]\.?\s?m\.?)?', re.I)
+
+def _speak_times(text):
+    """Spell clock times out so they read as one phrase.
+
+    espeak leaves the ':' sitting in the phoneme string — "3:30" phonemizes to
+    θɹˈiː:θˈɜːɾi — and Kokoro renders that colon as a break, so the time came out
+    as "three … thirty" with a hole in the middle. The same colon also stopped
+    espeak from reading the minutes as a unit: "3:05" became "three zero five"
+    and "12:00" became "twelve zero zero". Spelling the time out fixes the gap
+    and the wrong words together.
+
+    English only — "o'clock" has no place in Spanish output.
+    """
+    def _sub(m):
+        h, mi = int(m.group(1)), int(m.group(2))
+        hw = _two_digit_words(h) if h else "twelve"      # 0:15 is "twelve fifteen"
+        if mi == 0:
+            out = hw + " o'clock"
+        elif mi < 10:
+            out = hw + " oh " + _YEAR_ONES[mi]           # 3:05 -> "three oh five"
+        else:
+            out = hw + " " + _two_digit_words(mi)
+        # "3:30pm" must not collapse into "three thirtypm"
+        return out + (" " + m.group(3).strip() if m.group(3) else "")
+    return _TIME_RE.sub(_sub, text)
+
+# Em dash, en dash, and the typed "--" all mean the same beat to a reader.
+# A single hyphen is left alone — that's "well-known", not a pause.
+_DASH_RE = re.compile(r'\s*(?:—|–|--)\s*')
+
+# Both engines under-pause on a dash, so both get the same replacement. Fast
+# (espeak/Kokoro) phonemizes "late—it's" as lˈeɪt— ɪts: one trailing space, a
+# shorter break than the two a comma gets, and it drops the en dash and "--"
+# entirely. Natural (Chatterbox) is short on it too. An ellipsis is the longest
+# break that doesn't drop the pitch the way a full stop does. Chosen by ear on
+# Fast from five options, then confirmed as the same answer for Natural
+# (2026-08-17).
+_DASH_PAUSE = "... "
+
+def _dash_pause(text, replacement=_DASH_PAUSE):
+    """Normalize every dash style into a pause the engines actually render."""
+    return _DASH_RE.sub(replacement, text)
+
 def _tag_year(t):
     """Read 4-digit year-like numbers (1000-2999) naturally: 1982 -> nineteen eighty-two."""
     return re.sub(r'\b\d{4}\b',
@@ -3108,6 +3195,14 @@ def wsola(x, rate, frame=1024, search=360):
     return out.astype(np.float32)
 
 
+# NOTE (2026-08-17): a seam trim used to live here — it cut the silence off each
+# piece of a tag-split sentence to close the ~200 ms gap [loud]/[slow] leave
+# behind. It was REVERTED because energy-based trimming can't tell silence from a
+# quiet speech onset: "This" begins with /ð/, which sits below the -50 dB
+# threshold, so the trim ate the consonant and the word came out as "dis".
+# Any retry must key off something other than raw level at the head of a piece.
+
+
 def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95)):
     """Generate audio for text.
     progress_range: (lo, hi) — smooth bar target is scaled within this window.
@@ -3171,8 +3266,12 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
             else:
                 _done += 1
                 if status_cb: status_cb(f"Generating chunk {_done}/{n_text}...")
+                # Same text repairs Fast mode gets, tuned for this engine. Only what
+                # reaches the model is rewritten — chunks[] keeps the original text
+                # so read-along and SRT still track what the user actually typed.
+                _cb_text = _dash_pause(_speak_times(u["text"]))
                 samples, sr = chatterbox_engine.generate_chunk(
-                    u["text"], audio_prompt_path=prompt,
+                    _cb_text, audio_prompt_path=prompt,
                     exaggeration=exag, cfg_weight=cfg, status_cb=status_cb)
                 samples = np.asarray(samples, dtype=np.float32)
                 if abs(u["speed"] - 1.0) > 1e-3:        # [slow]/[fast]/[rate]
@@ -3214,7 +3313,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
                 sample_rate = sample_rate or 24000
             else:
                 if status_cb: status_cb(f"⏳ Generating chunk {i+1}/{len(units)}...")
-                samples, sr = kokoro.create(u["text"], voice=u["voice"], speed=u["speed"],
+                samples, sr = kokoro_create(u["text"], voice=u["voice"], speed=u["speed"],
                                             lang=lang_for_voice(u["voice"]))
                 samples = np.asarray(samples, dtype=np.float32) * u["gain"]
                 if abs(u["gain"] - 1.0) > 1e-6:
@@ -3302,7 +3401,7 @@ def generate_dialogue_audio(dialogue_lines, speaker_voices, speed,
             for chunk in line_chunks:
                 if cancel_event and cancel_event.is_set():
                     raise GenerationCancelled()
-                samp, sr = kokoro.create(chunk, voice=voice_id, speed=speed, lang=lang_for_voice(voice_id))
+                samp, sr = kokoro_create(chunk, voice=voice_id, speed=speed, lang=lang_for_voice(voice_id))
                 line_samples.append(samp)
                 sample_rate = sr
 
@@ -3753,7 +3852,7 @@ def _build_audiobook(chapters, *, voice, speed, lang, out_dir, book_title,
         for chunk in chunk_text(spoken or title or " "):
             if cancelled():
                 return {"folder": None, "single": None, "chapters": [], "cancelled": True}
-            s, _sr = kokoro.create(chunk, voice=voice, speed=speed, lang=lang)
+            s, _sr = kokoro_create(chunk, voice=voice, speed=speed, lang=lang)
             parts.append(np.asarray(s, dtype=np.float32))
         audio = np.concatenate(parts) if parts else np.zeros(1, np.float32)
         try:
@@ -4161,7 +4260,7 @@ def preview_voice():
 
     def run():
         try:
-            samples, sr = kokoro.create(
+            samples, sr = kokoro_create(
                 preview_text, voice=voice, speed=speed, lang=lang)
             enhanced = apply_enhancements(samples, sr)
             sd.play(enhanced, sr)
@@ -7590,7 +7689,7 @@ def _run_kokoro_benchmark():
     try:
         already = bool(load_calibration().get("words_per_second"))
         _t0 = time.time()
-        kokoro.create(_BENCH_TEXT, voice="af_heart", speed=1.0)
+        kokoro_create(_BENCH_TEXT, voice="af_heart", speed=1.0)
         if not already:
             record_calibration(len(_BENCH_TEXT.split()), time.time() - _t0, use_cb=False)
     except Exception:
