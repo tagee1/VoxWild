@@ -3195,12 +3195,46 @@ def wsola(x, rate, frame=1024, search=360):
     return out.astype(np.float32)
 
 
-# NOTE (2026-08-17): a seam trim used to live here — it cut the silence off each
-# piece of a tag-split sentence to close the ~200 ms gap [loud]/[slow] leave
-# behind. It was REVERTED because energy-based trimming can't tell silence from a
-# quiet speech onset: "This" begins with /ð/, which sits below the -50 dB
-# threshold, so the trim ate the consonant and the word came out as "dis".
-# Any retry must key off something other than raw level at the head of a piece.
+_GAIN_RAMP_MIN_MS = 15     # even with no room, ramp this much — a step is worse
+_GAIN_RAMP_MAX_MS = 120    # never spend longer than this reaching full gain
+
+def apply_tag_gain(samples, gain, sample_rate, threshold_db=-55):
+    """Apply a [loud]/[quiet] gain without stepping the noise floor at the seam.
+
+    A tag-split sentence is spoken in separate pieces and glued together, and the
+    "silence" between them is not silent — each piece carries a noise floor
+    around -70 dB. Multiplying a whole piece by 3.0 for [loud] lifts that hiss
+    along with the voice, so the background jumped ~9.4 dB the instant the loud
+    part began. An abrupt step in hiss is what was heard as a breath or a click
+    mid-sentence. Measured, not guessed (2026-08-17).
+
+    So the gain is faded in across the piece's LEADING quiet run and back out
+    across its trailing one: by the time speech starts the gain is already at
+    full, so the punch is untouched, and the noise floor never steps.
+
+    This replaces an earlier attempt that tried to TRIM the silence instead. That
+    approach is a dead end in both directions: trimming the head cut the /ð/ off
+    "This" (speech onsets sit below any silence threshold), and a tail-only
+    version safe enough to keep trailing consonants removed nothing at all.
+    Nothing is deleted here — only the gain envelope changes, inside regions that
+    are already near-silent.
+    """
+    if abs(gain - 1.0) < 1e-6 or len(samples) == 0:
+        return samples
+    out  = samples * gain
+    thr  = 10 ** (threshold_db / 20.0)
+    loud = np.where(np.abs(samples) > thr)[0]
+    lo   = int(sample_rate * _GAIN_RAMP_MIN_MS / 1000.0)
+    hi   = int(sample_rate * _GAIN_RAMP_MAX_MS / 1000.0)
+    head_quiet = int(loud[0]) if len(loud) else len(samples)
+    tail_quiet = (len(samples) - 1 - int(loud[-1])) if len(loud) else len(samples)
+    n_in  = min(max(lo, min(hi, head_quiet)), len(samples))
+    n_out = min(max(lo, min(hi, tail_quiet)), len(samples) - n_in)
+    if n_in > 0:
+        out[:n_in] = samples[:n_in] * np.linspace(1.0, gain, n_in, dtype=np.float32)
+    if n_out > 0:
+        out[-n_out:] = samples[-n_out:] * np.linspace(gain, 1.0, n_out, dtype=np.float32)
+    return out
 
 
 def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95)):
@@ -3277,7 +3311,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
                 if abs(u["speed"] - 1.0) > 1e-3:        # [slow]/[fast]/[rate]
                     samples = wsola(samples, u["speed"])
                 if abs(u["gain"] - 1.0) > 1e-6:         # [loud]/[quiet]/[volume]
-                    samples = samples * u["gain"]
+                    samples = apply_tag_gain(samples, u["gain"], sr or cb_sr)
                     _used_gain = True
                 all_samples.append(samples)
                 chunks.append(u["text"])
@@ -3315,7 +3349,8 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
                 if status_cb: status_cb(f"⏳ Generating chunk {i+1}/{len(units)}...")
                 samples, sr = kokoro_create(u["text"], voice=u["voice"], speed=u["speed"],
                                             lang=lang_for_voice(u["voice"]))
-                samples = np.asarray(samples, dtype=np.float32) * u["gain"]
+                samples = apply_tag_gain(np.asarray(samples, dtype=np.float32),
+                                         u["gain"], sr)
                 if abs(u["gain"] - 1.0) > 1e-6:
                     _used_gain = True
                 all_samples.append(samples)
