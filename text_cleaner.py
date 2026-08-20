@@ -113,6 +113,20 @@ def clean_text(text: str) -> tuple[str, list[str]]:
     if expanded_any:
         changes.append("Expanded abbreviations")
 
+    # ── Final tidy ────────────────────────────────────────────────────────────
+    # Bracket removal and abbreviation expansion run AFTER the spacing pass, so
+    # they leave their own debris: "the chart [image], ok" came out as
+    # "the chart , ok", which the voice reads with a stumble before the comma.
+    # Sweeping once at the end is safer than reordering the passes — that would
+    # only move the problem to whichever one ran last.
+    tidy = re.sub(r" {2,}", " ", text)
+    tidy = re.sub(r"[ \t]+([,.!?;:])", r"\1", tidy)   # no space before punctuation
+    tidy = re.sub(r" +\n", "\n", tidy)
+    tidy = re.sub(r"\n +", "\n", tidy)
+    if tidy != text:
+        text = tidy
+        changes.append("Fixed spacing issues")
+
     # ── Strip leading/trailing whitespace ─────────────────────────────────────
     text = text.strip()
 

@@ -424,13 +424,27 @@ def main():
         import torchaudio
         from chatterbox.tts import ChatterboxTTS
 
+        # Resolving the cache and LOADING it are separated deliberately. They used
+        # to sit in one try/except, so any failure inside load_model_from_local()
+        # — most likely running out of RAM on a small machine — was treated as
+        # "model missing" and fell through to re-downloading 3 GB that was already
+        # on disk. A load failure is a real error and must be reported as one.
+        local_dir = None
         try:
             from huggingface_hub import snapshot_download
             local_dir = snapshot_download("ResembleAI/chatterbox",
                                           allow_patterns=MODEL_FILES,
                                           local_files_only=True)
-            model = load_model_from_local(local_dir)
         except Exception:
+            local_dir = None          # genuinely not cached — fall through and fetch
+
+        if local_dir:
+            # Say "from disk" out loud: the old wording ("speech model (2 GB)")
+            # read like a download and users reported being re-downloaded.
+            emit({"type": "status",
+                  "msg": "Loading Natural mode from disk (already downloaded)..."})
+            model = load_model_from_local(local_dir)
+        else:
             # ── Download with retry + heartbeat ──────────────────────────────
             # The model is ~3GB. On slow/flaky connections the download can
             # stall. We retry up to 3 times (resume_download=True means each

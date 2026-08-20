@@ -620,14 +620,26 @@ class ChatterboxEngine:
                 + "  [E099]"
             )
 
-    def stop(self):
+    def stop(self, force=False):
+        """Shut the worker down. force=True kills it immediately.
+
+        The polite path asks the worker to quit and waits. That's fine when it's
+        idle, but a worker in the middle of generating won't read the request
+        until it finishes — so Stop would sit for the full 5 s timeout before
+        killing anyway. force skips straight to the kill, which is what a user
+        pressing Stop a second time is asking for.
+        """
         if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.stdin.write((json.dumps({"cmd": "quit"}) + "\n").encode("utf-8"))
-                self._proc.stdin.flush()
-                self._proc.wait(timeout=5)
-            except Exception:
-                self._proc.kill()
+            if force:
+                try: self._proc.kill()
+                except Exception: pass
+            else:
+                try:
+                    self._proc.stdin.write((json.dumps({"cmd": "quit"}) + "\n").encode("utf-8"))
+                    self._proc.stdin.flush()
+                    self._proc.wait(timeout=5)
+                except Exception:
+                    self._proc.kill()
         self._proc = None
 
     @property
@@ -675,7 +687,12 @@ class ChatterboxEngine:
                 os.unlink(tmp.name)
                 self.stop()  # mark engine as needing restart so next attempt recovers
                 raise RuntimeError(msg["msg"])
+        # Reaching here means the pipe closed. That's normally a crash — but it's
+        # also exactly what a forced Stop does on purpose, and reporting the
+        # user's own cancel as "worker closed unexpectedly" would be a lie.
         self.stop()
+        if _cancel_event.is_set():
+            raise GenerationCancelled()
         raise RuntimeError("Chatterbox worker closed unexpectedly.")
 
 chatterbox_engine = ChatterboxEngine()
@@ -3364,6 +3381,13 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
                 all_samples = [s * _f for s in all_samples]
 
     # Build per-chunk timings (before trim/enhance) for SRT
+    # Both engines only test the flag BETWEEN sections, so a job with a single
+    # section runs to completion no matter when Stop was pressed. Without this
+    # the cancelled audio was still enhanced, saved to history and played —
+    # which is what made Stop look like it did nothing at all.
+    if _cancel_event.is_set():
+        raise GenerationCancelled()
+
     chunk_timings = []
     offset = 0.0
     for chunk, samp in zip(chunks, all_samples):
@@ -3602,9 +3626,24 @@ def apply_eq_preset(name=None):
 # GenerationCancelled imported from tts_utils
 _cancel_event = threading.Event()
 
-def cancel_generation():
-    """Signal the running generation thread to stop after the current chunk."""
+def cancel_generation(force=False):
+    """Stop the running generation.
+
+    The flag alone can only take effect BETWEEN sections: Natural generates a
+    whole section inside one blocking call to its worker, so a short one-section
+    job never reaches the next check. Stop looked completely dead and the audio
+    still arrived at the end.
+
+    force=True closes the worker instead. The blocked read ends the moment the
+    pipe dies, so Stop is immediate. The cost is that Natural reloads its model
+    (~2 min) next time — which is why it's the second press, not the first.
+    """
     _cancel_event.set()
+    if force:
+        try:
+            chatterbox_engine.stop(force=True)
+        except Exception:
+            pass
 
 # ── Queue ─────────────────────────────────────────────────────────────────────
 queue_items   = []
@@ -4194,7 +4233,23 @@ def generate_and_store():
 
 def stop_audio():
     if is_generating:
-        cancel_generation()   # signals the generation thread to stop after current chunk
+        if _cancel_event.is_set():
+            # Second press — they've waited and it's still going. End it now.
+            # Paint the acknowledgement BEFORE the kill, not after: Windows takes
+            # a moment to tear down a process holding several GB, and during that
+            # moment the second press looked ignored too. update_idletasks()
+            # pushes the label to screen now rather than after the kill returns.
+            status_label.configure(
+                text="⏹ Stopping now — Natural will reload its model next time.")
+            try: app.update_idletasks()
+            except Exception: pass
+            cancel_generation(force=True)
+        else:
+            cancel_generation()
+            status_label.configure(
+                text="⏹ Stopping after this section… press Stop again to end it now."
+                if engine_var.get() == "Natural"
+                else "⏹ Stopping…")
     elif _preview_busy[0]:
         _cancel_event.set()   # stops the preview if it hasn't started generating yet
         sd.stop()             # stops it if it's already playing
@@ -4878,49 +4933,70 @@ ctk.CTkLabel(_ti_header, text="type  [  for menu",
              font=ctk.CTkFont(family="Segoe UI", size=10),
              text_color=C_TXT3).pack(side="left", padx=(12, 0))
 
-def _attach_context_menu(widget):
-    """Give a CTk textbox/entry a right-click Cut/Copy/Paste/Select All menu.
+_CTX = {"menu": None, "target": None, "is_text": False}
+
+def _ctx_popup(event):
+    """Right-click Cut/Copy/Paste/Select All, for every entry and text box.
+
+    Bound once at the WIDGET-CLASS level rather than per widget. It used to be
+    attached one call at a time, which meant any field added later silently
+    shipped without a right-click menu — the Profiles name box and the Library
+    search box both did, and nothing in the code made that visible. Binding the
+    class means a new field cannot be forgotten.
+
     Paste fires the same <<Paste>> event as Ctrl+V, so existing paste handlers
-    (word count, auto-clean) still run. Built once per widget."""
-    inner   = getattr(widget, "_textbox", None) or getattr(widget, "_entry", None) or widget
-    is_text = hasattr(inner, "tag_add")   # Text widgets have tags; Entry widgets don't
-    menu = tk.Menu(inner, tearoff=0,
-                   bg=C_ELEVATED, fg=C_TXT,
-                   activebackground=C_ACCENT, activeforeground="#0d0d0d",
-                   bd=0, relief="flat")
+    (word count, auto-clean) still run.
+    """
+    w = event.widget
+    _CTX["target"]  = w
+    _CTX["is_text"] = hasattr(w, "tag_add")   # Text has tags; Entry doesn't
 
-    def _emit(ev):
-        try: inner.event_generate(ev)
-        except Exception: pass
+    if _CTX["menu"] is None:
+        m = tk.Menu(app, tearoff=0, bg=C_ELEVATED, fg=C_TXT,
+                    activebackground=C_ACCENT, activeforeground="#0d0d0d",
+                    bd=0, relief="flat")
 
-    def _select_all():
-        try:
-            if is_text:
-                inner.tag_add("sel", "1.0", "end-1c")
-            else:
-                inner.select_range(0, "end")
-            inner.focus_set()
-        except Exception: pass
+        def _emit(ev):
+            t = _CTX["target"]
+            if t is not None:
+                try: t.event_generate(ev)
+                except Exception: pass
 
-    menu.add_command(label="Cut",   command=lambda: _emit("<<Cut>>"))
-    menu.add_command(label="Copy",  command=lambda: _emit("<<Copy>>"))
-    menu.add_command(label="Paste", command=lambda: _emit("<<Paste>>"))
-    menu.add_separator()
-    menu.add_command(label="Select All", command=_select_all)
+        def _select_all():
+            t = _CTX["target"]
+            if t is None:
+                return
+            try:
+                if _CTX["is_text"]:
+                    t.tag_add("sel", "1.0", "end-1c")
+                else:
+                    t.select_range(0, "end")
+                t.focus_set()
+            except Exception: pass
 
-    def _popup(event):
-        try:
-            inner.focus_set()
-            if is_text:   # drop the caret where they clicked, so paste lands there
-                inner.mark_set("insert", "@%d,%d" % (event.x, event.y))
-        except Exception: pass
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        m.add_command(label="Cut",   command=lambda: _emit("<<Cut>>"))
+        m.add_command(label="Copy",  command=lambda: _emit("<<Copy>>"))
+        m.add_command(label="Paste", command=lambda: _emit("<<Paste>>"))
+        m.add_separator()
+        m.add_command(label="Select All", command=_select_all)
+        _CTX["menu"] = m
 
-    inner.bind("<Button-3>", _popup)
-    return menu
+    try:
+        w.focus_set()
+        if _CTX["is_text"]:      # drop the caret where they clicked, so paste lands there
+            w.mark_set("insert", "@%d,%d" % (event.x, event.y))
+    except Exception: pass
+    try:
+        _CTX["menu"].tk_popup(event.x_root, event.y_root)
+    finally:
+        _CTX["menu"].grab_release()
+    return "break"
+
+# CTkEntry wraps a tk Entry and CTkTextbox wraps a tk Text, so binding these two
+# classes reaches every field in the app, including ones inside dialogs that
+# don't exist yet.
+app.bind_class("Entry", "<Button-3>", _ctx_popup, add="+")
+app.bind_class("Text",  "<Button-3>", _ctx_popup, add="+")
 
 
 # ── Inline speech tags: insert-toolbar + '[' menu data ──
@@ -4994,7 +5070,6 @@ def _on_paste(e=None):
         app.after(20, _clean)
 
 text_input.bind("<<Paste>>", _on_paste)
-_attach_context_menu(text_input)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Inline speech tags — live green/orange coloring + a '[' autocomplete menu that
@@ -5285,7 +5360,18 @@ _Tooltip(readalong_switch,
     "(The text box must still show that clip's text.)")
 
 # ── Voice + Engine panel ──────────────────────────────────────────────────────
-mid_panel = _panel(studio, 1)
+# Same outer-card + inner-scroll pattern as the FX panel below, and for the same
+# reason: this panel's height depends on the engine. Natural adds a clone picker,
+# four buttons and two sliders that Fast doesn't have, which pushed the SPEED
+# slider past the bottom of a fixed frame with no way to reach it — worst on a
+# scaled display, where the whole window has less vertical room to begin with.
+_mid_card = ctk.CTkFrame(studio, fg_color=C_CARD, corner_radius=12)
+_mid_card.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=6)
+mid_panel = ctk.CTkScrollableFrame(
+    _mid_card, fg_color="transparent",
+    scrollbar_button_color=C_BORDER,
+    scrollbar_button_hover_color=C_ACCENT_D)
+mid_panel.pack(fill="both", expand=True)
 
 _section_label(mid_panel, "ENGINE",
     tooltip="Choose between Fast mode (Kokoro — instant, offline) and Natural mode "
@@ -5932,8 +6018,14 @@ def _lock_engine_column_width():
     try:
         app.update_idletasks()
         need = max(cb_frame.winfo_reqwidth(), kokoro_frame.winfo_reqwidth())
+        # The panel scrolls, so its scrollbar eats width the controls used to have.
+        # Measure it rather than assume: it scales with the user's DPI setting.
+        try:
+            bar = mid_panel._scrollbar.winfo_reqwidth()
+        except Exception:
+            bar = 20
         if need > 0:
-            studio.grid_columnconfigure(1, minsize=need + 40)   # + panel padding
+            studio.grid_columnconfigure(1, minsize=need + 40 + bar)
     except Exception:
         pass  # cosmetic — never break startup over layout
 
@@ -6471,7 +6563,6 @@ dlg_text = ctk.CTkTextbox(
     fg_color=C_ELEVATED, border_width=0, corner_radius=8,
     text_color=C_TXT)
 dlg_text.pack(fill="both", expand=True, padx=14, pady=(0, 6))
-_attach_context_menu(dlg_text)
 dlg_text.insert("1.0",
     "NARRATOR: In the beginning, there was silence.\n"
     "ALICE: But silence never lasts forever.\n"
@@ -6754,7 +6845,6 @@ ab_text = ctk.CTkTextbox(ab_text_panel,
                          font=ctk.CTkFont(family="Consolas", size=12),
                          fg_color=C_BG, border_width=0, wrap="word")
 ab_text.pack(fill="both", expand=True, padx=14, pady=(0, 6))
-_attach_context_menu(ab_text)
 _sep(ab_text_panel, pady=0)
 ab_txt_btns = ctk.CTkFrame(ab_text_panel, fg_color="transparent")
 ab_txt_btns.pack(fill="x", padx=10, pady=8)
@@ -6813,7 +6903,6 @@ def _ab_field(parent, label, var, placeholder=""):
                      placeholder_text=placeholder, placeholder_text_color=C_TXT3,
                      height=30)
     e.pack(fill="x", padx=14)
-    _attach_context_menu(e)
     return e
 
 _section_label(ab_details, "AUDIOBOOK DETAILS")
@@ -6935,7 +7024,6 @@ def ab_detect_chapters(*_):
                            border_color=C_BORDER, text_color=C_TXT,
                            font=ctk.CTkFont(family="Segoe UI", size=12))
         ent.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        _attach_context_menu(ent)
         words = len(content.split())
         ctk.CTkLabel(row, text=f"{words:,} words", anchor="w", text_color=C_TXT3,
                      font=ctk.CTkFont(family="Segoe UI", size=10)).pack(
@@ -7102,7 +7190,9 @@ def _show_chatterbox_setup_modal(on_complete, on_cancel):
     win.configure(fg_color=C_BG)
     win.transient(app)
     win.protocol("WM_DELETE_WINDOW", lambda: None)
-    win.attributes("-topmost", True)
+    # No -topmost: transient(app) already keeps this above VoxWild. -topmost
+    # additionally floats it over every OTHER application on the desktop,
+    # so it followed the user into their browser and everything else.
     win.lift()
 
     # ── Header ────────────────────────────────────────────────────────────────
@@ -7237,7 +7327,9 @@ def _make_chatterbox_loading_modal():
     win.configure(fg_color=C_BG)
     win.transient(app)
     win.protocol("WM_DELETE_WINDOW", lambda: None)  # block close button
-    win.attributes("-topmost", True)               # stay above main window
+    # No -topmost: transient(app) already keeps this above VoxWild. -topmost
+    # additionally floats it over every OTHER application on the desktop,
+    # so it followed the user into their browser and everything else.
     win.lift()                                      # bring to front
 
     # ── Header ────────────────────────────────────────────────────────────────
@@ -7325,7 +7417,9 @@ def _show_low_ram_warning(free_gb: float, on_proceed, on_cancel):
     win.configure(fg_color=C_BG)
     win.grab_set()
     win.transient(app)
-    win.attributes("-topmost", True)
+    # No -topmost: transient(app) already keeps this above VoxWild. -topmost
+    # additionally floats it over every OTHER application on the desktop,
+    # so it followed the user into their browser and everything else.
     win.lift()
     _fade_in(win)
 
@@ -7382,7 +7476,9 @@ def _show_oom_modal():
     win.configure(fg_color=C_BG)
     win.grab_set()
     win.transient(app)
-    win.attributes("-topmost", True)
+    # No -topmost: transient(app) already keeps this above VoxWild. -topmost
+    # additionally floats it over every OTHER application on the desktop,
+    # so it followed the user into their browser and everything else.
     win.lift()
     _fade_in(win)
 
@@ -7508,7 +7604,6 @@ def _show_activation_modal(can_skip=True, remaining=0):
         placeholder_text="XXXX-XXXX-XXXX-XXXX",
         font=ctk.CTkFont(family="Segoe UI", size=13))
     key_entry.pack(pady=(4, 8))
-    _attach_context_menu(key_entry)
 
     # Pre-fill if there's a saved (unactivated) key
     saved_key = _lic.load_license().get("key") or ""
@@ -8223,7 +8318,9 @@ def _show_onboarding(on_done=None):
     win.grab_set()
     win.transient(app)
     win.protocol("WM_DELETE_WINDOW", lambda: None)  # must use the button to dismiss
-    win.attributes("-topmost", True)
+    # No -topmost: transient(app) already keeps this above VoxWild. -topmost
+    # additionally floats it over every OTHER application on the desktop,
+    # so it followed the user into their browser and everything else.
     win.lift()
     _fade_in(win)
 
