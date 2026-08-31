@@ -199,10 +199,24 @@ class TestParseDialogue(unittest.TestCase):
         result = parse_dialogue("alice: Hello.")
         self.assertEqual(result, [])
 
-    def test_mixed_case_label_not_parsed(self):
-        result = parse_dialogue("Alice: Hello.")
-        # "Alice" is only one uppercase letter followed by lowercase — doesn't match
-        self.assertEqual(result, [])
+    def test_mixed_case_label_is_parsed(self):
+        # Speaker names only have to START with a capital. This test used to
+        # assert the opposite, left over from when ALL CAPS was required, and
+        # had been failing ever since the rule was relaxed.
+        self.assertEqual(parse_dialogue("Alice: Hello."), [("Alice", "Hello.")])
+
+    def test_capitalised_multi_word_name_is_parsed(self):
+        self.assertEqual(parse_dialogue("Dr Smith: Come in."),
+                         [("Dr Smith", "Come in.")])
+
+    def test_url_is_not_read_as_dialogue(self):
+        # Speaker names may contain spaces, so a sentence with a URL in it used
+        # to match with speaker "See https" and lose the "https:" from the text.
+        self.assertEqual(parse_dialogue("See https://example.com for more."), [])
+
+    def test_url_inside_a_real_speaker_line_is_kept_intact(self):
+        result = parse_dialogue("ALICE: Go to https://example.com now.")
+        self.assertEqual(result, [("ALICE", "Go to https://example.com now.")])
 
     def test_speaker_with_digit(self):
         text = "VOICE1: First.\nVOICE2: Second."

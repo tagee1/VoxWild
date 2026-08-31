@@ -32,7 +32,9 @@ if sys.platform == "win32":
     del _sp, _popen_init_orig, _popen_no_window
 
 import customtkinter as ctk
+import window_utils   # imports customtkinter, so must come after the Popen patch above
 from kokoro_onnx import Kokoro
+import onnxruntime as ort   # for RunOptions.terminate — see _abort_kokoro below
 import sounddevice as sd
 import soundfile as sf
 import threading
@@ -270,41 +272,12 @@ BTN_GHOST   = dict(fg_color="transparent", hover_color=C_ELEVATED,
 
 # ── Window helpers ───────────────────────────────────────────────────────────
 def _center_window(win, w: int, h: int) -> None:
-    """Set win to w×h and center it over the main app window.
+    """Size win to w×h and center it over the main app window.
 
-    Centers relative to the app window rather than the screen so it works
-    correctly on remote/cloud desktops (Shadow PC) and multi-monitor setups
-    where GetSystemMetrics may return the wrong coordinate space.
+    Thin wrapper so every dialog in the app shares one implementation —
+    see window_utils.center_window for the scaling and clamping rules.
     """
-    win.update_idletasks()
-    try:
-        ax = app.winfo_x()
-        ay = app.winfo_y()
-        aw = app.winfo_width()
-        ah = app.winfo_height()
-        x = ax + (aw - w) // 2
-        y = ay + (ah - h) // 2
-    except Exception:
-        try:
-            sw = ctypes.windll.user32.GetSystemMetrics(0)
-            sh = ctypes.windll.user32.GetSystemMetrics(1)
-        except Exception:
-            sw = win.winfo_screenwidth()
-            sh = win.winfo_screenheight()
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-    # Clamp onto the visible screen. If the parent is hidden or not yet mapped
-    # (e.g. still behind the splash) Windows reports its position as a large
-    # negative sentinel, which would drop the dialog off-screen — where a modal
-    # with grab_set() can neither be reached nor dismissed.
-    try:
-        sw_ = win.winfo_screenwidth()
-        sh_ = win.winfo_screenheight()
-        x = max(0, min(x, max(0, sw_ - w)))
-        y = max(0, min(y, max(0, sh_ - h)))
-    except Exception:
-        x, y = max(0, x), max(0, y)
-    win.geometry(f"{w}x{h}+{x}+{y}")
+    window_utils.center_window(win, w, h, parent=app)
 
 
 # ── Window animation helpers ──────────────────────────────────────────────────
@@ -352,8 +325,30 @@ except Exception:
 
 app = ctk.CTk()
 app.title(f"{APP_NAME}  v{VERSION}")
-app.geometry("1380x860")
-app.minsize(1100, 720)
+
+# Never ask for a window bigger than the screen can show.
+#
+# CustomTkinter multiplies every geometry it is given by the display scaling, so
+# on a 1080p laptop at Windows' common 150% setting the old fixed values became
+# 2070x1290 real pixels on a 1280x720 desktop — and minsize(1100, 720) became a
+# 1650x1080 FLOOR, so the window could not be shrunk to fit either. The right and
+# bottom edges of the app were simply unreachable, which is what was really behind
+# the missing SPEED slider, the clipped "Tag guide" button, and the off-screen
+# low-RAM dialog. Dividing the screen size back through the scaling factor gives
+# the largest request that still fits. min() means a roomy display is untouched:
+# it only ever shrinks, never grows.
+_WANT_W, _WANT_H = 1380, 860
+_MIN_W,  _MIN_H  = 1100, 720
+try:
+    _scale = ctk.ScalingTracker.get_window_scaling(app) or 1.0
+    _fit_w = int(app.winfo_screenwidth()  / _scale)
+    _fit_h = int(app.winfo_screenheight() / _scale)
+    _WANT_W, _WANT_H = min(_WANT_W, _fit_w), min(_WANT_H, _fit_h)
+    _MIN_W,  _MIN_H  = min(_MIN_W,  _fit_w), min(_MIN_H,  _fit_h)
+except Exception:
+    pass      # unreadable scaling — fall back to the original fixed sizes
+app.geometry(f"{_WANT_W}x{_WANT_H}")
+app.minsize(_MIN_W, _MIN_H)
 
 # Route Tkinter callback exceptions through the crash logger so they're never silent.
 def _on_tk_exception(exc_type, exc_val, exc_tb):
@@ -503,6 +498,61 @@ def _run_splash(on_done):
 
 # ── Load Kokoro ───────────────────────────────────────────────────────────────
 kokoro = Kokoro(_res("kokoro-v1.0.onnx"), _res("voices-v1.0.bin"))
+
+# ── Fast-mode abort switch ────────────────────────────────────────────────────
+# Natural and Enhance run in subprocesses, so Cancel can close them. Fast runs
+# IN-PROCESS: there is nothing to close, and one chunk is a single blocking call
+# into ONNX Runtime. On a 2-core machine an 800-character chunk takes minutes, so
+# a Cancel that could only be read between chunks looked broken for minutes.
+#
+# ONNX Runtime's own answer is RunOptions.terminate — set it from another thread
+# and the running inference aborts. Measured here: a chunk with ~4 minutes left
+# stopped 0.04 s after the flag was set, raised a catchable Python error, and the
+# same session generated normally straight afterwards.
+#
+# kokoro_onnx calls sess.run(None, inputs) with no run options of its own, so the
+# session's run() is wrapped to slip ours in on every call.
+#
+# The flag is STICKY. Left set, every later generation dies instantly with the
+# same error — so _arm_kokoro() must run before any generation starts. That is
+# what _reset_cancel() is for; use it rather than clearing _cancel_event alone.
+_kokoro_run_opts = ort.RunOptions()
+
+try:
+    _kokoro_orig_run = kokoro.sess.run
+
+    def _kokoro_run(output_names, input_feed, run_options=None):
+        return _kokoro_orig_run(output_names, input_feed,
+                                run_options or _kokoro_run_opts)
+
+    kokoro.sess.run = _kokoro_run
+    _KOKORO_ABORTABLE = True
+except Exception:
+    # A kokoro_onnx version that no longer exposes .sess would land here. Fast
+    # mode still works; Cancel just falls back to landing at the next chunk.
+    _KOKORO_ABORTABLE = False
+
+
+def _arm_kokoro():
+    """Clear the abort flag so a new Fast-mode generation can run."""
+    try:
+        _kokoro_run_opts.terminate = False
+    except Exception:
+        pass
+
+
+def _abort_kokoro():
+    """Abort the Fast-mode inference that is running right now."""
+    try:
+        _kokoro_run_opts.terminate = True
+    except Exception:
+        pass
+
+
+def _is_kokoro_abort(e):
+    """True if e is the ONNX error our own abort flag raises."""
+    return "terminate flag" in str(e).lower()
+
 
 _fmt_err = fmt_err  # local alias kept so existing call sites are unchanged
 
@@ -668,31 +718,43 @@ class ChatterboxEngine:
         }
         self._proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
         self._proc.stdin.flush()
-        for raw_bytes in self._proc.stdout:
-            raw = raw_bytes.decode("utf-8", errors="replace").strip()
-            if not raw:
-                continue
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue  # skip non-JSON noise
-            if msg["type"] == "status":
-                if status_cb:
-                    status_cb(msg['msg'])
-            elif msg["type"] == "done":
-                samples, sr = sf.read(tmp.name)
-                os.unlink(tmp.name)
-                return samples, sr
-            elif msg["type"] == "error":
-                os.unlink(tmp.name)
-                self.stop()  # mark engine as needing restart so next attempt recovers
-                raise RuntimeError(msg["msg"])
+        try:
+            for raw_bytes in self._proc.stdout:
+                raw = raw_bytes.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue  # skip non-JSON noise
+                if msg["type"] == "status":
+                    if status_cb:
+                        status_cb(msg['msg'])
+                elif msg["type"] == "done":
+                    samples, sr = sf.read(tmp.name)
+                    os.unlink(tmp.name)
+                    return samples, sr
+                elif msg["type"] == "error":
+                    os.unlink(tmp.name)
+                    self.stop()  # mark engine as needing restart so next attempt recovers
+                    raise RuntimeError(msg["msg"])
+        except ValueError:
+            # Cancel kills the process out from under this loop, and reading a
+            # pipe whose file object has been closed raises ValueError rather
+            # than ending the iteration. Fall through to the cancel check below.
+            if not _cancel_event.is_set():
+                raise
         # Reaching here means the pipe closed. That's normally a crash — but it's
-        # also exactly what a forced Stop does on purpose, and reporting the
-        # user's own cancel as "worker closed unexpectedly" would be a lie.
-        self.stop()
+        # also exactly what Cancel does on purpose, and reporting the user's own
+        # cancel as "worker closed unexpectedly" would be a lie.
+        #
+        # Check the flag BEFORE calling stop(). On a cancel the worker is already
+        # gone (cancel_generation closed it) and a replacement is being started in
+        # the background — so a stop() here would race that restart and kill the
+        # fresh worker instead of the dead one.
         if _cancel_event.is_set():
             raise GenerationCancelled()
+        self.stop()
         raise RuntimeError("Chatterbox worker closed unexpectedly.")
 
 chatterbox_engine = ChatterboxEngine()
@@ -793,16 +855,27 @@ class EnhanceEngine:
                 + "  [E013]"
             )
 
-    def stop(self):
+    def stop(self, force=False):
+        """Shut the worker down. force=True kills it immediately.
+
+        Same reasoning as ChatterboxEngine.stop: a worker part-way through a
+        64-step enhance pass will not read the quit request until it finishes,
+        so the polite path burns the full 5 s timeout and then kills anyway.
+        Cancel needs the kill now, not five seconds from now.
+        """
         if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.stdin.write(
-                    (json.dumps({"cmd": "quit"}) + "\n").encode("utf-8")
-                )
-                self._proc.stdin.flush()
-                self._proc.wait(timeout=5)
-            except Exception:
-                self._proc.kill()
+            if force:
+                try: self._proc.kill()
+                except Exception: pass
+            else:
+                try:
+                    self._proc.stdin.write(
+                        (json.dumps({"cmd": "quit"}) + "\n").encode("utf-8")
+                    )
+                    self._proc.stdin.flush()
+                    self._proc.wait(timeout=5)
+                except Exception:
+                    self._proc.kill()
         self._proc = None
 
     @property
@@ -847,6 +920,15 @@ class EnhanceEngine:
 
 
 enhance_engine = EnhanceEngine()
+
+# An enhancement is in flight. Enhancement runs in its own thread AFTER the
+# generation that produced it has already finished, so is_generating is False by
+# then — which is why Cancel used to grey itself out during the slowest step in
+# the app and do nothing at all. Cancel consults this too.
+#
+# Set in add_to_history (before the thread starts, so the generating thread's
+# own cleanup sees it) and cleared in _enhance_async's finally.
+_enhance_active = threading.Event()
 
 # ── Chatterbox auto-setup helpers ─────────────────────────────────────────────
 
@@ -1138,7 +1220,17 @@ def kokoro_create(text, voice, speed=1.0, lang=None):
     text = _dash_pause(text)
     if lang.startswith("en"):
         text = _speak_times(text)             # "o'clock" is English-only
-    return kokoro.create(_es_fix_ni(text, lang), voice=voice, speed=speed, lang=lang)
+    try:
+        return kokoro.create(_es_fix_ni(text, lang), voice=voice, speed=speed, lang=lang)
+    except Exception as e:
+        # Cancel aborts the inference itself (see _abort_kokoro). ONNX reports
+        # that as a generic failure, so translate it back into the cancellation
+        # every caller already knows how to handle. Every Fast-mode generation
+        # in the app goes through this function, so this one place covers the
+        # Studio, Dialogue, Audiobook and preview paths alike.
+        if _is_kokoro_abort(e):
+            raise GenerationCancelled() from None
+        raise
 
 def _lang_name_for_label(label):
     """LANGUAGES key whose voice list contains this label (defaults English)."""
@@ -1511,7 +1603,11 @@ def add_to_history(samples, sample_rate, text, voice_name, segments=None):
         else:  # Async — worker auto-detects
             device = "cpu"
         entry["enhancing"] = True
+        # Set BEFORE the thread starts: the generating thread's finally block
+        # runs moments from now and asks this whether to leave Cancel live.
+        _enhance_active.set()
         app.after(0, lambda e=entry: _prepend_history_card(e))
+        app.after(0, _reset_stop_button)
         threading.Thread(target=_enhance_async, args=(entry, device), daemon=True).start()
     else:
         app.after(0, lambda e=entry: _prepend_history_card(e))
@@ -1569,11 +1665,19 @@ def _enhance_async(entry, device="cpu"):
             text=f"✅ Enhancement done  ({db:+.1f} dB RMS) — use Orig button to A/B compare"))
 
     except Exception as e:
-        _log_crash(e)
-        raw_msg = str(e)
-        display_msg = raw_msg.replace("  [E013]", "").replace(" [E013]", "")
-        app.after(0, lambda m=display_msg: status_label.configure(
-            text=f"⚠️ Enhancement failed: {m}"))
+        # Cancel kills the worker, which closes the pipe — the same symptom as a
+        # crash. Reporting the user's own Cancel as "Enhancement failed" would be
+        # a lie, and it would hide the useful part: the un-enhanced take is
+        # already saved, so nothing was lost.
+        if _cancel_event.is_set():
+            app.after(0, lambda: status_label.configure(
+                text="⏹ Enhancement cancelled — your original audio is safe in History."))
+        else:
+            _log_crash(e)
+            raw_msg = str(e)
+            display_msg = raw_msg.replace("  [E013]", "").replace(" [E013]", "")
+            app.after(0, lambda m=display_msg: status_label.configure(
+                text=f"⚠️ Enhancement failed: {m}"))
         # Clean up temp files on error
         for _t in (input_tmp, output_tmp):
             try:
@@ -1582,8 +1686,10 @@ def _enhance_async(entry, device="cpu"):
                 pass
     finally:
         entry["enhancing"] = False
+        _enhance_active.clear()
         app.after(0, refresh_history_panel)
         app.after(0, _save_history)
+        app.after(0, _reset_stop_button)
 
 def _prepend_history_card(entry):
     """Add entry to the top of the history panel and rebuild."""
@@ -3626,24 +3732,96 @@ def apply_eq_preset(name=None):
 # GenerationCancelled imported from tts_utils
 _cancel_event = threading.Event()
 
-def cancel_generation(force=False):
-    """Stop the running generation.
+_cb_restart_thread = None
 
-    The flag alone can only take effect BETWEEN sections: Natural generates a
-    whole section inside one blocking call to its worker, so a short one-section
-    job never reaches the next check. Stop looked completely dead and the audio
-    still arrived at the end.
 
-    force=True closes the worker instead. The blocked read ends the moment the
-    pipe dies, so Stop is immediate. The cost is that Natural reloads its model
-    (~2 min) next time — which is why it's the second press, not the first.
+def _restart_chatterbox_bg():
+    """Reload the Natural worker in the background after a cancel.
+
+    Closing the worker is what makes Cancel instant, but it leaves the model
+    unloaded. Reloading it here — while the user is reading, editing or picking
+    a voice — puts that cost on idle time instead of on their next Generate.
+    That reload cost is the whole reason Stop used to need a second press: it was
+    real, so the user had to opt into it. Paid here, one press is enough.
+
+    start() is lock-guarded and returns immediately when the worker is ready, so
+    a Generate arriving mid-reload waits on the same load rather than starting a
+    second one. Skipped if they have already switched back to Fast — on a 2-core
+    machine a pointless reload would be stealing half their CPU.
+    """
+    global _cb_restart_thread
+    if _cb_restart_thread is not None and _cb_restart_thread.is_alive():
+        return
+
+    def _work():
+        if engine_var.get() != "Natural":
+            return
+        try:
+            chatterbox_engine.start()
+            app.after(0, lambda: status_label.configure(
+                text="✅ Natural mode ready again."))
+        except Exception:
+            pass   # the next Generate reports it properly; don't nag here
+
+    _cb_restart_thread = threading.Thread(target=_work, daemon=True)
+    _cb_restart_thread.start()
+
+
+def cancel_generation():
+    """Stop whatever is running, right now. One press does all of it.
+
+    Each engine needs a different lever:
+
+      Fast     runs in-process, so there is nothing to close. ONNX Runtime's
+               terminate flag aborts the inference itself (~0.04 s measured).
+      Natural  is a subprocess; closing it ends the blocked pipe read at once.
+      Enhance  is also a subprocess, and is the slowest step in the app.
+
+    Fast's lever is pulled unconditionally — it only affects an inference that is
+    actually running, and the flag is re-armed at the start of every job. The two
+    subprocesses are only closed when they are the thing in use, because closing
+    one costs a model reload.
+
+    The flag is set as well, for the loops that check between chunks and for the
+    paths that ask "was this a cancel or a crash?" after a pipe dies.
+
+    Natural is reloaded in the background straight afterwards so the user never
+    pays for the kill — see _restart_chatterbox_bg.
     """
     _cancel_event.set()
-    if force:
-        try:
+    _abort_kokoro()
+
+    # Only close Natural if Natural is what's being used. It can sit loaded and
+    # idle while the user works in Fast mode, and throwing that model away —
+    # then reloading it — because they cancelled an unrelated Fast job would be
+    # a punishment for pressing Cancel.
+    _natural_was_up = False
+    try:
+        if engine_var.get() == "Natural" and chatterbox_engine.is_ready:
+            _natural_was_up = True
             chatterbox_engine.stop(force=True)
-        except Exception:
-            pass
+    except Exception:
+        pass
+
+    try:
+        if _enhance_active.is_set():
+            enhance_engine.stop(force=True)
+    except Exception:
+        pass
+
+    if _natural_was_up:
+        _restart_chatterbox_bg()
+
+
+def _reset_cancel():
+    """Arm a fresh job: clear the flag AND un-stick the Fast-mode abort switch.
+
+    Use this instead of _cancel_event.clear() on its own. The ONNX terminate flag
+    stays set once tripped, so a job started without clearing it would die
+    instantly with "Exiting due to terminate flag being set to true."
+    """
+    _cancel_event.clear()
+    _arm_kokoro()
 
 # ── Queue ─────────────────────────────────────────────────────────────────────
 queue_items   = []
@@ -4039,8 +4217,11 @@ def queue_generate_all():
 
     queue_gen_btn.configure(state="disabled")
     play_button.configure(state="disabled")
+    # The queue never armed Stop, so a batch — the longest job in the app — was
+    # the one thing that could not be cancelled at all.
+    _set_stop_live()
     smooth.start(est_total)
-    _cancel_event.clear()
+    _reset_cancel()
 
     def run():
         global is_generating
@@ -4129,6 +4310,7 @@ def queue_generate_all():
                 text=f"✅ Queue complete! {t} {f} files saved to {d}"))
         app.after(0, lambda: queue_gen_btn.configure(state="normal"))
         app.after(0, lambda: play_button.configure(state="normal", text="Generate"))
+        app.after(0, _reset_stop_button)
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -4185,11 +4367,9 @@ def generate_and_store():
     words      = len(text.split())
     est        = estimate_processing_time(text)
 
-    _cancel_event.clear()
+    _reset_cancel()
     play_button.configure(state="disabled", text="Working...")
-    stop_button.configure(state="normal", text="Cancel",
-                          fg_color="#2a0f0f", hover_color="#3d1515",
-                          text_color=C_DANGER, border_width=1, border_color="#3d1515")
+    _set_stop_live()
     queue_gen_btn.configure(state="disabled")
     smooth.start(est)
     is_generating = True
@@ -4222,45 +4402,76 @@ def generate_and_store():
         finally:
             is_generating = False
             app.after(0, lambda: play_button.configure(state="normal", text="Generate"))
-            app.after(0, lambda: stop_button.configure(
-                state="disabled", text="Stop",
-                fg_color="transparent", hover_color=C_ELEVATED,
-                text_color=C_TXT2, border_width=1, border_color=C_BORDER))
+            # Not a plain "disable": an enhancement may have just been kicked off
+            # on its own thread, and Cancel has to stay reachable for it.
+            app.after(0, _reset_stop_button)
             app.after(0, lambda: queue_gen_btn.configure(state="normal"))
 
     threading.Thread(target=run, daemon=True).start()
 
 
+def _set_stop_idle():
+    """Stop button in its resting, greyed-out look."""
+    stop_button.configure(state="disabled", text="Stop",
+                          fg_color="transparent", hover_color=C_ELEVATED,
+                          text_color=C_TXT2, border_width=1, border_color=C_BORDER)
+
+
+def _set_stop_live():
+    """Stop button armed and red, as it looks while a job is running."""
+    stop_button.configure(state="normal", text="Cancel",
+                          fg_color="#2a0f0f", hover_color="#3d1515",
+                          text_color=C_DANGER, border_width=1, border_color="#3d1515")
+
+
+def _reset_stop_button():
+    """Put Stop back the way it should be for whatever is still happening.
+
+    Enhancement outlives the generation that started it — it runs on its own
+    thread after is_generating has already gone False — so the generating
+    thread's cleanup used to grey Cancel out during the slowest step in the app.
+    That was the case where Cancel genuinely did nothing at all. If an
+    enhancement is still in flight, the button stays live.
+    """
+    if _enhance_active.is_set():
+        _set_stop_live()
+    else:
+        _set_stop_idle()
+
+
+def _reset_stop_button_if_idle():
+    """Safety net for the gap between 'is it running?' and cancelling it.
+
+    If the job finished in that moment, its own cleanup has already run and
+    nothing is left to take the button off "Cancelling…". Re-check shortly after.
+    """
+    if not is_generating and not _enhance_active.is_set():
+        _reset_stop_button()
+
+
 def stop_audio():
-    if is_generating:
-        if _cancel_event.is_set():
-            # Second press — they've waited and it's still going. End it now.
-            # Paint the acknowledgement BEFORE the kill, not after: Windows takes
-            # a moment to tear down a process holding several GB, and during that
-            # moment the second press looked ignored too. update_idletasks()
-            # pushes the label to screen now rather than after the kill returns.
-            status_label.configure(
-                text="⏹ Stopping now — Natural will reload its model next time.")
-            try: app.update_idletasks()
-            except Exception: pass
-            cancel_generation(force=True)
-        else:
-            cancel_generation()
-            status_label.configure(
-                text="⏹ Stopping after this section… press Stop again to end it now."
-                if engine_var.get() == "Natural"
-                else "⏹ Stopping…")
+    # One press, always. Every engine has a real abort now (see
+    # cancel_generation), so there is nothing left for a second press to do.
+    if is_generating or _enhance_active.is_set():
+        # Paint the acknowledgement BEFORE the cancel, not after: closing a
+        # worker holding several GB takes Windows a moment, and during that
+        # moment the press looked ignored. update_idletasks() puts it on screen
+        # now rather than when the kill returns.
+        stop_button.configure(state="disabled", text="Cancelling…")
+        status_label.configure(text="⏹ Cancelling…")
+        try: app.update_idletasks()
+        except Exception: pass
+        cancel_generation()
+        app.after(1500, _reset_stop_button_if_idle)
     elif _preview_busy[0]:
-        _cancel_event.set()   # stops the preview if it hasn't started generating yet
-        sd.stop()             # stops it if it's already playing
+        cancel_generation()   # aborts the inference if it is still generating
+        sd.stop()             # stops it if it is already playing
         status_label.configure(text="Preview stopped.")
     else:
         sd.stop()
         status_label.configure(text="Stopped.")
         play_button.configure(state="normal", text="Generate")
-        stop_button.configure(state="disabled", text="Stop",
-                              fg_color="transparent", hover_color=C_ELEVATED,
-                              text_color=C_TXT2, border_width=1, border_color=C_BORDER)
+        _set_stop_idle()
 
 
 _preview_busy = [False]  # a preview (canned or first-sentence) is running
@@ -4294,7 +4505,7 @@ def preview_first_sentence():
     speed   = round(speed_slider.get(), 2)
 
     _preview_busy[0] = True
-    _cancel_event.clear()
+    _reset_cancel()
     sd.stop()  # never talk over something already playing
     preview_line_btn.configure(state="disabled", text="Previewing...")
     play_button.configure(state="disabled")
@@ -4329,10 +4540,7 @@ def preview_first_sentence():
             app.after(0, lambda: preview_line_btn.configure(state="normal", text="Preview"))
             app.after(0, lambda: play_button.configure(state="normal", text="Generate"))
             app.after(0, lambda: queue_gen_btn.configure(state="normal"))
-            app.after(0, lambda: stop_button.configure(
-                state="disabled", text="Stop",
-                fg_color="transparent", hover_color=C_ELEVATED,
-                text_color=C_TXT2, border_width=1, border_color=C_BORDER))
+            app.after(0, _reset_stop_button)
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -4346,7 +4554,12 @@ def preview_voice():
     preview_text = LANGUAGES[_lang_name_for_label(voice_var.get())]["preview"]
     speed = round(speed_slider.get(), 2)
     _preview_busy[0] = True
+    _reset_cancel()
     preview_button.configure(state="disabled")
+    # Enable Stop for the duration. A voice preview is one Kokoro call, which on
+    # a slow machine is tens of seconds — long enough that it needs a way out,
+    # and stop_audio already knows how to end a preview.
+    stop_button.configure(state="normal")
 
     def run():
         try:
@@ -4356,6 +4569,8 @@ def preview_voice():
             sd.play(enhanced, sr)
             sd.wait()
             app.after(0, lambda: status_label.configure(text="✅ Preview done!"))
+        except GenerationCancelled:
+            app.after(0, lambda: status_label.configure(text="Preview stopped."))
         except Exception as e:
             _log_crash(e)
             _msg = _fmt_err(e)
@@ -4363,6 +4578,7 @@ def preview_voice():
         finally:
             _preview_busy[0] = False
             app.after(0, lambda: preview_button.configure(state="normal"))
+            app.after(0, _reset_stop_button)
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -4515,7 +4731,10 @@ def show_settings():
 def show_about():
     win = ctk.CTkToplevel(app)
     win.title("About VoxWild")
-    _center_window(win, 480, 640)
+    # 600, not 640: 640 becomes 960 real pixels at 150% scaling and the title bar
+    # adds 45 more, leaving only 3px of a 1080p screen's 1008px work area. That
+    # fit, but with no margin for a taller taskbar. The body scrolls.
+    _center_window(win, 480, 600)
     win.resizable(False, False)
     win.configure(fg_color=C_BG)
     win.grab_set()
@@ -4543,7 +4762,7 @@ def show_about():
     scroll = ctk.CTkScrollableFrame(win, fg_color="transparent",
                                     scrollbar_button_color=C_ELEVATED,
                                     scrollbar_button_hover_color=C_ACCENT_D)
-    scroll.pack(fill="both", expand=True, padx=24, pady=(16, 0))
+    # Packed after the footer, not here — see the note at the footer below.
 
     def _section(text):
         ctk.CTkLabel(scroll, text=text,
@@ -4625,10 +4844,18 @@ def show_about():
     ctk.CTkLabel(scroll, text=" ", text_color=C_BG).pack()  # bottom padding
 
     # ── Footer ────────────────────────────────────────────────────────────────
-    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
+    # Packed BEFORE the scrollable body and anchored to the bottom. Tk hands out
+    # space in pack order, so whatever is packed last is what gets squeezed when
+    # the window is shorter than its contents want — which made Close the first
+    # casualty on a short screen. Reserving the footer first keeps it visible and
+    # lets the scroll area absorb the shortfall instead.
     foot = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=52)
-    foot.pack(fill="x")
+    foot.pack(fill="x", side="bottom")
     foot.pack_propagate(False)
+    # side="bottom" stacks upward, so this separator lands just above the footer.
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1,
+                 corner_radius=0).pack(fill="x", side="bottom")
+    scroll.pack(fill="both", expand=True, padx=24, pady=(16, 0))
     ctk.CTkLabel(foot, text=f"© 2026 Cookie Studios",
                  font=ctk.CTkFont(family="Segoe UI", size=10),
                  text_color=C_TXT3).pack(side="left", padx=20, pady=18)
@@ -5029,6 +5256,18 @@ _TAG_BUTTONS = [
 ]
 tags_bar = ctk.CTkFrame(text_panel, fg_color="transparent")
 tags_bar.pack(fill="x", padx=14, pady=(0, 4))
+
+# Packed BEFORE the icons, deliberately. Tk hands leftover space to whatever packs
+# LAST, so with the icons claiming the row first this button was starved down to
+# "Tag guid" on a DPI-scaled display. Reserving its width from the right edge
+# first means a tight row can only squeeze the icons, which are fixed-size and
+# carry tooltips. Its width is explicit too: CTkButton does not grow to fit its
+# label, and the old width=1 left nothing for the text to render into.
+ctk.CTkButton(tags_bar, text="?  Tag guide", width=104, height=26,
+              command=lambda: _tag_show_guide(),
+              font=ctk.CTkFont(family="Segoe UI", size=11), **BTN_DARK
+              ).pack(side="right", padx=(6, 0))
+
 ctk.CTkLabel(tags_bar, text="Insert tag:", font=ctk.CTkFont(family="Segoe UI", size=11),
              text_color=C_TXT3).pack(side="left", padx=(0, 4))
 for _ic, _lb, _snip, _tip in _TAG_BUTTONS:
@@ -5037,9 +5276,6 @@ for _ic, _lb, _snip, _tip in _TAG_BUTTONS:
                         font=ctk.CTkFont(family="Segoe UI", size=13), **BTN_GHOST)
     _tb.pack(side="left", padx=2)
     _Tooltip(_tb, f"{_lb} — {_tip}")
-ctk.CTkButton(tags_bar, text="?  Tag guide", width=1, height=26,
-              command=lambda: _tag_show_guide(),
-              font=ctk.CTkFont(family="Segoe UI", size=11), **BTN_DARK).pack(side="right")
 # The "type [ for the menu" hint used to live here. On small / DPI-scaled displays
 # this row overflows the panel and the hint was pushed off the right edge anyway,
 # taking the "? Tag guide" button with it. Removed — the Tag guide button explains
@@ -5320,7 +5556,7 @@ _clean_btn = ctk.CTkButton(txt_btns, text="Clean", command=show_text_cleaner,
 _clean_btn.pack(side="left", padx=(0, 5))
 _Tooltip(_clean_btn, "Clean up pasted text — fix smart quotes, odd spacing and stray characters")
 _dict_btn = ctk.CTkButton(txt_btns, text="Dict",
-              command=lambda: open_pronunciation_window(app),
+              command=lambda: open_pronunciation_window(app, info_btn=_info_btn),
               width=54, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_GHOST)
 _dict_btn.pack(side="left", padx=(0, 5))
@@ -6744,7 +6980,10 @@ def dlg_generate():
 
     d_lines = parse_dialogue(text)
     if not d_lines:
-        status_label.configure(text="⚠️ No dialogue detected. Format: SPEAKER: text  (SPEAKER must be ALL CAPS)")
+        # The ALL CAPS requirement was dropped — a name only has to start with a
+        # capital now — but this message still demanded it, so anyone who wrote
+        # "Alex: Hi." correctly was told to go and shout it instead.
+        status_label.configure(text="⚠️ No dialogue detected. Format: Name: text  (the name must start with a capital letter)")
         return
 
     # Auto-detect if speaker panel is empty
@@ -6764,11 +7003,15 @@ def dlg_generate():
     est            = estimate_processing_time(" ".join(t for _, t in d_lines))
 
     _dlg_cancel_event.clear()
+    _arm_kokoro()   # dialogue is Fast-only; un-stick the abort switch
     dlg_gen_btn.configure(state="disabled", text="Generating...")
     dlg_detect_btn.configure(state="disabled")
     play_button.configure(state="disabled")
     queue_gen_btn.configure(state="disabled")
-    dlg_cancel_btn.configure(command=lambda: _dlg_cancel_event.set())
+    # Abort the running inference too, not just the between-lines flag — a line
+    # already inside Kokoro would otherwise have to finish first.
+    dlg_cancel_btn.configure(command=lambda: (_dlg_cancel_event.set(),
+                                              _abort_kokoro()))
     dlg_cancel_btn.pack(pady=(0, 4))
     smooth.start(est)
 
@@ -7039,7 +7282,9 @@ def ab_detect_chapters(*_):
         text=f"{len(ab_chapters)} chapters · {total_words:,} words · ~{dur} of audio")
 
 def ab_cancel():
-    _cancel_event.set()
+    # cancel_generation, not a bare flag set: a chapter already inside Kokoro
+    # would otherwise run to the end before the flag was next looked at.
+    cancel_generation()
     ab_cancel_btn.configure(state="disabled", text="Cancelling…")
 
 def _ab_reset_buttons():
@@ -7106,7 +7351,7 @@ def ab_build():
     except Exception:
         est = max(30.0, sum(len(c[1]) for c in chapters) / 40.0)
 
-    _cancel_event.clear()
+    _reset_cancel()
     ab_build_btn.configure(state="disabled", text="Building…")
     ab_cancel_btn.configure(state="normal", text="Cancel")
     ab_detect_btn.configure(state="disabled")
@@ -7140,6 +7385,12 @@ def ab_build():
                 app.after(0, lambda: status_label.configure(text="⏹ Audiobook cancelled."))
             else:
                 app.after(0, lambda: _ab_done_ui(res, out_dir))
+        except GenerationCancelled:
+            # Cancel now aborts the chapter mid-generation instead of waiting for
+            # it to finish, so the cancel arrives as an exception rather than as
+            # a "cancelled" result. Finished chapters stay checkpointed on disk.
+            smooth.finish()
+            app.after(0, lambda: status_label.configure(text="⏹ Audiobook cancelled."))
         except Exception as e:
             _log_crash(e)
             app.after(0, lambda e=e: status_label.configure(text=f"❌ Audiobook failed: {e}"))
@@ -8657,8 +8908,34 @@ _lib_main = ctk.CTkFrame(_lib_root, fg_color="transparent")
 _lib_main.pack(side="left", fill="both", expand=True)
 _lib_search_var = ctk.StringVar()
 ctk.CTkEntry(_lib_main, textvariable=_lib_search_var,
-             placeholder_text="Search clips by name or text…", height=32).pack(fill="x")
-_lib_search_var.trace_add("write", lambda *a: _lib_refresh())
+             placeholder_text="Search name, text, voice or folder — e.g. \"heart ads\"",
+             height=32).pack(fill="x")
+
+_lib_search_job  = [None]
+_lib_render_job  = [None]
+# A clip card costs ~167 ms to build, so a long list is seconds of work. Cap what
+# gets rendered; the search box is how you reach the rest.
+_LIB_MAX_CARDS   = 40
+# Must be longer than the gap between keystrokes for an ordinary typist. The first
+# attempt used 180 ms, which is shorter than that — so a rebuild still fired
+# between almost every character and the box stayed just as chunky.
+_LIB_SEARCH_WAIT = 450
+
+def _lib_search_changed(*_):
+    """Rebuild the clip list once typing stops, not on every keystroke.
+
+    Each keystroke used to run the FULL refresh: two reads of the index off disk
+    (one of them stat-ing every clip file to check it still exists), every folder
+    button destroyed and rebuilt, then every clip card destroyed and rebuilt.
+    Only the clip list is touched now — the folder sidebar can't change from
+    typing — and it waits for a real pause first.
+    """
+    if _lib_search_job[0]:
+        try: app.after_cancel(_lib_search_job[0])
+        except Exception: pass
+    _lib_search_job[0] = app.after(_LIB_SEARCH_WAIT, _lib_refresh_clips)
+
+_lib_search_var.trace_add("write", _lib_search_changed)
 _lib_head = ctk.CTkFrame(_lib_main, fg_color="transparent")
 _lib_head.pack(fill="x", pady=(8, 4))
 _lib_title = ctk.CTkLabel(_lib_head, text="All Clips",
@@ -8675,9 +8952,9 @@ def _lib_select(folder, trash=False):
     _lib_state["folder"] = folder; _lib_state["trash"] = trash
     _lib_refresh()
 
-def _lib_refresh_folders():
+def _lib_refresh_folders(data=None):
     for w in _lib_folder_scroll.winfo_children(): w.destroy()
-    data = _lib_data()
+    data = _lib_data() if data is None else data   # caller may already have it
     def _fbtn(label, folder, trash, count):
         active = (_lib_state["trash"] == trash) and (trash or (_lib_state["folder"] == folder))
         b = ctk.CTkButton(_lib_folder_scroll, text=f"{label}  ({count})", anchor="w", height=30,
@@ -8755,18 +9032,29 @@ def _lib_make_clip_row(clip):
                       command=lambda cid=clip["id"]: _lib_rename_clip(cid)).pack(side="right", padx=(0, 4))
 
 def _lib_refresh():
-    _lib_refresh_folders()
+    """Full rebuild — folder sidebar and clip list. Use after anything that can
+    change what folders exist or which folder a clip lives in."""
+    data = _lib_data()              # read once, hand it to both halves
+    _lib_refresh_folders(data)
+    _lib_refresh_clips(data)
+
+
+def _lib_refresh_clips(data=None):
+    """Rebuild only the clip list. Typing can't change the folders, so searching
+    doesn't need to tear the sidebar down and put it back."""
+    if _lib_render_job[0]:          # a previous render is still streaming in
+        try: app.after_cancel(_lib_render_job[0])
+        except Exception: pass
+        _lib_render_job[0] = None
     for w in _lib_clip_scroll.winfo_children(): w.destroy()
-    data = _lib_data()
+    data = _lib_data() if data is None else data
     q = _lib_search_var.get()
     if _lib_state["trash"]:
         _lib_title.configure(text="🗑 Recently Deleted — auto-clears after 30 days")
         _lib_empty_btn.pack(side="right")
-        clips = _cliplib.trashed_clips(data)
-        if q:
-            ql = q.lower()
-            clips = [c for c in clips
-                     if ql in c.get("name", "").lower() or ql in c.get("text", "").lower()]
+        # Same matcher as the main list, so Recently Deleted searches identically
+        # instead of quietly ignoring voice and folder.
+        clips = _cliplib.filter_clips(_cliplib.trashed_clips(data), q)
     else:
         _lib_empty_btn.pack_forget()
         folder = _lib_state["folder"]
@@ -8779,8 +9067,27 @@ def _lib_refresh():
                      font=ctk.CTkFont(family="Segoe UI", size=12),
                      text_color=C_TXT3, justify="left").pack(anchor="w", padx=6, pady=16)
         return
-    for c in clips:
-        _lib_make_clip_row(c)
+
+    # Render a couple of cards per tick instead of all of them in one go.
+    # A clip card costs ~167 ms to build (measured) — six CTkButtons alone are
+    # 56% of that — so a 25-clip folder froze the whole window for four seconds.
+    # Yielding between batches keeps typing and clicking responsive while the
+    # list fills in behind you.
+    shown = clips[:_LIB_MAX_CARDS]
+    def _render(i=0):
+        end = min(i + 2, len(shown))
+        for c in shown[i:end]:
+            _lib_make_clip_row(c)
+        if end < len(shown):
+            _lib_render_job[0] = app.after(1, lambda: _render(end))
+            return
+        _lib_render_job[0] = None
+        if len(clips) > len(shown):
+            ctk.CTkLabel(_lib_clip_scroll,
+                         text=f"Showing {len(shown)} of {len(clips)} — search to narrow it down.",
+                         font=ctk.CTkFont(family="Segoe UI", size=11),
+                         text_color=C_TXT3).pack(anchor="w", padx=6, pady=(4, 12))
+    _render()
 
 def _lib_refresh_if_ready():
     try: _lib_refresh()

@@ -5,22 +5,12 @@ import os
 import sys
 from tkinter import filedialog
 
+import window_utils
+
 
 def _center_window(win, w: int, h: int, parent=None) -> None:
-    win.update_idletasks()
-    try:
-        p = parent or win.master
-        x = p.winfo_x() + (p.winfo_width()  - w) // 2
-        y = p.winfo_y() + (p.winfo_height() - h) // 2
-    except Exception:
-        try:
-            sw = ctypes.windll.user32.GetSystemMetrics(0)
-            sh = ctypes.windll.user32.GetSystemMetrics(1)
-        except Exception:
-            sw = win.winfo_screenwidth()
-            sh = win.winfo_screenheight()
-        x, y = (sw - w) // 2, (sh - h) // 2
-    win.geometry(f"{w}x{h}+{x}+{y}")
+    """Center win over its parent at w×h (see window_utils.center_window)."""
+    window_utils.center_window(win, w, h, parent=parent)
 
 SETTINGS_FILE = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")), "TTS Studio", "settings.json"
@@ -78,7 +68,13 @@ def open_settings_window(parent, voices: list, profiles: list, on_save_callback=
 
     win = ctk.CTkToplevel(parent)
     win.title("Settings")
-    _center_window(win, 520, 680)
+    # 630, not 680: at 150% display scaling 680 becomes 1020 real pixels, and the
+    # title bar adds another 45 — 1065 against a 1080p screen's 1008px work area.
+    # The window could not fit however it was positioned, so Save and Cancel sat
+    # below the bottom of the screen. 630 lands at 990 including the title bar.
+    # The body scrolls, so the lost height comes off the viewport only and no
+    # setting becomes unreachable.
+    _center_window(win, 520, 630)
     win.resizable(False, False)
     win.grab_set()
     win.configure(fg_color=C_BG)
@@ -99,10 +95,11 @@ def open_settings_window(parent, voices: list, profiles: list, on_save_callback=
     ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
 
     # ── Scrollable body ───────────────────────────────────────────────────────
+    # Created here but deliberately NOT packed until after the footer — see the
+    # note down at the footer for why the order matters.
     scroll = ctk.CTkScrollableFrame(win, fg_color=C_BG,
                                     scrollbar_button_color=C_ELEVATED,
                                     scrollbar_button_hover_color=C_ACCENT_D)
-    scroll.pack(fill="both", expand=True, padx=20, pady=(14, 0))
 
     def _card():
         """Container for a group of related settings."""
@@ -255,11 +252,20 @@ def open_settings_window(parent, voices: list, profiles: list, on_save_callback=
         side="left", fill="x", expand=True, padx=(0, 8))
 
     # ── Footer ────────────────────────────────────────────────────────────────
-    ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x")
-
+    # Packed BEFORE the scrollable body, and anchored to the bottom. Tk hands out
+    # space in pack order, so whatever is packed last is what gets squeezed when
+    # the window is shorter than its contents want. The body was packed first
+    # with expand=True, which made Save and Cancel the first casualties on a
+    # short screen. Reserving the footer first means the buttons are always
+    # visible and the scroll area absorbs the shortfall instead.
     foot = ctk.CTkFrame(win, fg_color=C_SURFACE, corner_radius=0, height=64)
-    foot.pack(fill="x")
+    foot.pack(fill="x", side="bottom")
     foot.pack_propagate(False)
+    # side="bottom" stacks upward, so this separator lands just above the footer.
+    ctk.CTkFrame(win, fg_color=C_BORDER, height=1,
+                 corner_radius=0).pack(fill="x", side="bottom")
+
+    scroll.pack(fill="both", expand=True, padx=20, pady=(14, 0))
 
     def on_save():
         new_settings = {

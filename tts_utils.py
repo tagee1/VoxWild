@@ -84,7 +84,13 @@ def parse_dialogue(text):
         # Speaker names need only START with a capital (Alex:, Dr Smith:) —
         # no longer required to be ALL CAPS. Still capital-first to avoid matching
         # lowercase prose like "note:" or "https:".
-        m = re.match(r'^([A-Z][A-Za-z0-9 _\-]*)\s*:\s*(.+)$', line)
+        #
+        # (?!//) keeps a URL from being read as dialogue. Because the name may
+        # contain spaces, "See https://example.com for more." used to match with
+        # speaker "See https" and text "//example.com for more." — inventing a
+        # speaker and eating the "https:" out of the line. A URL's colon is always
+        # followed immediately by "//", which never happens in real dialogue.
+        m = re.match(r'^([A-Z][A-Za-z0-9 _\-]*)\s*:(?!//)\s*(.+)$', line)
         if m:
             result.append((m.group(1).strip(), m.group(2).strip()))
         elif result:

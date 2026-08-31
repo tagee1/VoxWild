@@ -209,23 +209,48 @@ def sweep_trash(library_dir, index_path, days=30):
 
 
 # ── views (pure, no I/O) ─────────────────────────────────────────────────────
+def _newest_first(clips, key="date"):
+    """Sort newest to oldest. Sorting in the VIEW rather than changing insert order
+    means existing libraries reorder themselves too, and a restored clip lands in
+    its rightful place instead of at whichever end it was appended to.
+    ISO 8601 timestamps sort correctly as plain strings."""
+    return sorted(clips, key=lambda c: (c.get(key) or ""), reverse=True)
+
+
 def clips_in_folder(data, folder):
-    """Non-trashed clips in `folder`. folder=None/'' => All Clips (every non-trashed)."""
+    """Non-trashed clips in `folder`, newest first.
+    folder=None/'' => All Clips (every non-trashed)."""
     out = [c for c in data["clips"] if not c.get("trashed")]
     if folder:
         out = [c for c in out if (c.get("folder") or "") == folder]
-    return out
+    return _newest_first(out)
 
 
 def trashed_clips(data):
-    return [c for c in data["clips"] if c.get("trashed")]
+    """Recently Deleted, most recently deleted first."""
+    return _newest_first([c for c in data["clips"] if c.get("trashed")], key="deletedAt")
 
 
-def search_clips(data, query, folder=None):
-    """Search non-trashed clips by name/text (case-insensitive). Optional folder scope."""
-    q = (query or "").strip().lower()
-    pool = clips_in_folder(data, folder)
-    if not q:
-        return pool
-    return [c for c in pool
-            if q in (c.get("name", "").lower()) or q in (c.get("text", "").lower())]
+# Fields a search query is matched against. "voice" and "folder" were missing:
+# searching for the voice you generated a clip with returned nothing, even though
+# the voice is printed on the clip's own card.
+SEARCH_FIELDS = ("name", "text", "voice", "folder")
+
+
+def filter_clips(clips, query, fields=SEARCH_FIELDS):
+    """Filter any list of clips by a query. Every space-separated word must match
+    somewhere, so "heart ads" finds Heart-voiced clips in the Ads folder and the
+    word order doesn't matter. Shared so Recently Deleted searches identically."""
+    terms = (query or "").strip().lower().split()
+    if not terms:
+        return list(clips)
+
+    def _haystack(c):
+        return " ".join(str(c.get(f) or "") for f in fields).lower()
+
+    return [c for c in clips if all(t in _haystack(c) for t in terms)]
+
+
+def search_clips(data, query, folder=None, fields=SEARCH_FIELDS):
+    """Search non-trashed clips, case-insensitive, newest first."""
+    return filter_clips(clips_in_folder(data, folder), query, fields)

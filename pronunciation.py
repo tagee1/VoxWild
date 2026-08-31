@@ -8,22 +8,12 @@ import os
 import re
 import sys
 
+import window_utils
+
 
 def _center_window(win, w: int, h: int, parent=None) -> None:
-    win.update_idletasks()
-    try:
-        p = parent or win.master
-        x = p.winfo_x() + (p.winfo_width()  - w) // 2
-        y = p.winfo_y() + (p.winfo_height() - h) // 2
-    except Exception:
-        try:
-            sw = ctypes.windll.user32.GetSystemMetrics(0)
-            sh = ctypes.windll.user32.GetSystemMetrics(1)
-        except Exception:
-            sw = win.winfo_screenwidth()
-            sh = win.winfo_screenheight()
-        x, y = (sw - w) // 2, (sh - h) // 2
-    win.geometry(f"{w}x{h}+{x}+{y}")
+    """Center win over its parent at w×h (see window_utils.center_window)."""
+    window_utils.center_window(win, w, h, parent=parent)
 
 PRONUNCIATION_FILE = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")),
@@ -60,14 +50,22 @@ def load_dictionary():
     return _default_entries()
 
 def save_dictionary(entries):
+    """Write the dictionary. Returns (ok, error_message).
+
+    It used to swallow the failure into a stderr print — invisible in a windowed
+    app — and the editor closed either way, so a save that never happened looked
+    exactly like one that did. The caller needs to know.
+    """
     global _dict_cache
     _dict_cache = None  # invalidate cache so next generation re-reads the new entries
     try:
         os.makedirs(os.path.dirname(PRONUNCIATION_FILE), exist_ok=True)
         with open(PRONUNCIATION_FILE, "w", encoding="utf-8") as f:
             json.dump(entries, f, indent=2, ensure_ascii=False)
+        return True, ""
     except OSError as e:
         print(f"[pronunciation] Failed to save dictionary: {e}", file=sys.stderr)
+        return False, str(e)
 
 def _default_entries():
     return [
@@ -96,8 +94,19 @@ def apply_pronunciation(text):
     for entry in _dict_cache:
         src = entry["from"]
         dst = entry["to"]
+        if not src:
+            continue   # an empty pattern matches between every character and
+                       # would insert the replacement across the whole text. The
+                       # editor won't save one, but a hand-edited JSON could.
         try:
-            pattern = r'\b' + re.escape(src) + r'\b'
+            # Only demand a word boundary on a side that actually ENDS in a word
+            # character. '\b' after a '.' can never match before a space, so any
+            # entry ending in punctuation silently did nothing — including the
+            # shipped "i.e." and "e.g." defaults, and anything a user added like
+            # "Dr." or "C++".
+            left  = r'\b' if (src[:1].isalnum() or src[:1] == '_') else ''
+            right = r'\b' if (src[-1:].isalnum() or src[-1:] == '_') else ''
+            pattern = left + re.escape(src) + right
             if entry.get("case_sensitive", False):
                 text = re.sub(pattern, dst, text)
             else:
@@ -108,8 +117,13 @@ def apply_pronunciation(text):
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-def open_pronunciation_window(parent):
-    """Open the pronunciation dictionary editor."""
+def open_pronunciation_window(parent, info_btn=None):
+    """Open the pronunciation dictionary editor.
+
+    info_btn: optional factory from app.py that returns a hoverable "i" icon —
+    passed in rather than duplicated here because app.py already owns the tooltip
+    class, and importing it back would be circular (app imports this module).
+    """
     import customtkinter as ctk
     from tkinter import messagebox
 
@@ -138,20 +152,45 @@ def open_pronunciation_window(parent):
     ctk.CTkLabel(win,
                  text="Words and phrases typed here are replaced before speech is generated.",
                  font=ctk.CTkFont(family="Segoe UI", size=11),
-                 text_color=C_TXT3).pack(pady=(8, 4))
+                 text_color=C_TXT3).pack(pady=(8, 1))
+    # The window was a bare list with no guidance, so the trick that makes it
+    # useful — respell phonetically rather than correctly — was never obvious.
+    # Keep the example generic; never ship a real user's word here.
+    ctk.CTkLabel(win,
+                 text="Tip: spell it the way it sounds, not the way it's written — "
+                      "type \"GIF\", say \"jif\".",
+                 font=ctk.CTkFont(family="Segoe UI", size=11),
+                 text_color=C_ACCENT).pack(pady=(0, 5))
 
     # ── Column headers ────────────────────────────────────────────────────────
     col_hdr = ctk.CTkFrame(win, fg_color="transparent")
     col_hdr.pack(fill="x", padx=16)
-    ctk.CTkLabel(col_hdr, text="SAY THIS",
+    # These read "SAY THIS" / "INSTEAD OF", which described the columns backwards:
+    # the first is what you TYPE and the second is what gets SPOKEN, so the built-in
+    # AWS -> Amazon Web Services read as "say AWS instead of Amazon Web Services".
+    # Anyone filling the window in by reading the headers entered every pair inverted.
+    ctk.CTkLabel(col_hdr, text="WHEN YOU TYPE",
                  font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
                  text_color=C_TXT2, width=200, anchor="w").pack(side="left", padx=(0, 8))
-    ctk.CTkLabel(col_hdr, text="INSTEAD OF",
+    ctk.CTkLabel(col_hdr, text="SAY THIS INSTEAD",
                  font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
                  text_color=C_TXT2, width=200, anchor="w").pack(side="left", padx=(0, 8))
-    ctk.CTkLabel(col_hdr, text="CASE",
+    # "CASE" alone told the user nothing — it was the least obvious control in
+    # the window. Spell it out and hang an explanation off it.
+    case_hdr = ctk.CTkFrame(col_hdr, fg_color="transparent")
+    case_hdr.pack(side="left")
+    ctk.CTkLabel(case_hdr, text="EXACT CASE",
                  font=ctk.CTkFont(family="Segoe UI", size=9, weight="bold"),
-                 text_color=C_TXT2, width=50, anchor="w").pack(side="left")
+                 text_color=C_TXT2, anchor="w").pack(side="left")
+    if info_btn:
+        info_btn(case_hdr,
+                 "Tick this to match ONLY the exact capitalisation you typed.\n\n"
+                 "Leave it off and “GIF”, “Gif” and “gif” "
+                 "all match — usually what you want.\n\n"
+                 "Tick it on when your entry is also an everyday word. An entry "
+                 "for “US” left off would turn “Give us the figures” "
+                 "into “Give U.S. the figures”."
+                 ).pack(side="left", padx=(4, 0))
 
     ctk.CTkFrame(win, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x", padx=16, pady=(4, 0))
 
@@ -163,7 +202,7 @@ def open_pronunciation_window(parent):
 
     row_widgets = []   # list of (from_var, to_var, cs_var, frame)
 
-    def _add_row(src="", dst="", cs=False):
+    def _add_row(src="", dst="", cs=False, reveal=False):
         row = ctk.CTkFrame(scroll, fg_color="transparent")
         row.pack(fill="x", pady=3)
 
@@ -171,13 +210,14 @@ def open_pronunciation_window(parent):
         to_var   = ctk.StringVar(value=dst)
         cs_var   = ctk.BooleanVar(value=cs)
 
-        ctk.CTkEntry(row, textvariable=from_var, width=196,
+        first_entry = ctk.CTkEntry(row, textvariable=from_var, width=196,
                      fg_color=C_ELEVATED, border_color=C_BORDER,
-                     text_color=C_TXT, placeholder_text="word / phrase",
-                     placeholder_text_color=C_TXT3).pack(side="left", padx=(0, 8))
+                     text_color=C_TXT, placeholder_text="word you type",
+                     placeholder_text_color=C_TXT3)
+        first_entry.pack(side="left", padx=(0, 8))
         ctk.CTkEntry(row, textvariable=to_var, width=196,
                      fg_color=C_ELEVATED, border_color=C_BORDER,
-                     text_color=C_TXT, placeholder_text="replacement",
+                     text_color=C_TXT, placeholder_text="how to say it",
                      placeholder_text_color=C_TXT3).pack(side="left", padx=(0, 8))
         ctk.CTkCheckBox(row, text="", variable=cs_var, width=24,
                         checkbox_width=16, checkbox_height=16).pack(side="left", padx=(0, 8))
@@ -195,6 +235,18 @@ def open_pronunciation_window(parent):
 
         row_widgets.append((from_var, to_var, cs_var, row))
 
+        if reveal:
+            # A new row lands at the BOTTOM of ten built-in entries, below the
+            # fold — clicking "+ Add Entry" looked like it did nothing at all.
+            def _show():
+                try:
+                    scroll.update_idletasks()
+                    scroll._parent_canvas.yview_moveto(1.0)
+                    first_entry.focus_set()
+                except Exception:
+                    pass
+            win.after(30, _show)
+
     # Populate existing entries
     for e in entries:
         _add_row(e["from"], e["to"], e.get("case_sensitive", False))
@@ -205,7 +257,7 @@ def open_pronunciation_window(parent):
     mid_row = ctk.CTkFrame(win, fg_color="transparent")
     mid_row.pack(fill="x", padx=16, pady=6)
 
-    ctk.CTkButton(mid_row, text="+ Add Entry", command=lambda: _add_row(),
+    ctk.CTkButton(mid_row, text="+ Add Entry", command=lambda: _add_row(reveal=True),
                   width=110, height=30,
                   font=ctk.CTkFont(family="Segoe UI", size=12),
                   **BTN_GHOST).pack(side="left", padx=(0, 8))
@@ -233,25 +285,50 @@ def open_pronunciation_window(parent):
     foot_inner = ctk.CTkFrame(foot, fg_color="transparent")
     foot_inner.pack(side="left", padx=16, pady=10)
 
-    def _save():
-        new_entries = []
+    def _current_entries():
+        """Rows as they stand right now, skipping half-filled ones."""
+        out = []
         for from_var, to_var, cs_var, _ in row_widgets:
             src = from_var.get().strip()
             dst = to_var.get().strip()
             if src and dst:
-                new_entries.append({
-                    "from": src,
-                    "to":   dst,
-                    "case_sensitive": cs_var.get()
-                })
-        save_dictionary(new_entries)
+                out.append({"from": src, "to": dst, "case_sensitive": cs_var.get()})
+        return out
+
+    _opened_with = _current_entries()   # to detect unsaved edits on close
+
+    def _save():
+        ok, err = save_dictionary(_current_entries())
+        if not ok:
+            # Keep the window open so their typing isn't thrown away.
+            messagebox.showerror(
+                "Could not save",
+                "VoxWild couldn't write the pronunciation file:\n\n"
+                f"{PRONUNCIATION_FILE}\n\n{err}\n\n"
+                "Your entries are still here — try again.",
+                parent=win)
+            return
         win.destroy()
+
+    def _close():
+        """Nothing here saves as you type. Closing with edits pending used to
+        discard them silently, which read as 'my entries disappeared'."""
+        if _current_entries() != _opened_with:
+            if not messagebox.askyesno(
+                    "Discard changes?",
+                    "You have unsaved changes to the dictionary.\n\n"
+                    "Close without saving them?",
+                    parent=win):
+                return
+        win.destroy()
+
+    win.protocol("WM_DELETE_WINDOW", _close)
 
     ctk.CTkButton(foot_inner, text="Save Dictionary", command=_save,
                   width=148, height=34,
                   font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
                   ).pack(side="left", padx=(0, 10))
-    ctk.CTkButton(foot_inner, text="Cancel", command=win.destroy,
+    ctk.CTkButton(foot_inner, text="Cancel", command=_close,
                   width=88, height=34,
                   font=ctk.CTkFont(family="Segoe UI", size=12),
                   **BTN_GHOST).pack(side="left")
