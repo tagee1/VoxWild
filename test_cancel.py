@@ -184,10 +184,29 @@ class TestCancelWiring(unittest.TestCase):
                       "abort switch -- the next dialogue run would die instantly")
 
     def test_kokoro_create_translates_the_abort_error(self):
-        """One funnel covers Studio, Dialogue, Audiobook and previews."""
-        fn = self.src.split("def kokoro_create(", 1)[1].split("\ndef ", 1)[0]
+        """One funnel covers Studio, Dialogue, Audiobook and previews.
+
+        The translation lives in _kokoro_one, which wraps the single
+        kokoro.create call; kokoro_create splits a line on its dashes and
+        drives that helper once per piece.
+        """
+        fn = self.src.split("def _kokoro_one(", 1)[1].split("\ndef ", 1)[0]
         self.assertIn("_is_kokoro_abort", fn)
         self.assertIn("GenerationCancelled", fn)
+
+    def test_every_kokoro_call_goes_through_that_translation(self):
+        """A raw kokoro.create() anywhere else would surface the abort as a
+        crash dialog instead of a cancellation.
+
+        Counts calls in statement position only — the name also appears in a
+        comment and in kokoro_create's own docstring, which are not call sites.
+        """
+        import re
+        calls = re.findall(r"(?:return|=)\s*kokoro\.create\(", self.src)
+        self.assertEqual(len(calls), 1,
+                         "a second raw kokoro.create() bypasses the abort funnel")
+        fn = self.src.split("def kokoro_create(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("_kokoro_one(", fn)
 
     def test_cancel_pulls_every_lever(self):
         fn = self.src.split("def cancel_generation(", 1)[1].split("\ndef ", 1)[0]

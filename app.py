@@ -56,7 +56,7 @@ from tts_utils import (
     format_time, chunk_text, parse_dialogue, first_sentence,
     _srt_time, _wrap_for_subtitle, build_srt,
     fmt_err, estimate_audio_duration, GenerationCancelled,
-    history_card_preview, history_card_voice_label,
+    history_card_preview, history_card_voice_label, parse_book_metadata,
 )
 from audio_export import (
     LOUDNESS_PRESETS, DEFAULT_PRESET as DEFAULT_LOUDNESS_PRESET,
@@ -1209,17 +1209,11 @@ def _es_fix_ni(text, lang):
         lambda m: m.group(1) + ("NI" if m.group(2) == "Ñ" else "ni"), text)
 
 
-def kokoro_create(text, voice, speed=1.0, lang=None):
-    """kokoro.create with per-language text repairs applied.
-
-    Call this instead of kokoro.create() so a fix can never be added at one site
-    and forgotten at another. Callers keep their ORIGINAL text for read-along and
-    SRT timings — only what reaches the model is rewritten.
-    """
-    lang = lang or lang_for_voice(voice)
-    text = _dash_pause(text)
+def _kokoro_one(text, voice, speed, lang):
+    """One kokoro.create call, with the per-language text repairs applied."""
     if lang.startswith("en"):
         text = _speak_times(text)             # "o'clock" is English-only
+        text = _speak_ratios(text)            # so is "sixteen TO nine"
     try:
         return kokoro.create(_es_fix_ni(text, lang), voice=voice, speed=speed, lang=lang)
     except Exception as e:
@@ -1231,6 +1225,31 @@ def kokoro_create(text, voice, speed=1.0, lang=None):
         if _is_kokoro_abort(e):
             raise GenerationCancelled() from None
         raise
+
+def kokoro_create(text, voice, speed=1.0, lang=None):
+    """kokoro.create with per-language text repairs applied.
+
+    Call this instead of kokoro.create() so a fix can never be added at one site
+    and forgotten at another. Callers keep their ORIGINAL text for read-along and
+    SRT timings — only what reaches the model is rewritten.
+
+    A dash is rendered as real silence, which means splitting the line and
+    generating each side separately. Studio and Dialogue have normally done that
+    upstream already (parse_speech_tags turns a dash into a [pause] span), so
+    this fires for the Audiobook path, which synthesizes raw chunks and never
+    goes through the tag parser.
+    """
+    lang = lang or lang_for_voice(voice)
+    pieces = [p for p in _DASH_RE.split(text) if p.strip()]
+    if len(pieces) < 2:                        # the common case, unchanged
+        return _kokoro_one(text, voice, speed, lang)
+    out, sr = [], None
+    for i, piece in enumerate(pieces):
+        samples, sr = _kokoro_one(piece, voice, speed, lang)
+        if i:
+            out.append(np.zeros(int(_DASH_PAUSE_SECONDS * sr), dtype=np.float32))
+        out.append(np.asarray(samples, dtype=np.float32))
+    return np.concatenate(out), sr
 
 def _lang_name_for_label(label):
     """LANGUAGES key whose voice list contains this label (defaults English)."""
@@ -1273,11 +1292,35 @@ def _save_fx_settings():
         s["fx_normalize"]         = normalize_var.get()
         s["fx_normalize_preset"]  = normalize_preset_var.get()
         _save_settings(s)
+    except Exception as e:
+        # Was a bare `pass`. This function only ever ran on window close, and no
+        # fx_* key had ever reached settings.json — with the error swallowed
+        # there was nothing anywhere to say why. Log it so a future failure is
+        # findable instead of silent; still never let it break closing the app.
+        _log_crash(e)
+
+# Saving only on close meant a crash, a kill, or a close the handler never saw
+# lost the whole panel. Sliders fire continuously while dragging, so coalesce
+# into one write shortly after the user stops moving things.
+_fx_save_job = [None]
+_fx_restoring = [False]
+
+def _schedule_fx_save(*_args):
+    if _fx_restoring[0]:
+        return          # start-up is applying saved values; nothing new to store
+    try:
+        if _fx_save_job[0] is not None:
+            app.after_cancel(_fx_save_job[0])
     except Exception:
         pass
+    try:
+        _fx_save_job[0] = app.after(600, _save_fx_settings)
+    except Exception:
+        _save_fx_settings()      # no event loop yet — just write it
 
 def _restore_fx_settings():
     """Load persisted FX panel state and apply to UI variables."""
+    _fx_restoring[0] = True      # these .set() calls fire the save traces
     try:
         s = _get_settings()
         highpass_slider.set(s.get("fx_highpass",         _FX_DEFAULTS["fx_highpass"]))
@@ -1300,8 +1343,10 @@ def _restore_fx_settings():
         # Enhancement must be explicitly opted-in each session.
         # enhance_var.set(s.get("fx_enhance", _FX_DEFAULTS["fx_enhance"]))
         update_all_labels()
-    except Exception:
-        pass
+    except Exception as e:
+        _log_crash(e)
+    finally:
+        _fx_restoring[0] = False
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 def load_calibration():
@@ -1896,6 +1941,17 @@ def _make_history_card(parent, idx, entry):
         ).pack(side="left", padx=(0, 4))
 
     if entry.get("original_samples") is not None:
+        # Orig gets a row of its own. On row_act it was packed last, and pack
+        # starves whoever comes last: measured at 150% scaling the action row
+        # has 249px, Delete/Save/📁/SRT claim all of it, and Orig rendered at
+        # x=0 with width=1 — created correctly, drawn one pixel wide, invisible
+        # on every machine. SRT is only built when the entry has segments, which
+        # every Studio generation does, so real clips always hit the crowded
+        # case. Its own row measures 218px of the 249 available, and still fits
+        # once Pause and Stop appear during playback.
+        row_orig = ctk.CTkFrame(content, fg_color="transparent")
+        row_orig.pack(fill="x", pady=(4, 0))
+
         # Build a synthetic entry so the original audio goes through the
         # full playback system — same pause / stop / error handling.
         _orig_entry = {
@@ -1904,20 +1960,21 @@ def _make_history_card(parent, idx, entry):
             "text":        f"[Original] {entry.get('text', '')}",
         }
         orig_play_btn  = ctk.CTkButton(
-            row_act, text="Orig", width=46, height=22,
+            row_orig, text="Orig", width=46, height=22,
             font=ctk.CTkFont(family="Segoe UI", size=10),
             **BTN_GHOST, corner_radius=5,
         )
         orig_pause_btn = ctk.CTkButton(
-            row_act, text="Pause", width=46, height=22,
+            row_orig, text="Pause", width=46, height=22,
             font=ctk.CTkFont(family="Segoe UI", size=10),
             state="disabled", **BTN_GHOST, corner_radius=5,
         )
         orig_stop_btn  = ctk.CTkButton(
-            row_act, text="Stop", width=40, height=22,
+            row_orig, text="Stop", width=40, height=22,
             font=ctk.CTkFont(family="Segoe UI", size=10),
             state="disabled", **BTN_GHOST, corner_radius=5,
         )
+        _Tooltip(orig_play_btn, "Play the un-enhanced take, to A/B against the enhanced one")
         orig_play_btn.configure(
             command=lambda e=_orig_entry, b=orig_play_btn, p=orig_pause_btn, s=orig_stop_btn:
                 _toggle_history_playback(e, b, p, s))
@@ -2664,6 +2721,113 @@ class SegmentBar:
         self.frame.pack(**kw)
 
 
+# ── "Your audio is ready" ─────────────────────────────────────────────────────
+# The Settings checkbox and threshold slider for this had never done anything:
+# the old code imported win10toast, which is not installed, not in
+# requirements.txt and not in the build spec. The import sat inside a bare
+# `except Exception: pass`, so it failed silently on every machine including
+# every customer's — a setting that looked real and controlled nothing.
+#
+# Deliberately built on what the app already has rather than on a new dependency.
+# The in-app updater only replaces VoxWild.exe, so a bundled library added now
+# could not reach existing customers through a patch at all; they would each need
+# a full reinstall to get a chime.
+
+def _flash_taskbar():
+    """Flash the taskbar button until the window is focused again.
+
+    Does nothing when VoxWild is already the foreground window — Windows ignores
+    it there anyway, and the point is to catch someone working in another app.
+    """
+    try:
+        hwnd = ctypes.windll.user32.GetParent(app.winfo_id()) or app.winfo_id()
+        if ctypes.windll.user32.GetForegroundWindow() == hwnd:
+            return
+        # FLASHWINFO: FLASHW_TRAY | FLASHW_TIMERNOFG = flash the button, and keep
+        # flashing until they come back rather than for a fixed count.
+        class _FLASHWINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("hwnd", ctypes.c_void_p),
+                        ("dwFlags", ctypes.c_uint), ("uCount", ctypes.c_uint),
+                        ("dwTimeout", ctypes.c_uint)]
+        fi = _FLASHWINFO(ctypes.sizeof(_FLASHWINFO), ctypes.c_void_p(hwnd),
+                         0x00000002 | 0x0000000C, 0, 0)
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(fi))
+    except Exception:
+        pass
+
+
+_chime_cache = [None]   # (samples, sample_rate), built once on first use
+
+
+def _build_chime(sr=44100):
+    """A soft two-note chime, synthesised rather than loaded from a file.
+
+    No asset to bundle and nothing to go missing from an install, and the level
+    is ours to choose — a Windows system sound is mixed for a different purpose
+    and lands wherever the user's sound theme happens to put it.
+    """
+    def note(freq, dur, amp):
+        t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+        w = np.sin(2 * np.pi * freq * t)
+        w += 0.25 * np.sin(2 * np.pi * freq * 2 * t)   # octave, for a little body
+        env = np.ones_like(t)
+        a = max(1, int(sr * 0.006))                    # fade in, or it clicks
+        env[:a] = np.linspace(0, 1, a)
+        env[a:] = np.exp(-np.linspace(0, 5.0, len(t) - a))   # natural decay
+        return (w * env * amp).astype(np.float32)
+
+    gap = np.zeros(int(sr * 0.045), dtype=np.float32)
+    return np.concatenate([note(880.0, 0.16, 0.28),      # A5
+                           gap,
+                           note(1174.7, 0.30, 0.30)]), sr   # D6
+
+
+def _play_chime():
+    """Play the chime through the app's own audio output.
+
+    Not winsound: PlaySound sends system sounds to Windows' separate "System
+    Sounds" mixer channel, which is not the one the user hears VoxWild's speech
+    on. Tested here — the call succeeded and the sound file was fine, but nothing
+    was audible. sounddevice is the path the app already plays every generation
+    through, so the chime lands on the device and volume the user is actually
+    listening to. winsound stays as a fallback for a machine where the audio
+    device is busy or missing.
+    """
+    try:
+        if _chime_cache[0] is None:
+            _chime_cache[0] = _build_chime()
+        samples, sr = _chime_cache[0]
+        sd.play(samples, sr)
+        return
+    except Exception:
+        pass
+    try:
+        import winsound
+        winsound.PlaySound("SystemAsterisk",
+                           winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception:
+        pass   # never let a chime break a finished generation
+
+
+def notify_done(elapsed):
+    """Tell the user their audio is ready: a chime, and a flashing taskbar button.
+
+    Honours the two existing settings — the on/off checkbox and the "only if it
+    took longer than N seconds" threshold — so a two-second preview stays silent.
+    """
+    try:
+        s = _get_settings()
+        if not s.get("notify_on_completion", True):
+            return
+        if elapsed <= s.get("notify_threshold_seconds", 10):
+            return
+    except Exception:
+        return
+
+    _play_chime()
+    _flash_taskbar()
+
+
 # ── Smooth Progress ───────────────────────────────────────────────────────────
 class SmoothProgress:
     """Drives a SegmentBar honestly: progress tracks actual chunks completed
@@ -2756,10 +2920,16 @@ class SmoothProgress:
     def set_target(self, value):   # legacy no-op safeguard (segment mode ignores it)
         pass
 
-    def finish(self):
+    def finish(self, ok=True):
+        """Stop the bar. ok=False means the job did not produce audio.
+
+        Every exit path calls this — success, cancel and error alike — so it has
+        to be told which it was. Sniffing a global cancel flag instead would miss
+        the Dialogue tab (it has its own) and would still chime after a failure.
+        """
         elapsed = time.time() - self._start_time if self._start_time else 0
         self._running = False
-        app.after(0, lambda e=elapsed: self._finish_ui(e))
+        app.after(0, lambda e=elapsed: self._finish_ui(e, ok))
 
     # ---- main-thread rendering ----
     def _seed_rate(self):
@@ -2770,20 +2940,17 @@ class SmoothProgress:
         except Exception:
             return 40.0
 
-    def _finish_ui(self, elapsed):
+    def _finish_ui(self, elapsed, ok=True):
         self.bar.complete()
         if self.pct_label:
             self.pct_label.configure(text="100%")
+        if not ok:
+            # Cancelled or failed. "✅ Done in 12s" was a lie here, and chiming
+            # "your audio is ready" when there is no audio is worse.
+            self.time_label.configure(text="—")
+            return
         self.time_label.configure(text=f"✅ Done in {format_time(elapsed)}")
-        s = _get_settings()
-        threshold = s.get("notify_threshold_seconds", 10)
-        if s.get("notify_on_completion", True) and elapsed > threshold:
-            try:
-                from win10toast import ToastNotifier
-                ToastNotifier().show_toast(
-                    "VoxWild", "Your audio is ready!", duration=4, threaded=True)
-            except Exception:
-                pass  # Notification is optional, never crash for it
+        notify_done(elapsed)
 
     def _tick(self):
         if not self._running:
@@ -3081,22 +3248,68 @@ def _speak_times(text):
         return out + (" " + m.group(3).strip() if m.group(3) else "")
     return _TIME_RE.sub(_sub, text)
 
+# Ratios, odds and scores: "16:9", "2:1", "3:2". Runs AFTER _speak_times, which
+# has first claim on anything clock-shaped — "3:30" and "John 3:16" are already
+# spoken by then, so a colon that reaches here is a "to", not a time.
+#
+# Natural mode is why this exists. Chatterbox normalizes punctuation before it
+# tokenizes (chatterbox/tts.py, punc_norm) and one of its rules rewrites ":" as
+# ",", so "a 2:1 ratio" arrived at the model as "a 2,1 ratio" and was read as a
+# thousands-grouped number — "two thousand one". That package ships to customers
+# through the Natural-mode installer and cannot be patched from here, so the
+# colon has to be gone before the text reaches it. Fast never had the bug
+# (espeak keeps the colon and renders a short break) but gets the same treatment
+# so the two engines say the same words.
+#
+# Two digits a side covers aspect ratios, odds and scores; anything longer is
+# more likely a reference or a resolution than something read as "to".
+# The trailing guard is "\.\d", not ".", so that a full stop ending the sentence
+# still counts as a ratio ("shot at 2:1.") while a decimal does not ("2.5:1.5").
+_RATIO_RE = re.compile(r'(?<![\d:.])(\d{1,2}):(\d{1,2})(?![\d:]|\.\d)')
+
+def _speak_ratios(text):
+    """Read "16:9" as "sixteen to nine" rather than leaving a bare colon."""
+    return _RATIO_RE.sub(
+        lambda m: f"{_two_digit_words(int(m.group(1)))} to "
+                  f"{_two_digit_words(int(m.group(2)))}", text)
+
 # Em dash, en dash, and the typed "--" all mean the same beat to a reader.
 # A single hyphen is left alone — that's "well-known", not a pause.
 _DASH_RE = re.compile(r'\s*(?:—|–|--)\s*')
 
-# Both engines under-pause on a dash, so both get the same replacement. Fast
-# (espeak/Kokoro) phonemizes "late—it's" as lˈeɪt— ɪts: one trailing space, a
-# shorter break than the two a comma gets, and it drops the en dash and "--"
-# entirely. Natural (Chatterbox) is short on it too. An ellipsis is the longest
-# break that doesn't drop the pitch the way a full stop does. Chosen by ear on
-# Fast from five options, then confirmed as the same answer for Natural
-# (2026-08-17).
-_DASH_PAUSE = "... "
+# A dash becomes real silence, not punctuation, because in Natural mode
+# punctuation buys nothing at all. Measured on the same sentence (2026-09-02),
+# gap at the dash:
+#
+#                     Fast     Natural
+#   dash removed      0.359s   0.225s
+#   "... " (old fix)  0.468s   0.220s   <- Natural: below the do-nothing baseline
+#   ". "              0.434s   0.169s   <- worse still
+#   0.30s silence     0.607s   0.525s
+#
+# The old ellipsis was chosen by ear on Fast and assumed to carry over; it does
+# not. Chatterbox rewrites "..." to ", " in punc_norm before tokenizing, so the
+# beat never reached the model. Silence is engine-independent and exact.
+#
+# The cost is that a dash splits the line into two synthesis calls. Free in
+# Fast; in Natural it is roughly a minute per dash on a 2-core machine.
+_DASH_PAUSE_SECONDS = 0.30
 
-def _dash_pause(text, replacement=_DASH_PAUSE):
-    """Normalize every dash style into a pause the engines actually render."""
-    return _DASH_RE.sub(replacement, text)
+def _dash_to_pause_tag(text, seconds=_DASH_PAUSE_SECONDS):
+    """Rewrite dashes into the app's own [pause] tag, so they become silence.
+
+    Feeding them through the existing tag machinery means read-along, SRT and
+    the progress bar all account for the gap for free — a pause span already
+    carries duration with no text. Substitution skips over [...] spans so a
+    dash inside a tag's argument can't split the tag in half.
+    """
+    out, pos = [], 0
+    for m in _TAG_RE.finditer(text):
+        out.append(_DASH_RE.sub(f" [pause {seconds}] ", text[pos:m.start()]))
+        out.append(m.group())
+        pos = m.end()
+    out.append(_DASH_RE.sub(f" [pause {seconds}] ", text[pos:]))
+    return ''.join(out)
 
 def _tag_year(t):
     """Read 4-digit year-like numbers (1000-2999) naturally: 1982 -> nineteen eighty-two."""
@@ -3120,6 +3333,10 @@ def strip_speech_tags(text):
 def parse_speech_tags(text, base_voice, base_speed):
     """Return (spans, used_effect). spans: {"kind":"text","text","voice","speed","gain"}
     or {"kind":"pause","seconds"}. Stack-based open/close; unrecognized [..] left literal."""
+    # A dash is a pause the reader hears, so turn it into one here rather than at
+    # each caller: every path that honours inline tags — Studio in both engines
+    # and Dialogue — comes through this function.
+    text = _dash_to_pause_tag(text)
     speed_stack, gain_stack, voice_stack, xform_stack = [], [], [], []
     spans, run, used = [], [], [False]
     def cur_speed():
@@ -3426,7 +3643,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
                 # Same text repairs Fast mode gets, tuned for this engine. Only what
                 # reaches the model is rewritten — chunks[] keeps the original text
                 # so read-along and SRT still track what the user actually typed.
-                _cb_text = _dash_pause(_speak_times(u["text"]))
+                _cb_text = _speak_ratios(_speak_times(u["text"]))
                 samples, sr = chatterbox_engine.generate_chunk(
                     _cb_text, audio_prompt_path=prompt,
                     exaggeration=exag, cfg_weight=cfg, status_cb=status_cb)
@@ -3548,6 +3765,7 @@ def generate_dialogue_audio(dialogue_lines, speaker_voices, speed,
     sample_rate = None
     offset      = 0.0
     voice_keys  = list(VOICES.keys())
+    used_gain   = False
 
     for i, (speaker, text) in enumerate(dialogue_lines):
         if cancel_event and cancel_event.is_set():
@@ -3561,15 +3779,44 @@ def generate_dialogue_audio(dialogue_lines, speaker_voices, speed,
             voice_name = speaker_voices.get(speaker, voice_keys[0])
             voice_id   = VOICES.get(voice_name, list(VOICES.values())[0])
 
-            line_chunks  = chunk_text(proc_text)
+            # Inline tags, the same way the Studio tab handles them. Dialogue used
+            # to hand the raw line straight to the engine, so "[pause 500ms]" was
+            # read out loud instead of pausing. The speaker's own voice is the
+            # base, so [voice: Heart] ... [/voice] overrides it for that stretch
+            # only and the Speakers panel keeps working exactly as before.
+            spans, _ = parse_speech_tags(proc_text, voice_id, speed)
+            units = []
+            for _sp in spans:
+                if _sp["kind"] == "pause":
+                    units.append(_sp)
+                else:
+                    for _sub in chunk_text(_sp["text"]):
+                        units.append({"kind": "text", "text": _sub, "voice": _sp["voice"],
+                                      "speed": _sp["speed"], "gain": _sp["gain"]})
+            if not units:
+                units = [{"kind": "text", "text": proc_text, "voice": voice_id,
+                          "speed": speed, "gain": 1.0}]
+
             line_samples = []
-            for chunk in line_chunks:
+            for u in units:
                 if cancel_event and cancel_event.is_set():
                     raise GenerationCancelled()
-                samp, sr = kokoro_create(chunk, voice=voice_id, speed=speed, lang=lang_for_voice(voice_id))
+                if u["kind"] == "pause":
+                    _sr = sample_rate or 24000
+                    line_samples.append(
+                        np.zeros(int(u["seconds"] * _sr), dtype=np.float32))
+                    sample_rate = _sr
+                    continue
+                samp, sr = kokoro_create(u["text"], voice=u["voice"], speed=u["speed"],
+                                         lang=lang_for_voice(u["voice"]))
+                samp = apply_tag_gain(np.asarray(samp, dtype=np.float32), u["gain"], sr)
+                if abs(u["gain"] - 1.0) > 1e-6:
+                    used_gain = True
                 line_samples.append(samp)
                 sample_rate = sr
 
+            if not line_samples:            # a line that was nothing but tags
+                continue
             seg_audio = np.concatenate(line_samples)
             dur = len(seg_audio) / sample_rate
             timings.append((offset, offset + dur, f"{speaker}: {text}"))
@@ -3593,6 +3840,15 @@ def generate_dialogue_audio(dialogue_lines, speaker_voices, speed,
 
     if not parts:
         raise RuntimeError("All dialogue lines failed to generate. Check your script and voices.")
+
+    if used_gain:
+        # [loud]/[volume N] can push a line past full scale. Scale the whole
+        # script by one factor rather than per line, so the quiet lines stay
+        # quiet relative to the loud ones instead of every line being levelled.
+        _peak = max((float(np.max(np.abs(s))) for s in parts if len(s)), default=0.0)
+        if _peak > 0.97:
+            _f = 0.97 / _peak
+            parts = [s * _f for s in parts]
 
     combined = np.concatenate(parts)
 
@@ -3642,6 +3898,7 @@ def apply_settings(s):
     update_all_labels()
     update_word_count()
     eq_preset_var.set("Custom")
+    _schedule_fx_save()        # a profile moves the sliders in code too
 
 EQ_PRESETS = {
     "Custom":             None,
@@ -3727,6 +3984,9 @@ def apply_eq_preset(name=None):
     trim_var.set(p["trim"])
     _applying_eq_preset = False
     update_all_labels()
+    # A CTkSlider only fires its command on a real drag, so setting one in code
+    # never reaches _on_eq_manual_change. Ask for the save explicitly.
+    _schedule_fx_save()
 
 # ── Cancellation ─────────────────────────────────────────────────────────────
 # GenerationCancelled imported from tts_utils
@@ -3789,6 +4049,13 @@ def cancel_generation():
     pays for the kill — see _restart_chatterbox_bg.
     """
     _cancel_event.set()
+    # The Dialogue tab carries its own flag, so the header Stop has to set that
+    # one too — aborting the inference alone would stop the line in flight but
+    # the between-lines checks would carry straight on to the next speaker.
+    try:
+        _dlg_cancel_event.set()
+    except NameError:
+        pass          # not built yet during start-up
     _abort_kokoro()
 
     # Only close Natural if Natural is what's being used. It can sit loaded and
@@ -3885,10 +4152,16 @@ def queue_add():
 def queue_remove():
     sel = queue_listbox.curselection()
     if not sel:
-        status_label.configure(text="⚠️ Click an item first.")
+        status_label.configure(text="⚠️ Click an item first — Ctrl+click to pick several.")
         return
-    queue_items.pop(sel[0])
+    # Highest index first: popping from the front would shift everything below it
+    # and delete the wrong rows for every selection after the first.
+    for idx in sorted(sel, reverse=True):
+        if 0 <= idx < len(queue_items):
+            queue_items.pop(idx)
     refresh_queue_display()
+    status_label.configure(
+        text=f"🗑 Removed {len(sel)} item{'s' if len(sel) != 1 else ''} from the queue.")
 
 def queue_clear():
     queue_items.clear()
@@ -4298,7 +4571,9 @@ def queue_generate_all():
                 _log_crash(e)
                 scb(f"❌ {_fmt_err(e)}")
             time.sleep(0.05)
-        smooth.finish()
+        # A batch stopped part-way still wrote the items it got through, but it
+        # is not "done" — don't chime, and don't claim a finish time.
+        smooth.finish(ok=not cancelled)
         is_generating = False
         completed = i + 1
         fmt_str = out_fmt
@@ -4392,11 +4667,11 @@ def generate_and_store():
                 text="✅ Audio ready! Click ▶ Play in the history panel."))
             app.after(0, update_word_count)  # refresh calibration note
         except GenerationCancelled:
-            smooth.finish()
+            smooth.finish(ok=False)
             app.after(0, lambda: status_label.configure(text="Generation cancelled."))
         except Exception as e:
             _log_crash(e)
-            smooth.finish()
+            smooth.finish(ok=False)
             _msg = _fmt_err(e)
             app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
         finally:
@@ -4582,6 +4857,54 @@ def preview_voice():
 
     threading.Thread(target=run, daemon=True).start()
 
+# ── Auto-clean ────────────────────────────────────────────────────────────────
+# "Auto-clean text on import or paste" is one setting, so it has to behave the
+# same on every tab. It used to be hand-wired into the Studio box only, and the
+# Dialogue and Audiobook boxes silently did nothing — the kind of gap that grows
+# every time a tab is added. These two helpers are the only implementation;
+# every text box calls them.
+
+def _auto_clean_enabled():
+    return bool(_get_settings().get("auto_clean_text", False))
+
+
+def _auto_clean_imported(content, keep_headings=False):
+    """Clean text that has just been read from a file, if the setting is on."""
+    if content and _auto_clean_enabled():
+        content, _changes = clean_text(content, keep_headings=keep_headings)
+    return content
+
+
+def _auto_clean_after_paste(box, keep_headings=False, after=None):
+    """Clean a text box just after a paste lands in it, if the setting is on.
+
+    Deferred with after(): the <<Paste>> event fires BEFORE Tk has inserted the
+    pasted text, so reading the box straight away would clean the old contents
+    and miss what was pasted. `after` is an optional callback (word count, etc.)
+    to run once the box has been rewritten.
+    """
+    if not _auto_clean_enabled():
+        return
+
+    def _clean():
+        raw = box.get("1.0", "end").strip()
+        if not raw:
+            return
+        cleaned, changes = clean_text(raw, keep_headings=keep_headings)
+        if not changes:
+            return
+        box.delete("1.0", "end")
+        box.insert("1.0", cleaned)
+        if after:
+            try: after()
+            except Exception: pass
+        # Only the first three are listed — the full list can run to nine and
+        # would push everything else out of the status bar.
+        status_label.configure(text=f"✅ Auto-cleaned: {', '.join(changes[:3])}")
+
+    app.after(20, _clean)
+
+
 def import_file():
     folder = get_default_folder()
     fp = filedialog.askopenfilename(
@@ -4599,8 +4922,7 @@ def import_file():
         else:
             status_label.configure(text="❌ Could not decode file — unknown encoding.")
             return
-        if _get_settings().get("auto_clean_text", False):
-            content, _ = clean_text(content)
+        content = _auto_clean_imported(content)
         text_input.delete("1.0", "end")
         text_input.insert("1.0", content)
         update_word_count()
@@ -4634,6 +4956,7 @@ def reset_enhancements():
     gain_slider.set(0);       compressor_var.set(False)
     noise_gate_var.set(False); trim_var.set(True)
     update_all_labels()
+    _schedule_fx_save()        # sliders set in code don't fire their command
     status_label.configure(text="🔄 Enhancements reset.")
 
 # ── About Window ──────────────────────────────────────────────────────────────
@@ -5294,16 +5617,7 @@ text_input.bind("<KeyRelease>", update_word_count)
 
 def _on_paste(e=None):
     app.after(10, update_word_count)  # after paste content lands
-    if _get_settings().get("auto_clean_text", False):
-        def _clean():
-            raw = text_input.get("1.0", "end").strip()
-            cleaned, changes = clean_text(raw)
-            if changes:
-                text_input.delete("1.0", "end")
-                text_input.insert("1.0", cleaned)
-                update_word_count()
-                status_label.configure(text=f"✅ Auto-cleaned: {', '.join(changes[:3])}")
-        app.after(20, _clean)
+    _auto_clean_after_paste(text_input, after=update_word_count)
 
 text_input.bind("<<Paste>>", _on_paste)
 
@@ -5311,14 +5625,18 @@ text_input.bind("<<Paste>>", _on_paste)
 # Inline speech tags — live green/orange coloring + a '[' autocomplete menu that
 # appears at the caret (filter, arrow/enter/click), plus snippet insertion.
 # ══════════════════════════════════════════════════════════════════════════════
-_tag_inner = text_input._textbox            # underlying tk.Text
-_tag_inner.tag_config("tag_ok",  foreground=C_ACCENT)
-_tag_inner.tag_config("tag_bad", foreground="#f0a35e")
+# Which text box the tag UI is currently driving. It used to be one hard-wired
+# box, which is why tags typed in the Dialogue script never coloured and never
+# autocompleted -- the machinery simply could not see that box. Only one box has
+# focus at a time, so tracking the active one is enough to share all of it.
+_tag_active = [None]        # the underlying tk.Text being edited
 _tagmenu = {"win": None, "list": None, "items": []}
 
 def _tag_recolor(*_):
     try:
-        inner = _tag_inner
+        inner = _tag_active[0]
+        if inner is None:
+            return
         inner.tag_remove("tag_ok", "1.0", "end")
         inner.tag_remove("tag_bad", "1.0", "end")
         txt = inner.get("1.0", "end-1c")
@@ -5338,7 +5656,9 @@ def _tag_menu_hide():
 def _tag_ctx():
     """Return the query string after an open '[' at the caret, else None."""
     try:
-        inner = _tag_inner
+        inner = _tag_active[0]
+        if inner is None:
+            return
         if inner.tag_ranges("sel"):
             return None
         before = inner.get("1.0", "insert")
@@ -5370,7 +5690,9 @@ def _tag_menu_show(query):
         items = _tag_filter(query)
         if not items:
             _tag_menu_hide(); return
-        inner = _tag_inner
+        inner = _tag_active[0]
+        if inner is None:
+            _tag_menu_hide(); return
         box = inner.bbox("insert")
         if not box:
             _tag_menu_hide(); return
@@ -5421,9 +5743,11 @@ def _tag_menu_choose():
     _tag_menu_hide()
 
 def _tag_insert_snippet(snip, from_bracket=False):
-    """Insert a tag snippet into text_input. ⟨x⟩ pre-selects x; ‸ is caret/wrap point."""
+    """Insert a tag snippet into the active box. ⟨x⟩ pre-selects x; ‸ is caret/wrap point."""
     try:
-        inner = _tag_inner
+        inner = _tag_active[0]
+        if inner is None:
+            return
         if from_bracket:
             before = inner.get("1.0", "insert")
             br = before.rfind("[")
@@ -5485,14 +5809,41 @@ def _tag_key_nav(e):
     if k == "Escape": _tag_menu_hide(); return "break"
     return None
 
-_tag_inner.bind("<KeyRelease>", _tag_on_keyrelease, add="+")
-_tag_inner.bind("<Down>",   _tag_key_nav, add="+")
-_tag_inner.bind("<Up>",     _tag_key_nav, add="+")
-_tag_inner.bind("<Return>", _tag_key_nav, add="+")
-_tag_inner.bind("<Tab>",    _tag_key_nav, add="+")
-_tag_inner.bind("<Escape>", _tag_key_nav, add="+")
-_tag_inner.bind("<FocusOut>", lambda e: app.after(150, _tag_menu_hide), add="+")
-_tag_inner.bind("<Button-1>", lambda e: _tag_menu_hide(), add="+")
+def _tag_attach(box):
+    """Give a CTkTextbox green/orange tag colouring and the '[' autocomplete menu.
+
+    Call this for every box where tags are honoured at generation time. Anywhere
+    tags DO something, they should also look like they do — the Dialogue script
+    accepted them silently, with no colour and no menu, which read as "tags are
+    not supported here" long before the user ever pressed Generate.
+    """
+    inner = box._textbox                     # underlying tk.Text
+    inner.tag_config("tag_ok",  foreground=C_ACCENT)
+    inner.tag_config("tag_bad", foreground="#f0a35e")
+
+    def _mark(e=None):
+        _tag_active[0] = inner
+
+    def _keyrelease(e):
+        _mark()
+        return _tag_on_keyrelease(e)
+
+    def _nav(e):
+        _mark()
+        return _tag_key_nav(e)              # returns "break" to swallow the key
+
+    inner.bind("<FocusIn>",    _mark, add="+")
+    inner.bind("<KeyRelease>", _keyrelease, add="+")
+    for _k in ("<Down>", "<Up>", "<Return>", "<Tab>", "<Escape>"):
+        inner.bind(_k, _nav, add="+")
+    inner.bind("<FocusOut>", lambda e: app.after(150, _tag_menu_hide), add="+")
+    inner.bind("<Button-1>", lambda e: (_mark(), _tag_menu_hide()), add="+")
+
+    if _tag_active[0] is None:
+        _tag_active[0] = inner              # so the toolbar works before any click
+
+
+_tag_attach(text_input)
 
 def _tag_show_guide():
     win = ctk.CTkToplevel(app)
@@ -6381,6 +6732,7 @@ def _on_eq_manual_change(_=None):
     if not _applying_eq_preset:
         eq_preset_var.set("Custom")
     update_all_labels()
+    _schedule_fx_save()
 
 for _eq_s in (compressor_slider, highpass_slider, lowpass_slider, reverb_slider, gain_slider):
     _eq_s.configure(command=_on_eq_manual_change)
@@ -6388,6 +6740,9 @@ for _eq_s in (compressor_slider, highpass_slider, lowpass_slider, reverb_slider,
 noise_gate_var.trace_add("write",  lambda *_: eq_preset_var.set("Custom") if not _applying_eq_preset else None)
 trim_var.trace_add("write",        lambda *_: eq_preset_var.set("Custom") if not _applying_eq_preset else None)
 compressor_var.trace_add("write",  lambda *_: eq_preset_var.set("Custom") if not _applying_eq_preset else None)
+
+for _fx_v in (noise_gate_var, trim_var, compressor_var, enhance_mode):
+    _fx_v.trace_add("write", _schedule_fx_save)
 
 ctk.CTkButton(enh_panel, text="Reset to defaults", command=reset_enhancements,
               width=214, height=30,
@@ -6423,6 +6778,12 @@ def _norm_toggle(*_):
         state="normal" if normalize_var.get() else "disabled")
 normalize_var.trace_add("write", _norm_toggle)
 _norm_toggle()
+
+# Export controls join the same save-on-change wiring. Attached here rather than
+# with the EQ ones above because both variables are created further down the
+# panel than that block, and a trace can't be hung on a name that doesn't exist.
+for _fx_v in (normalize_var, normalize_preset_var):
+    _fx_v.trace_add("write", _schedule_fx_save)
 
 
 def _resemble_deps_without_deepspeed():
@@ -6664,8 +7025,40 @@ queue_listbox = tk.Listbox(
     selectbackground=C_ACCENT_D, selectforeground=C_TXT,
     borderwidth=0, highlightthickness=0,
     activestyle="none",
+    # Without this Tk defaults to "browse": exactly one row selected, always.
+    # There was no way to reach zero rows (so the green bar could never be
+    # cleared) and no way to reach two (so Remove could only ever take one).
+    # "extended" gives click, Ctrl+click to add, Shift+click for a range.
+    selectmode="extended",
     relief="flat")
 queue_listbox.pack(fill="both", expand=True, padx=12, pady=(8, 4))
+
+
+def _queue_click_empty(event):
+    """Clicking below the last row clears the selection.
+
+    "extended" still leaves no way to deselect the last row by clicking it, and
+    a green bar you cannot get rid of reads as stuck.
+    """
+    if queue_listbox.nearest(event.y) < 0 or not queue_items:
+        queue_listbox.selection_clear(0, "end")
+        return
+    bbox = queue_listbox.bbox(queue_listbox.nearest(event.y))
+    if bbox and event.y > bbox[1] + bbox[3]:      # below the last drawn row
+        queue_listbox.selection_clear(0, "end")
+
+
+queue_listbox.bind("<Button-1>", _queue_click_empty, add="+")
+queue_listbox.bind("<Escape>",
+                   lambda e: queue_listbox.selection_clear(0, "end"), add="+")
+
+# Multi-select is not discoverable on its own — nothing on screen says a list
+# takes Ctrl+click until you already know it does.
+ctk.CTkLabel(q_card,
+             text="Click to select  ·  Ctrl+click for several  ·  Shift+click for a range"
+                  "  ·  click below the list to clear",
+             font=ctk.CTkFont(family="Segoe UI", size=10),
+             text_color=C_TXT3, anchor="w").pack(fill="x", padx=14, pady=(0, 2))
 
 _sep(q_card)
 
@@ -6788,7 +7181,10 @@ dlg_script_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=6)
 
 _section_label(dlg_script_panel, "DIALOGUE SCRIPT", padx=14, pady=(12, 2))
 ctk.CTkLabel(dlg_script_panel,
-             text="One cue per line  ·  SPEAKER (all caps) followed by a colon, then the spoken text",
+             # Not "all caps" — that requirement was dropped; a name only has to
+             # start with a capital. The old wording sent people off to shout.
+             text="One cue per line  ·  Name (starting with a capital) then a colon, "
+                  "then the spoken text  ·  Inline [tags] work here too",
              font=ctk.CTkFont(family="Segoe UI", size=10),
              text_color=C_TXT3, anchor="w").pack(anchor="w", padx=14, pady=(0, 8))
 
@@ -6825,9 +7221,13 @@ def dlg_import_file():
         else:
             status_label.configure(text="❌ Could not decode file — unknown encoding.")
             return
+        content = _auto_clean_imported(content)
         dlg_text.delete("1.0", "end")
         dlg_text.insert("1.0", content)
         status_label.configure(text=f"✅ Imported {len(content):,} characters.")
+
+dlg_text.bind("<<Paste>>", lambda e=None: _auto_clean_after_paste(dlg_text))
+_tag_attach(dlg_text)   # green/orange colouring and the '[' menu, same as Studio
 
 ctk.CTkButton(dlg_txt_btns, text="Import", command=dlg_import_file,
               width=76, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
@@ -6836,6 +7236,12 @@ ctk.CTkButton(dlg_txt_btns, text="Clear",
               command=lambda: (dlg_text.delete("1.0", "end")),
               width=60, height=30, font=ctk.CTkFont(family="Segoe UI", size=12),
               **BTN_DARK).pack(side="left")
+# Tags are honoured here now, so the guide belongs here too — same button and
+# same window as the Studio tab's.
+ctk.CTkButton(dlg_txt_btns, text="?  Tag guide", width=104, height=30,
+              command=lambda: _tag_show_guide(),
+              font=ctk.CTkFont(family="Segoe UI", size=11),
+              **BTN_DARK).pack(side="right")
 
 # ── Speakers panel ────────────────────────────────────────────────────────────
 dlg_right = ctk.CTkFrame(dlg_tab, fg_color=C_CARD, corner_radius=12)
@@ -6875,11 +7281,17 @@ dlg_gen_btn = ctk.CTkButton(
 dlg_gen_btn.pack(pady=(0, 4))
 
 dlg_cancel_btn = ctk.CTkButton(
-    dlg_gen_frame, text="Cancel",
-    width=256, height=30,
-    font=ctk.CTkFont(family="Segoe UI", size=12),
-    **BTN_DARK)
+    dlg_gen_frame, text="⏹  Cancel",
+    width=256, height=34,
+    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+    corner_radius=8, **BTN_DANGER)
 # shown only during generation (packed dynamically)
+#
+# BTN_DANGER, not BTN_DARK: BTN_DARK's fill is C_CARD, which is the exact colour
+# of the panel behind it, and its text is the dim C_TXT2 with no border. The
+# button was rendering at full size in the right place and was simply impossible
+# to see — dark grey on identical dark grey. Red, bold and bordered now, matching
+# the Studio Cancel it does the same job as.
 
 ctk.CTkLabel(dlg_right,
              text="Fast mode (Kokoro) · output appears in Studio history",
@@ -6890,10 +7302,20 @@ ctk.CTkLabel(dlg_right,
 dlg_speaker_vars = {}   # speaker_name → StringVar (voice display name)
 _dlg_cancel_event = threading.Event()
 
-def dlg_detect_speakers():
+def dlg_detect_speakers(keep_voices=None):
+    """Rebuild the Speakers panel from the script.
+
+    Voices already chosen are kept, matched by speaker name: re-detecting after
+    an edit used to reset the whole cast to defaults, so adding one line cost you
+    every voice you had picked. Speakers that are new still get a default.
+    """
     text     = dlg_text.get("1.0", "end").strip()
     d_lines  = parse_dialogue(text)
     speakers = list(dict.fromkeys(sp for sp, _ in d_lines))  # ordered unique
+
+    # Default to whatever is on screen right now, so a plain re-detect is safe.
+    if keep_voices is None:
+        keep_voices = dict(dlg_speaker_vars)
 
     for w in dlg_speakers_scroll.winfo_children():
         w.destroy()
@@ -6924,17 +7346,90 @@ def dlg_detect_speakers():
         row = ctk.CTkFrame(dlg_speakers_scroll, fg_color=C_ELEVATED, corner_radius=8)
         row.pack(fill="x", padx=2, pady=(0, 6))
 
-        # Editable speaker name
+        # Two lines, not one. Name + button + voice dropdown side by side wanted
+        # 471px inside a 294px panel at 150% scaling — measured — so the button,
+        # packed last, was pushed clean off the edge and never rendered at all.
+        # It has been invisible on every display since it was added. Splitting the
+        # row gives each control the width it asks for instead of overflowing.
+        line1 = ctk.CTkFrame(row, fg_color="transparent")
+        line1.pack(fill="x", padx=10, pady=(8, 0))
+        line2 = ctk.CTkFrame(row, fg_color="transparent")
+        line2.pack(fill="x", padx=10, pady=(4, 8))
+
         name_var = ctk.StringVar(value=speaker)
-        name_entry = ctk.CTkEntry(row, textvariable=name_var, width=90,
+
+        # Rename-in-script. Defined before the button so the button can be packed
+        # before the name box — see the note on the button itself.
+        def _make_rename(old, nv):
+            def _do(_e=None):
+                # No .upper(): the ALL CAPS requirement was dropped, so forcing it
+                # here turned "Dr Smith" into "DR SMITH" against the user's typing.
+                new = nv.get().strip()
+
+                # Every one of these used to be a silent `return`, so pressing
+                # Rename without editing the name first — the obvious thing to try
+                # — looked like a dead button.
+                if not new:
+                    nv.set(old)
+                    status_label.configure(
+                        text="⚠️ Type the new name in the box first, then press Rename.")
+                    return
+                if new == old:
+                    status_label.configure(
+                        text=f"ℹ️ '{old}' is unchanged — edit the name box, then press Rename.")
+                    return
+
+                content = dlg_text.get("1.0", "end")
+                updated, n = re.subn(rf'^{re.escape(old)}\s*:', f'{new}:', content,
+                                     flags=re.MULTILINE)
+                if not n:
+                    status_label.configure(
+                        text=f"⚠️ No lines starting with '{old}:' found in the script.")
+                    return
+                dlg_text.delete("1.0", "end")
+                dlg_text.insert("1.0", updated.rstrip('\n'))
+
+                # Move this speaker's voice onto the new name so the rename keeps
+                # their cast — the rebuild below would not recognise it otherwise.
+                # If the new name is an existing speaker the two merge, so leave
+                # that speaker's own voice alone rather than overwriting it.
+                _keep = dict(dlg_speaker_vars)
+                _moved = _keep.pop(old, None)
+                _merged = new in _keep
+                if _moved and not _merged:
+                    _keep[new] = _moved
+                dlg_detect_speakers(keep_voices=_keep)
+                status_label.configure(
+                    text=(f"✅ Renamed '{old}' to '{new}' in {n} line(s)."
+                          + (f"  Merged into the existing '{new}'." if _merged else "")))
+            return _do
+
+        # Packed BEFORE the name box even though it sits to its right. Tk hands
+        # out width in pack order, so an expand=True entry packed first eats the
+        # row and starves whatever follows — measured at 45px here, enough to clip
+        # the label. Reserving the button first lets the entry take the leftover.
+        #
+        # Labelled "Reset" until now, while renaming the speaker through the whole
+        # script. Nothing in this row resets anything.
+        _rename = _make_rename(speaker, name_var)
+        ctk.CTkButton(line1, text="Rename", width=62, height=26,
+                      font=ctk.CTkFont(family="Segoe UI", size=11),
+                      command=_rename,
+                      **BTN_GHOST).pack(side="right")
+
+        # Editable speaker name
+        name_entry = ctk.CTkEntry(line1, textvariable=name_var,
                                   font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
                                   fg_color=C_BG, border_width=1, border_color=C_BORDER,
                                   text_color=C_TXT)
-        name_entry.pack(side="left", padx=(10, 4), pady=8)
+        name_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        name_entry.bind("<Return>", _rename)   # Enter is the natural way to commit
 
         # Voice dropdown — use explicit command to guarantee the selection is stored
         # (CTkOptionMenu variable binding is unreliable without a command callback)
-        default_voice = _default_voice(i)
+        # Their earlier choice wins over the alternating default.
+        _kept = keep_voices.get(speaker)
+        default_voice = _kept if _kept in VOICES else _default_voice(i)
         dlg_speaker_vars[speaker] = default_voice  # store display-name string, not StringVar
 
         def _make_voice_cmd(sp):
@@ -6942,30 +7437,12 @@ def dlg_detect_speakers():
                 dlg_speaker_vars[sp] = choice
             return _on_select
 
-        menu = ctk.CTkOptionMenu(row, values=voice_list,
+        menu = ctk.CTkOptionMenu(line2, values=voice_list,
                                  command=_make_voice_cmd(speaker),
-                                 width=140, dynamic_resizing=False,
+                                 dynamic_resizing=False,
                                  font=ctk.CTkFont(family="Segoe UI", size=11))
         menu.set(default_voice)
-        menu.pack(side="left", padx=(0, 4), pady=8)
-
-        # Rename-in-script button
-        def _make_rename(old, nv):
-            def _do():
-                new = nv.get().strip().upper()
-                if not new or new == old:
-                    return
-                content = dlg_text.get("1.0", "end")
-                updated = re.sub(rf'^{re.escape(old)}\s*:', f'{new}:', content, flags=re.MULTILINE)
-                dlg_text.delete("1.0", "end")
-                dlg_text.insert("1.0", updated.rstrip('\n'))
-                dlg_detect_speakers()
-            return _do
-
-        ctk.CTkButton(row, text="Reset", width=52, height=28,
-                      font=ctk.CTkFont(family="Segoe UI", size=12),
-                      command=_make_rename(speaker, name_var),
-                      **BTN_GHOST).pack(side="left", padx=(0, 6), pady=8)
+        menu.pack(fill="x")
 
     status_label.configure(text=f"✅ {len(speakers)} detected — speaker 1 female, speaker 2 male by default.")
 
@@ -7013,6 +7490,11 @@ def dlg_generate():
     dlg_cancel_btn.configure(command=lambda: (_dlg_cancel_event.set(),
                                               _abort_kokoro()))
     dlg_cancel_btn.pack(pady=(0, 4))
+    # The header Stop button sits in the tab row, so it is on screen from the
+    # Dialogue tab too — but dialogue never armed it, leaving it greyed out and
+    # unclickable for the whole run. Anyone reaching for the app's main Stop
+    # found it dead.
+    _set_stop_live()
     smooth.start(est)
 
     def run():
@@ -7036,13 +7518,13 @@ def dlg_generate():
                 app.after(0, lambda: status_label.configure(
                     text="✅ Dialogue ready! View in Studio → History panel."))
         except GenerationCancelled:
-            smooth.finish()
+            smooth.finish(ok=False)
             app.after(0, lambda: status_label.configure(text="🚫 Dialogue generation cancelled."))
         except Exception as e:
             _log_crash(e)
             _msg = _fmt_err(e)
             app.after(0, lambda m=_msg: status_label.configure(text=f"❌ {m}"))
-            smooth.finish()
+            smooth.finish(ok=False)
         finally:
             is_generating = False
             app.after(0, lambda: dlg_gen_btn.configure(state="normal", text="Generate Dialogue"))
@@ -7050,6 +7532,7 @@ def dlg_generate():
             app.after(0, lambda: dlg_cancel_btn.pack_forget())
             app.after(0, lambda: play_button.configure(state="normal", text="Generate"))
             app.after(0, lambda: queue_gen_btn.configure(state="normal"))
+            app.after(0, _reset_stop_button)
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -7088,14 +7571,20 @@ ab_text = ctk.CTkTextbox(ab_text_panel,
                          font=ctk.CTkFont(family="Consolas", size=12),
                          fg_color=C_BG, border_width=0, wrap="word")
 ab_text.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+# keep_headings: split_into_chapters finds chapters by their '#' marks, so
+# stripping those would turn a whole book into a single chapter. The '#' is
+# still never spoken — it becomes the chapter title.
+ab_text.bind("<<Paste>>",
+             lambda e=None: _auto_clean_after_paste(ab_text, keep_headings=True))
 _sep(ab_text_panel, pady=0)
 ab_txt_btns = ctk.CTkFrame(ab_text_panel, fg_color="transparent")
 ab_txt_btns.pack(fill="x", padx=10, pady=8)
 ab_import_btn = ctk.CTkButton(ab_txt_btns, text="Import .txt", width=94, height=28,
               corner_radius=8, **BTN_GHOST)
 ab_import_btn.pack(side="left")
-ctk.CTkButton(ab_txt_btns, text="Clear", width=64, height=28, corner_radius=8,
-              command=lambda: ab_text.delete("1.0", "end"), **BTN_GHOST).pack(side="left", padx=6)
+ab_clear_btn = ctk.CTkButton(ab_txt_btns, text="Clear", width=64, height=28,
+              corner_radius=8, **BTN_GHOST)
+ab_clear_btn.pack(side="left", padx=6)
 ab_detect_btn = ctk.CTkButton(ab_txt_btns, text="Detect Chapters  ▸", width=150, height=28,
               fg_color=C_ACCENT, hover_color=C_ACCENT_H, text_color="#00120b",
               font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
@@ -7223,6 +7712,7 @@ def ab_import_file():
         status_label.configure(text="⚠️ Could not read that file.")
         return
     set_default_folder(os.path.dirname(path))
+    data = _auto_clean_imported(data, keep_headings=True)   # see the paste binding
     ab_text.delete("1.0", "end")
     ab_text.insert("1.0", data)
     if not ab_title_var.get().strip():
@@ -7248,11 +7738,85 @@ def _ab_clear_rows():
         w.destroy()
     ab_chapters.clear()
 
+
+def _ab_is_empty():
+    """True when there is nothing on the tab worth confirming before wiping."""
+    return not (ab_text.get("1.0", "end").strip()
+                or ab_chapters
+                or ab_title_var.get().strip()
+                or ab_author_var.get().strip()
+                or ab_cover["bytes"])
+
+
+def ab_clear_all():
+    """Reset the whole tab.
+
+    Clear used to empty the text box alone, leaving the detected chapters, the
+    summary line, the book details and the cover behind — so a second book
+    inherited the first one's chapters and cover art. Anything Clear leaves
+    behind is something that ends up in the wrong audiobook.
+
+    It asks first now, because it wipes typed-in details and not just text.
+    Skipped when the tab is already empty; a confirmation with nothing to
+    confirm is just a click.
+    """
+    if _ab_is_empty():
+        return
+    if not messagebox.askyesno(
+            "Clear Audiobook",
+            "Clear the book text, detected chapters, title, author, year "
+            "and cover art?\n\nThis cannot be undone."):
+        return
+    ab_text.delete("1.0", "end")
+    _ab_clear_rows()
+    ab_chap_summary.configure(text="Paste or import text, then Detect Chapters.")
+    ab_title_var.set("")
+    ab_author_var.set("")
+    ab_year_var.set(datetime.now().strftime("%Y"))   # back to its default
+    ab_cover["bytes"], ab_cover["mime"], ab_cover["path"] = None, "image/jpeg", ""
+    ab_cover_label.configure(text="optional", text_color=C_TXT3)
+    status_label.configure(text="Audiobook cleared.")
+
+
+def _ab_fill_details(text):
+    """Fill empty book details from a 'Title:/Author:/By:/Year:' header.
+
+    Returns the text with that header removed, so the narrator doesn't open the
+    book by reading "Title colon The Long Road" out loud. Only the value used
+    for generation is trimmed — what the user typed stays in the box.
+
+    Never overwrites a field they filled in themselves. Year counts as unset
+    while it still holds the current year, which is only ever a default nobody
+    chose.
+    """
+    fields, remaining = parse_book_metadata(text)
+    if not fields:
+        return text
+
+    filled = []
+    if fields.get("title") and not ab_title_var.get().strip():
+        ab_title_var.set(fields["title"]);   filled.append("title")
+    if fields.get("author") and not ab_author_var.get().strip():
+        ab_author_var.set(fields["author"]); filled.append("author")
+    if fields.get("year"):
+        cur = ab_year_var.get().strip()
+        if not cur or cur == datetime.now().strftime("%Y"):
+            ab_year_var.set(fields["year"]); filled.append("year")
+    if filled:
+        status_label.configure(text=f"✅ Filled in {', '.join(filled)} from your text.")
+    return remaining
+
+
 def ab_detect_chapters(*_):
     text = ab_text.get("1.0", "end").strip()
     _ab_clear_rows()
     if not text:
         ab_chap_summary.configure(text="Paste or import text, then Detect Chapters.")
+        return
+    text = _ab_fill_details(text)
+    if not text.strip():
+        # The whole input was a header block and nothing else.
+        ab_chap_summary.configure(text="No book text found — only book details.")
         return
     detected = split_into_chapters(text, ab_title_var.get().strip() or "Audiobook")
     for i, (title, content) in enumerate(detected):
@@ -7380,7 +7944,7 @@ def ab_build():
                 make_folder=make_folder, make_single=make_single,
                 speak_titles=speak_titles, progress_cb=progress_cb,
                 should_cancel=lambda: _cancel_event.is_set())
-            smooth.finish()
+            smooth.finish(ok=not res.get("cancelled"))
             if res.get("cancelled"):
                 app.after(0, lambda: status_label.configure(text="⏹ Audiobook cancelled."))
             else:
@@ -7389,7 +7953,7 @@ def ab_build():
             # Cancel now aborts the chapter mid-generation instead of waiting for
             # it to finish, so the cancel arrives as an exception rather than as
             # a "cancelled" result. Finished chapters stay checkpointed on disk.
-            smooth.finish()
+            smooth.finish(ok=False)
             app.after(0, lambda: status_label.configure(text="⏹ Audiobook cancelled."))
         except Exception as e:
             _log_crash(e)
@@ -7401,6 +7965,7 @@ def ab_build():
 
 # wire audiobook buttons now that handlers exist
 ab_import_btn.configure(command=ab_import_file)
+ab_clear_btn.configure(command=ab_clear_all)
 ab_detect_btn.configure(command=ab_detect_chapters)
 ab_cover_btn.configure(command=ab_pick_cover)
 ab_build_btn.configure(command=ab_build)

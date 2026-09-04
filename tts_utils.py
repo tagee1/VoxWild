@@ -98,6 +98,64 @@ def parse_dialogue(text):
     return result
 
 
+# ── Audiobook header block ────────────────────────────────────────────────────
+
+# Only these four labels. Guessing a title from an unlabelled first line would
+# put a stray sentence in someone's book details often enough to be worse than
+# leaving the field empty.
+_BOOK_LABELS = {"title": "title", "author": "author",
+                "by": "author", "year": "year"}
+
+_BOOK_LABEL_RE = re.compile(
+    r"^\s*(title|author|by|year)\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
+_YEAR_RE = re.compile(r"\b(\d{4})\b")
+
+
+def parse_book_metadata(text):
+    """Read a 'Title:/Author:/By:/Year:' header off the top of a book.
+
+    Returns (fields, remaining_text).
+
+    Only the run of blank and labelled lines at the very top is considered — the
+    scan stops at the first line of real content, so a line of dialogue further
+    down that happens to contain a colon can never be mistaken for a header.
+
+    The matched lines are stripped from remaining_text because they are header
+    material, not prose: left in, the narrator reads "Title colon The Long Road"
+    aloud as the opening of chapter one. The caller keeps the user's own text box
+    untouched — only what gets spoken is trimmed.
+    """
+    if not text or not text.strip():
+        return {}, text
+
+    fields = {}
+    lines = text.splitlines()
+    consumed = 0
+    for i, line in enumerate(lines):
+        if not line.strip():
+            consumed = i + 1          # blank lines inside the header are fine
+            continue
+        m = _BOOK_LABEL_RE.match(line)
+        if not m:
+            break                     # first real line of the book — stop
+        key = _BOOK_LABELS[m.group(1).lower()]
+        value = m.group(2).strip()
+        if key == "year":
+            # "Year: next spring" is still a header line — drop the value but
+            # keep reading, or a junk year would cost us the title under it.
+            ym = _YEAR_RE.search(value)
+            value = ym.group(1) if ym else ""
+        # First one wins, so "By:" cannot quietly overwrite an earlier "Author:".
+        if value and key not in fields:
+            fields[key] = value
+        consumed = i + 1
+
+    if not fields:
+        return {}, text
+    return fields, "\n".join(lines[consumed:]).lstrip("\n")
+
+
 def _srt_time(seconds):
     # round() avoids float-precision truncation errors (e.g. 0.9999... → 1 not 0)
     ms = min(round((seconds % 1) * 1000), 999)

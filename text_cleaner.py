@@ -1,9 +1,15 @@
 import re
 
-def clean_text(text: str) -> tuple[str, list[str]]:
+def clean_text(text: str, keep_headings: bool = False) -> tuple[str, list[str]]:
     """
     Clean and normalize text for TTS.
     Returns (cleaned_text, list_of_changes_made)
+
+    keep_headings leaves Markdown heading marks ('#', '##', ...) in place. The
+    audiobook tab needs it: split_into_chapters() finds chapters by looking for
+    those marks, so stripping them first would collapse a whole book into one
+    chapter. The '#' is still never spoken — it becomes the chapter title.
+    Everywhere else headings are stripped as usual.
     """
     changes = []
     original = text
@@ -12,7 +18,11 @@ def clean_text(text: str) -> tuple[str, list[str]]:
     replacements = {
         "\u2018": "'", "\u2019": "'",   # curly single quotes
         "\u201c": '"', "\u201d": '"',   # curly double quotes
-        "\u2013": "-", "\u2014": "-",   # en dash, em dash
+        # En/em dash become the typewriter "--", NOT a single hyphen: synthesis
+        # reads "--" as a beat and a lone hyphen as part of a word ("well-known"),
+        # so collapsing them here silently removed every dash pause from pasted
+        # text. Auto-clean must not change how the text sounds.
+        "\u2013": "--", "\u2014": "--",  # en dash, em dash
         "\u2026": "...",                # ellipsis character
         "\u00a0": " ",                  # non-breaking space
         "\u200b": "",                   # zero-width space
@@ -48,7 +58,8 @@ def clean_text(text: str) -> tuple[str, list[str]]:
     md_cleaned = re.sub(r"\*(.+?)\*",     r"\1", md_cleaned)   # italic
     md_cleaned = re.sub(r"__(.+?)__",     r"\1", md_cleaned)   # bold
     md_cleaned = re.sub(r"_(.+?)_",       r"\1", md_cleaned)   # italic
-    md_cleaned = re.sub(r"#{1,6}\s*",     "",    md_cleaned)   # headers
+    if not keep_headings:
+        md_cleaned = re.sub(r"#{1,6}\s*", "",  md_cleaned)     # headers
     md_cleaned = re.sub(r"`(.+?)`",       r"\1", md_cleaned)   # inline code
     md_cleaned = re.sub(r"^\s*[-*+]\s+",  "",    md_cleaned, flags=re.MULTILINE)  # bullets
     md_cleaned = re.sub(r"^\s*\d+\.\s+",  "",    md_cleaned, flags=re.MULTILINE)  # numbered lists
