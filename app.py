@@ -1211,9 +1211,7 @@ def _es_fix_ni(text, lang):
 
 def _kokoro_one(text, voice, speed, lang):
     """One kokoro.create call, with the per-language text repairs applied."""
-    if lang.startswith("en"):
-        text = _speak_times(text)             # "o'clock" is English-only
-        text = _speak_ratios(text)            # so is "sixteen TO nine"
+    text = _speak_numbers(text, lang)         # times, ratios, fractions, ranges, degrees
     try:
         return kokoro.create(_es_fix_ni(text, lang), voice=voice, speed=speed, lang=lang)
     except Exception as e:
@@ -3166,8 +3164,15 @@ def apply_enhancements(samples, sample_rate):
 # Recognized tags are consumed; unrecognized [..] stays as literal text. Fast mode.
 # ══════════════════════════════════════════════════════════════════════════════
 _TAG_RE = re.compile(r'\[[^\[\]]*\]')
-_TAG_SLOW, _TAG_FAST = 0.75, 1.4
-_TAG_LOUD, _TAG_QUIET = 3.0, 0.5   # [loud] 1.5 → 2.0 → 3.0 (user wanted more punch); tune by ear
+# Multipliers on the speed slider, not absolute speeds: the tag has to stay a
+# CONTRAST against whatever pace the narrator is set to. A fixed value would do
+# nothing at a 1.6 slider and would actually slow text down above it.
+# [fast] 1.4 → 1.6 by ear (2026-09-06): at a 0.85 slider, 1.4 only reached 1.19,
+# close enough to normal speech that the tag read as doing nothing.
+_TAG_SLOW, _TAG_FAST = 0.75, 1.6
+# [loud] 1.5 → 2.0 → 3.0 (wanted more punch); [quiet] 0.5 → 0.25 (-6 dB was not
+# quiet enough against Natural's output). Both chosen by ear, 2026-09-04.
+_TAG_LOUD, _TAG_QUIET = 3.0, 0.25
 
 # friendly first-name -> voice id, e.g. "george" -> "bm_george"
 _VOICE_BY_NAME = {}
@@ -3180,6 +3185,20 @@ def _tag_spell(t, digits_only=False):
     # Separator is a comma, not a full stop: Chatterbox gives a period a much
     # heavier prosodic break, which made mixed strings like "R4T9" land unevenly
     # (an audible gap at the digit->letter boundary). A comma reads steadier.
+    #
+    # The small gap between characters is DELIBERATE and load-bearing — do not
+    # "fix" it by switching to a space or a hyphen. The punctuation is what tells
+    # espeak these are letters rather than words. Measured 2026-09-06:
+    #
+    #   ", "  ->  sˈiː, ˈeɪ, tˈiː     "see AY tee"    correct
+    #   " "   ->  sˈiː  ɐ  tˈiː       "see UH tee"    the A becomes the article
+    #   "-"   ->  sˈiːɐtˈiː           same, and run together
+    #
+    # So [spell] on "CAT" or "AI" breaks without it. Every separator that keeps
+    # the letter names (comma, semicolon, period, comma-with-no-space) lands
+    # within 0.17s of the others, and this is already the shortest of them — the
+    # gap is the price of correctness, not a tuning oversight. Reported as a
+    # defect in the full test pass and closed as intended behaviour.
     _SEP = ', '
     out = []
     for ch in t:
@@ -3272,6 +3291,169 @@ def _speak_ratios(text):
     return _RATIO_RE.sub(
         lambda m: f"{_two_digit_words(int(m.group(1)))} to "
                   f"{_two_digit_words(int(m.group(2)))}", text)
+
+def _num_to_words(n):
+    """Whole number 0-999,999 in words. Digits are not safe to hand to either
+    engine: espeak reads them well enough, but Chatterbox has no number
+    normalization at all and guesses — it read "195" as "nineteen five"."""
+    if n < 100:
+        return _two_digit_words(n)
+    if n < 1000:
+        h, r = divmod(n, 100)
+        return _YEAR_ONES[h] + " hundred" + (" " + _two_digit_words(r) if r else "")
+    if n < 1000000:
+        th, r = divmod(n, 1000)
+        out = _num_to_words(th) + " thousand"
+        return out + (" " + _num_to_words(r) if r else "")
+    return str(n)                         # beyond what a voice reads naturally
+
+# Fractions. espeak pronounces the slash — "3/4" came out as "three SLASH four" —
+# and Chatterbox drops it, leaving "three four". Neither is the number.
+_FRACTION_WORDS = {2: "half", 3: "third", 4: "quarter", 5: "fifth", 6: "sixth",
+                   7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth",
+                   12: "twelfth", 16: "sixteenth"}
+# An optional whole number, then n/d. The trailing guard rejects dates:
+# "3/4/2026" must not become "three quarters/2026".
+_FRACTION_RE = re.compile(r'(?<![\d/])(?:(\d{1,4})\s+)?(\d{1,2})/(\d{1,2})(?![\d/])')
+
+_ORDINAL_ONES = ["zeroth","first","second","third","fourth","fifth","sixth",
+                 "seventh","eighth","ninth","tenth","eleventh","twelfth",
+                 "thirteenth","fourteenth","fifteenth","sixteenth",
+                 "seventeenth","eighteenth","nineteenth"]
+_ORDINAL_TENS = ["","","twentieth","thirtieth","fortieth","fiftieth","sixtieth",
+                 "seventieth","eightieth","ninetieth"]
+
+def _ordinal_words(n):
+    """1 -> "first", 22 -> "twenty-second". Used by dates and by fractions."""
+    if n < 20:
+        return _ORDINAL_ONES[n]
+    t, o = divmod(n, 10)
+    if o == 0:
+        return _ORDINAL_TENS[t]
+    return _YEAR_TENS[t] + "-" + _ORDINAL_ONES[o]
+
+def _speak_fractions(text):
+    """Read "3/4" as "three quarters" and "2 1/2" as "two and a half"."""
+    def _sub(m):
+        whole, num, den = m.group(1), int(m.group(2)), int(m.group(3))
+        word = _FRACTION_WORDS.get(den)
+        if word is None:                   # 3/13 and friends read better as-is
+            return m.group()
+        if num >= den:
+            # Top-heavy: "5/4" is read arithmetically as "five fourths", not
+            # "five quarters". The idiomatic names only apply below the whole.
+            # (A musician would say "five four" for the time signature — that
+            # reading loses out to the arithmetic one, which is far commoner.)
+            # Halves are the exception: the ordinal for 2 is "second", and
+            # "7/2" is "seven halves", never "seven seconds".
+            word = "half" if den == 2 else _ordinal_words(den)
+        plural = "halves" if word == "half" else word + "s"
+        frac = ("a " + word) if num == 1 and whole else \
+               (_num_to_words(num) + " " + (plural if num > 1 else word))
+        if whole:
+            return f"{_num_to_words(int(whole))} and {frac}"
+        return frac
+
+    return _FRACTION_RE.sub(_sub, text)
+
+# Dates, before fractions get a chance at "3/4/2026". US month/day/year: that is
+# what the reporting user types, and the ambiguity is unresolvable from the text
+# alone — "3/4/2026" is March 4th in the US and 3 April most other places.
+_MONTHS = ["", "January", "February", "March", "April", "May", "June", "July",
+           "August", "September", "October", "November", "December"]
+_DATE_RE = re.compile(r'(?<![\d/])(\d{1,2})/(\d{1,2})/(\d{4})(?![\d/])')
+
+def _speak_dates(text):
+    """Read "3/4/2026" as "March fourth twenty twenty-six"."""
+    def _sub(m):
+        mo, day, yr = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if not (1 <= mo <= 12 and 1 <= day <= 31):
+            return m.group()               # not a date; leave it for the other rules
+        return f"{_MONTHS[mo]} {_ordinal_words(day)} {_year_to_words(yr)}"
+    return _DATE_RE.sub(_sub, text)
+
+# Phone numbers, before ranges so "123-4567" can never be read as a span.
+# espeak read "555-1234" as "five hundred fifty five DASH one thousand two
+# hundred thirty four"; digits in groups is how anyone reads one aloud. The
+# comma between groups is what gives the familiar beat.
+_PHONE_RES = (
+    re.compile(r'(?<![\d-])\((\d{3})\)\s*(\d{3})-(\d{4})(?![\d-])'),   # (555) 123-4567
+    re.compile(r'(?<![\d-])(\d{3})-(\d{3})-(\d{4})(?![\d-])'),         # 555-123-4567
+    # 555-1234. A bare 3-then-4 pair is a local number in prose far more often
+    # than anything else, but "$100-2000" is a price range — so a currency sign
+    # in front disqualifies it. A range of that shape is otherwise unusual;
+    # matching magnitudes ("100-200", "1000-2000") are what people actually write.
+    re.compile(r'(?<![\d\-$£€])(\d{3})-(\d{4})(?![\d-])'),
+)
+
+def _digit_string(s):
+    return ' '.join(_YEAR_ONES[int(c)] for c in s)
+
+def _speak_phones(text):
+    """Read "555-1234" as "five five five, one two three four"."""
+    for rx in _PHONE_RES:
+        text = rx.sub(lambda m: ', '.join(_digit_string(g) for g in m.groups()), text)
+    return text
+
+# Degrees. The real sign works in Fast, but the look-alikes people actually
+# paste do not: º says "oh", ˚ is dropped, ℃ and ℉ vanish entirely — and all of
+# them look identical on screen. Normalize to the real sign, then spell it out
+# so Chatterbox stops improvising the number.
+_DEGREE_LOOKALIKES = {"º": "°", "˚": "°", "ᵒ": "°", "℃": "°C", "℉": "°F"}
+# The whitespace before C/F sits INSIDE the optional group: consuming it
+# unconditionally turned "350° for 20 minutes" into "degreesfor". The \b then
+# keeps the F of "for" from being read as Fahrenheit.
+_DEGREE_RE = re.compile(r'(\d{1,4})\s*°(?:\s*([CFcf])\b)?')
+_SCALE_NAME = {"C": " Celsius", "F": " Fahrenheit"}
+
+def _speak_degrees(text):
+    """Read "195°F" as "one hundred ninety five degrees Fahrenheit"."""
+    for bad, good in _DEGREE_LOOKALIKES.items():
+        text = text.replace(bad, good)
+    return _DEGREE_RE.sub(
+        lambda m: (_num_to_words(int(m.group(1))) + " degrees"
+                   + _SCALE_NAME.get((m.group(2) or "").upper(), "")), text)
+
+# Numeric ranges. "22-25 minutes" was read as "twenty two DASH twenty five" by
+# espeak and run together with no break at all by Chatterbox.
+#
+# Bounded to three digits a side, ascending, so a phone number ("555-1234"),
+# a part code or a year span is left alone. A single hyphen is never treated as
+# a pause elsewhere either — that is "well-known", not a beat.
+_RANGE_RE = re.compile(r'(?<![\d.-])(\d{1,3})\s*-\s*(\d{1,3})(?![\d.-])')
+
+def _speak_ranges(text):
+    """Read "22-25" as "twenty two to twenty five"."""
+    def _sub(m):
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if hi <= lo:                       # not a range; leave it as typed
+            return m.group()
+        return f"{_num_to_words(lo)} to {_num_to_words(hi)}"
+    return _RANGE_RE.sub(_sub, text)
+
+def _speak_numbers(text, lang="en-us"):
+    """Every number/symbol repair, in the one order that works.
+
+    Order is the whole design — each rule runs on what the previous declined:
+
+      phones   first, so "123-4567" can never be read as a numeric range
+      dates    before fractions, which would otherwise take "3/4" out of a date
+      times    first claim on anything clock-shaped ("3:30", "John 3:16")
+      ratios   the colons times declined
+      then fractions, ranges and degrees, which use separators that cannot collide
+
+    English only: "o'clock", "quarters" and "degrees Fahrenheit" have no place
+    in Spanish output.
+    """
+    if not lang.startswith("en"):
+        return text
+    text = _speak_phones(text)
+    text = _speak_dates(text)
+    text = _speak_times(text)
+    text = _speak_ratios(text)
+    text = _speak_fractions(text)
+    text = _speak_ranges(text)
+    return _speak_degrees(text)
 
 # Em dash, en dash, and the typed "--" all mean the same beat to a reader.
 # A single hyphen is left alone — that's "well-known", not a pause.
@@ -3643,7 +3825,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
                 # Same text repairs Fast mode gets, tuned for this engine. Only what
                 # reaches the model is rewritten — chunks[] keeps the original text
                 # so read-along and SRT still track what the user actually typed.
-                _cb_text = _speak_ratios(_speak_times(u["text"]))
+                _cb_text = _speak_numbers(u["text"])
                 samples, sr = chatterbox_engine.generate_chunk(
                     _cb_text, audio_prompt_path=prompt,
                     exaggeration=exag, cfg_weight=cfg, status_cb=status_cb)
@@ -5401,12 +5583,19 @@ progress_pct_label = ctk.CTkLabel(
     prog_row, text="0%", width=48, anchor="w",
     font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"), text_color=C_ACCENT)
 progress_pct_label.pack(side="left", padx=(16, 8))
+# The time label is packed BEFORE the bar, and to the right. Pack hands out
+# space in order and an expand=True widget takes everything left over, so
+# whatever follows it gets starved. SegmentBar's minimum width grows with the
+# chunk count (minsize=8 per cell), so from five segments up it squeezed this
+# label from 285px to 249px and clipped the text — "⏱ Assembling audio…" showed
+# as a fragment mid-generation, which is when it is on screen. Measured at 150%
+# scaling. Width raised to fit the longest string the label ever holds.
+progress_time_label = ctk.CTkLabel(
+    prog_row, text="", width=210, anchor="w",
+    font=ctk.CTkFont(family="Segoe UI", size=12), text_color=C_TXT3)
+progress_time_label.pack(side="right", padx=(0, 16))
 progress_bar = SegmentBar(prog_row)
 progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=10)
-progress_time_label = ctk.CTkLabel(
-    prog_row, text="", width=190, anchor="w",
-    font=ctk.CTkFont(family="Segoe UI", size=12), text_color=C_TXT3)
-progress_time_label.pack(side="left", padx=(0, 16))
 
 smooth = SmoothProgress(progress_bar, progress_time_label, progress_pct_label)
 

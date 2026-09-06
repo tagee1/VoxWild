@@ -20,6 +20,7 @@ Run with:
 """
 import io
 import os
+import re
 import unittest
 
 HERE   = os.path.dirname(os.path.abspath(__file__))
@@ -80,6 +81,71 @@ class TestTagsAreHonouredInDialogue(_Src):
     def test_cancel_still_lands_between_spans(self):
         body = self.fn("def generate_dialogue_audio(")
         self.assertIn("cancel_event.is_set()", body)
+
+
+class TestTagStrengths(_Src):
+    """The four strength tags, tuned by ear. These assert direction and the
+    relative-vs-absolute design, not the exact numbers — those get retuned."""
+
+    def parse(self):
+        import numpy as np
+        ns = {"re": re, "np": np, "VOICES": {}}
+        exec(self.src[self.src.index("_TAG_RE = re.compile"):
+                      self.src.index("\ndef time_stretch(")], ns)
+        return ns
+
+    def span(self, ns, tag, base):
+        spans, _ = ns["parse_speech_tags"](f"a [{tag}]b[/{tag}] c", "af_heart", base)
+        return [s for s in spans if s["text"].strip() == "b"][0]
+
+    def test_each_tag_pushes_the_right_way(self):
+        ns = self.parse()
+        self.assertGreater(self.span(ns, "fast",  1.0)["speed"], 1.0)
+        self.assertLess(   self.span(ns, "slow",  1.0)["speed"], 1.0)
+        self.assertGreater(self.span(ns, "loud",  1.0)["gain"],  1.0)
+        self.assertLess(   self.span(ns, "quiet", 1.0)["gain"],  1.0)
+
+    def test_speed_tags_scale_with_the_slider_rather_than_replacing_it(self):
+        """A fixed speed would do nothing at a matching slider setting, and
+        would SLOW text down above it — the opposite of the tag's name."""
+        ns = self.parse()
+        slow_slider = self.span(ns, "fast", 0.85)["speed"]
+        fast_slider = self.span(ns, "fast", 1.00)["speed"]
+        self.assertLess(slow_slider, fast_slider)
+        ratio_a = slow_slider / 0.85
+        ratio_b = fast_slider / 1.00
+        self.assertAlmostEqual(ratio_a, ratio_b, places=6,
+                               msg="the contrast must not depend on the slider")
+
+    def test_speed_stays_inside_a_sane_range(self):
+        """Past 2.0 speech stops being intelligible; below 0.5 it drawls.
+
+        Checked across every span, not just the tagged one: at a slider already
+        at the ceiling the tag clamps to its neighbours' speed, the spans become
+        identical and the parser merges them — so there is no "b" span left to
+        look up. That merge is correct, and it is why this asserts on all spans.
+        """
+        ns = self.parse()
+        for base, tag in ((2.0, "fast"), (0.5, "slow")):
+            spans, _ = ns["parse_speech_tags"](f"a [{tag}]b[/{tag}] c",
+                                               "af_heart", base)
+            for s in spans:
+                if s["kind"] == "text":
+                    self.assertGreaterEqual(s["speed"], 0.5)
+                    self.assertLessEqual(s["speed"], 2.0)
+
+    def test_a_tag_at_the_ceiling_collapses_instead_of_overshooting(self):
+        """At a maxed slider [fast] has nowhere to go, so it must read as plain
+        text rather than being clamped into a separate, identical-sounding span."""
+        ns = self.parse()
+        spans, _ = ns["parse_speech_tags"]("a [fast]b[/fast] c", "af_heart", 2.0)
+        texts = [s["text"] for s in spans if s["kind"] == "text"]
+        self.assertEqual(len(texts), 1, f"expected one merged span, got {texts}")
+
+    def test_quiet_is_well_below_half_volume(self):
+        """-6 dB was not quiet enough against Natural's output; now -12 dB."""
+        ns = self.parse()
+        self.assertLessEqual(ns["_TAG_QUIET"], 0.3)
 
 
 class TestTagUiIsShared(_Src):

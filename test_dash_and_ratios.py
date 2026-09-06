@@ -214,15 +214,16 @@ class TestWiring(unittest.TestCase):
         self.assertIn("if len(pieces) < 2:", fn)
 
     def test_both_engines_speak_ratios(self):
-        self.assertIn("_speak_ratios(", self.fn("def _kokoro_one("))      # Fast
-        self.assertIn("_speak_ratios(_speak_times(", SRC)                 # Natural
+        """Both call sites now share _speak_numbers, which chains every repair.
+        Ordering within it is asserted in test_number_speech.py."""
+        self.assertIn("_speak_numbers(text, lang)", self.fn("def _kokoro_one("))  # Fast
+        self.assertIn("_cb_text = _speak_numbers(", SRC)                          # Natural
+        self.assertIn("_speak_ratios(", self.fn("def _speak_numbers("))
 
     def test_ratios_are_applied_after_times_everywhere(self):
         """Order is the whole guard against "3:30" becoming "three to thirty"."""
-        fast = self.fn("def _kokoro_one(")
-        self.assertLess(fast.find("_speak_times("), fast.find("_speak_ratios("))
-        cb = SRC.split("_cb_text = ", 1)[1].split("\n", 1)[0]
-        self.assertEqual(cb, "_speak_ratios(_speak_times(u[\"text\"]))")
+        body = self.fn("def _speak_numbers(")
+        self.assertLess(body.find("_speak_times("), body.find("_speak_ratios("))
 
     def test_the_old_punctuation_fix_is_gone(self):
         """Leaving it in place would add "... " on top of the real silence."""
