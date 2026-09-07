@@ -148,6 +148,79 @@ class TestTagStrengths(_Src):
         self.assertLessEqual(ns["_TAG_QUIET"], 0.3)
 
 
+class TestRateTagWithdrawn(_Src):
+    """[rate N] was withdrawn on request — it multiplied the speed slider
+    instead of setting a speed, so "[rate 1.5]" at a 0.85 slider only reached
+    1.28 and read as doing nothing. [slow]/[fast] cover the same ground.
+
+    It is still CONSUMED rather than deleted from the parser: an unrecognized
+    tag is left in the text and read out loud, so simply removing it would make
+    every saved script start announcing "rate one point five".
+    """
+
+    def parse(self):
+        import numpy as np
+        ns = {"re": re, "np": np, "VOICES": {}}
+        exec(self.src[self.src.index("_TAG_RE = re.compile"):
+                      self.src.index("\ndef time_stretch(")], ns)
+        return ns
+
+    def test_it_is_gone_from_the_tag_guide(self):
+        self.assertNotIn("[rate 0.8] … [/rate]", self.src)
+
+    def test_it_is_gone_from_the_insert_menu(self):
+        self.assertNotIn("Rate (exact)", self.src)
+        self.assertNotIn('"[rate 0.8]‸[/rate]"', self.src)
+
+    def test_it_is_never_read_out_loud(self):
+        """The reason it is consumed rather than dropped."""
+        ns = self.parse()
+        spans, _ = ns["parse_speech_tags"]("a [rate 1.5]b[/rate] c", "af_heart", 1.0)
+        spoken = "".join(s["text"] for s in spans if s["kind"] == "text")
+        self.assertNotIn("rate", spoken.lower())
+        self.assertNotIn("[", spoken)
+
+    def test_it_changes_nothing(self):
+        ns = self.parse()
+        spans, used = ns["parse_speech_tags"]("a [rate 1.5]b[/rate] c",
+                                              "af_heart", 0.85)
+        for s in spans:
+            if s["kind"] == "text":
+                self.assertAlmostEqual(s["speed"], 0.85, places=6)
+        self.assertFalse(used, "a withdrawn tag must not count as an effect")
+
+    def test_the_text_is_not_split_into_extra_synthesis_calls(self):
+        """A no-op that still split spans would cost an extra engine call per
+        tag — minutes, in Natural."""
+        ns = self.parse()
+        spans, _ = ns["parse_speech_tags"]("a [rate 1.5]b[/rate] c", "af_heart", 1.0)
+        self.assertEqual(len([s for s in spans if s["kind"] == "text"]), 1)
+
+    def test_it_is_transparent_inside_another_speed_tag(self):
+        """Pushing a flat 1.0 would cancel an enclosing [fast]; it pushes a copy
+        of the current factor instead."""
+        ns = self.parse()
+        spans, _ = ns["parse_speech_tags"]("[fast]a [rate 2]b[/rate] c[/fast]",
+                                           "af_heart", 1.0)
+        for s in spans:
+            if s["kind"] == "text":
+                self.assertAlmostEqual(s["speed"], ns["_TAG_FAST"], places=6)
+
+    def test_volume_was_not_removed_with_it(self):
+        """[volume N] shared the same parser branch and had to survive it."""
+        ns = self.parse()
+        spans, _ = ns["parse_speech_tags"]("a [volume 2]b[/volume] c", "af_heart", 1.0)
+        gains = [s["gain"] for s in spans if s["kind"] == "text"]
+        self.assertIn(2.0, gains)
+
+    def test_the_other_speed_tags_still_work(self):
+        ns = self.parse()
+        for tag, expect in (("fast", ns["_TAG_FAST"]), ("slow", ns["_TAG_SLOW"])):
+            spans, _ = ns["parse_speech_tags"](f"a [{tag}]b[/{tag}] c", "af_heart", 1.0)
+            mid = [s for s in spans if s["text"].strip() == "b"][0]
+            self.assertAlmostEqual(mid["speed"], expect, places=6)
+
+
 class TestTagUiIsShared(_Src):
 
     def test_the_tag_ui_is_no_longer_bound_to_one_box(self):

@@ -3567,12 +3567,23 @@ def parse_speech_tags(text, base_voice, base_speed):
         elif low == 'digits': flush(); xform_stack.append('digits'); used[0] = True
         elif low == 'year':   flush(); xform_stack.append('year'); used[0] = True
         else:
-            rm = re.match(r'(rate|volume)\s+(\d+(?:\.\d+)?)$', low)
+            rm = re.match(r'volume\s+(\d+(?:\.\d+)?)$', low)
+            # [rate N] was withdrawn — it multiplied the speed slider rather than
+            # setting a speed, so "[rate 1.5]" at a 0.85 slider only reached 1.28
+            # and read as doing nothing. [slow]/[fast] cover the same ground
+            # predictably. Still CONSUMED rather than dropped: an unrecognized
+            # tag is left in the text and spoken aloud, which would make every
+            # saved script start reading "rate one point five" out loud. Pushing
+            # a copy of the current factor keeps it transparent to nesting, so
+            # "[fast]a [rate 2]b[/rate] c[/fast]" stays fast throughout.
+            ratem = re.match(r'rate\s+\d+(?:\.\d+)?$', low)
             vm = re.match(r'voice\s*:\s*(\S.*)$', raw, re.I)
-            if rm:
+            if ratem:
                 flush()
-                v = float(rm.group(2))
-                (speed_stack if rm.group(1) == 'rate' else gain_stack).append(v)
+                speed_stack.append(speed_stack[-1] if speed_stack else 1.0)
+            elif rm:
+                flush()
+                gain_stack.append(float(rm.group(1)))
                 used[0] = True
             elif vm:
                 flush()
@@ -3785,7 +3796,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
         cb_sr  = chatterbox_engine.sr or 24000
 
         # base_speed=1.0 → each span's "speed" IS the tag factor ([slow]=0.75,
-        # [fast]=1.4, [rate N]=N). Spell/digits are already baked into span text.
+        # [fast]=1.6). Spell/digits are already baked into span text.
         spans, _tag_used = parse_speech_tags(text, voice, 1.0)
         if _tag_used and any(s.get("voice") not in (None, voice) for s in spans):
             if status_cb: status_cb("ℹ️ [voice:] tags are ignored in Natural mode (uses your cloned voice).")
@@ -3830,7 +3841,7 @@ def generate_audio(text, voice, speed, status_cb=None, progress_range=(0.0, 0.95
                     _cb_text, audio_prompt_path=prompt,
                     exaggeration=exag, cfg_weight=cfg, status_cb=status_cb)
                 samples = np.asarray(samples, dtype=np.float32)
-                if abs(u["speed"] - 1.0) > 1e-3:        # [slow]/[fast]/[rate]
+                if abs(u["speed"] - 1.0) > 1e-3:        # [slow]/[fast]
                     samples = wsola(samples, u["speed"])
                 if abs(u["gain"] - 1.0) > 1e-6:         # [loud]/[quiet]/[volume]
                     samples = apply_tag_gain(samples, u["gain"], sr or cb_sr)
@@ -5748,7 +5759,6 @@ _TAG_ITEMS = [
     {"label": "⏸  Pause",        "snip": "[pause ⟨1⟩s]",       "kw": "pause break wait beat"},
     {"label": "🐢  Slow down",    "snip": "[slow]‸[/slow]",     "kw": "slow slower drama"},
     {"label": "🐇  Speed up",     "snip": "[fast]‸[/fast]",     "kw": "fast faster hurry"},
-    {"label": "🎚  Rate (exact)", "snip": "[rate 0.8]‸[/rate]", "kw": "rate speed exact tempo pace"},
     {"label": "🔊  Louder",       "snip": "[loud]‸[/loud]",     "kw": "loud louder volume punch"},
     {"label": "🔉  Quieter",      "snip": "[quiet]‸[/quiet]",   "kw": "quiet quieter soft volume aside"},
     {"label": "🔤  Spell out",    "snip": "[spell]‸[/spell]",   "kw": "spell letters code acronym reference"},
@@ -6053,7 +6063,6 @@ def _tag_show_guide():
         ("[pause 1s]", "A pause — also [pause 500ms] or [break]. No closing tag needed."),
         ("[slow] … [/slow]", "Slow the wrapped words down."),
         ("[fast] … [/fast]", "Speed the wrapped words up."),
-        ("[rate 0.8] … [/rate]", "Exact speed — below 1 is slower, above 1 is faster."),
         ("[loud] … [/loud]", "Make a stretch louder."),
         ("[quiet] … [/quiet]", "Make a stretch softer."),
         ("[spell]R4T9[/spell]", "Read characters one by one — codes, references."),
