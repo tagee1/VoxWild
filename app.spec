@@ -80,6 +80,9 @@ _hidden = [
     "clone_library",
     "audio_utils",
     "license",
+    "audio_export",     # export loudness normalization (1.4.0)
+    "clips_library",    # Clips Library tab (1.4.0)
+    "window_utils",     # shared window centring (1.4.0)
 
     # scipy — heavily uses ctypes/C extensions that confuse the analyser
     "scipy.signal",
