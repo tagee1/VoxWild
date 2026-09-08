@@ -3500,17 +3500,15 @@ def _tag_year(t):
                   else m.group(), t)
 
 def _tag_is_recognized(tag):
+    """Does this [..] name a tag the app knows? Drives the green/orange
+    colouring in the text boxes — an unrecognized bracket stays literal text
+    and is read aloud, so it is shown in orange as a warning."""
     t = tag[1:-1].strip().lower()
     if re.match(r'(pause|break)\b\s*(\d+(\.\d+)?)?\s*(ms|s)?$', t): return True
     if re.match(r'/?(slow|fast|loud|quiet|spell|digits|year|voice|rate|volume)$', t): return True
     if re.match(r'(rate|volume)\s+\d+(\.\d+)?$', t): return True
     if re.match(r'voice\s*:\s*\S', t): return True
     return False
-
-def strip_speech_tags(text):
-    """Remove recognized tags (leaving unrecognized brackets) — for engines that
-    can't apply them (Natural mode)."""
-    return _TAG_RE.sub(lambda m: ' ' if _tag_is_recognized(m.group()) else m.group(), text)
 
 def parse_speech_tags(text, base_voice, base_speed):
     """Return (spans, used_effect). spans: {"kind":"text","text","voice","speed","gain"}
